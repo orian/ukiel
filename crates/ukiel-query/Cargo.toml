@@ -1,0 +1,27 @@
+[package]
+name = "ukiel-query"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ukiel-core = { workspace = true }
+ukiel-catalog = { workspace = true }
+datafusion = { workspace = true }
+object_store = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+ukiel-ingest = { workspace = true }
+testcontainers-modules = { workspace = true }
+tempfile = { workspace = true }
+reqwest = { workspace = true }
