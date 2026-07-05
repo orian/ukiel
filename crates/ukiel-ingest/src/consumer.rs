@@ -105,7 +105,13 @@ impl RouteIngest {
                 }
                 msg = consumer.recv() => {
                     let msg = msg?;
-                    self.buffer_message(&mut buffers, msg.payload(), msg.partition(), msg.offset());
+                    self.buffer_message(
+                        &mut buffers,
+                        &hypertable.packing_key,
+                        msg.payload(),
+                        msg.partition(),
+                        msg.offset(),
+                    );
                     if buffers.total_rows >= self.config.max_buffer_rows {
                         self.flush(&hypertable, &mut buffers).await?;
                     }
@@ -149,6 +155,7 @@ impl RouteIngest {
     fn buffer_message(
         &self,
         buffers: &mut Buffers,
+        packing_key: &str,
         payload: Option<&[u8]>,
         partition: i32,
         offset: i64,
@@ -165,6 +172,12 @@ impl RouteIngest {
         let Some(ts) = row.get(&self.route.ts_column).and_then(|v| v.as_i64()) else {
             return;
         };
+        // Every buffered row must also carry a valid i64 packing key, or the
+        // Parquet encoder would reject the whole flush at commit time. Skip
+        // (but still advance past) rows that can't be encoded.
+        if row.get(packing_key).and_then(|v| v.as_i64()).is_none() {
+            return;
+        }
         let day = chrono::DateTime::from_timestamp_millis(ts)
             .map(|d| d.date_naive().to_string())
             .unwrap_or_else(|| "unknown".to_string());

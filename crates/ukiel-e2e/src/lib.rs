@@ -223,14 +223,20 @@ impl Stack {
         }
     }
 
-    /// Spawns an in-process ingest worker for `table`, returning a shutdown
-    /// token and the worker's join handle. Fast flush interval for test speed.
+    /// Spawns an in-process ingest worker with a fast (1s) flush interval —
+    /// the default for most scenarios where test speed matters.
     pub async fn spawn_ingest(&self, table: &Table) -> IngestHandle {
+        self.spawn_ingest_with(table, 1_000).await
+    }
+
+    /// Spawns an in-process ingest worker with an explicit flush interval —
+    /// e.g. the freshness scenario runs the spec's real 10s interval.
+    pub async fn spawn_ingest_with(&self, table: &Table, flush_interval_ms: u64) -> IngestHandle {
         self.ensure_topic(&table.topic).await;
         let config = IngestConfig {
             brokers: self.brokers.clone(),
             group_id: format!("ukiel-e2e-{}", self.nonce),
-            flush_interval_ms: 1_000,
+            flush_interval_ms,
             max_buffer_rows: 100_000,
             tables: vec![TableRoute {
                 topic: table.topic.clone(),
@@ -302,6 +308,30 @@ impl Stack {
             payloads.push(payload);
         }
         payloads
+    }
+
+    /// Sends a single raw (possibly malformed) payload to `table`'s topic —
+    /// for poison-stream tests. `payload` is written to Kafka verbatim.
+    pub async fn produce_raw(&self, table: &Table, payload: &str) {
+        self.producer
+            .send(
+                FutureRecord::<(), _>::to(&table.topic).payload(payload),
+                Duration::from_secs(10),
+            )
+            .await
+            .map_err(|(e, _)| e)
+            .expect("produce raw");
+    }
+
+    /// Sum of stored next-offsets across all partitions of `table`'s topic for a
+    /// hypertable — i.e. how many messages ingest has durably accounted for.
+    pub async fn ingest_offset_sum(&self, ht: HypertableId, topic: &str) -> i64 {
+        self.catalog
+            .ingest_offsets(ht, topic)
+            .await
+            .expect("ingest_offsets")
+            .values()
+            .sum()
     }
 
     /// Spawns an in-process compactor loop (fast poll) over all hypertables.
