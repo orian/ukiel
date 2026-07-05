@@ -4,6 +4,7 @@ mod commit;
 mod cursors;
 mod error;
 mod feed;
+mod gc;
 mod offsets;
 mod parts;
 mod tables;

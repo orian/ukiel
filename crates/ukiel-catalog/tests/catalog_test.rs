@@ -598,3 +598,75 @@ async fn placement_cursors_and_listing() {
     // Cursors are per worker name.
     assert_eq!(catalog.get_cursor("mv", ht).await.unwrap(), CommitId(0));
 }
+
+#[tokio::test]
+async fn reapable_parts_respect_grace_and_cursors() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+
+    catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![part_meta("old.parquet", 1, 10)],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let old_ids: Vec<_> = catalog
+        .live_parts(ht, None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|p| p.id)
+        .collect();
+    let replace = catalog
+        .commit(
+            ht,
+            CommitOp::Replace {
+                old: old_ids.clone(),
+                new: vec![part_meta("new.parquet", 1, 10)],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let CommitResult::Committed(replace_id) = replace else {
+        panic!("expected commit")
+    };
+
+    // Grace not elapsed -> nothing reapable.
+    assert!(catalog.reapable_parts(ht, 3600.0).await.unwrap().is_empty());
+
+    // Grace elapsed (0s), no cursors registered -> the tombstoned part is reapable.
+    let reapable = catalog.reapable_parts(ht, 0.0).await.unwrap();
+    assert_eq!(reapable.len(), 1);
+    assert_eq!(reapable[0].meta.path, "old.parquet");
+
+    // A lagging consumer fences reaping: cursor before the replace commit.
+    catalog
+        .set_cursor("mv", ht, CommitId(replace_id.0 - 1))
+        .await
+        .unwrap();
+    assert!(catalog.reapable_parts(ht, 0.0).await.unwrap().is_empty());
+
+    // Consumer catches up -> reapable again.
+    catalog.set_cursor("mv", ht, replace_id).await.unwrap();
+    let reapable = catalog.reapable_parts(ht, 0.0).await.unwrap();
+    assert_eq!(reapable.len(), 1);
+
+    // Purging stamps the row: no longer reapable, but path stays known and
+    // the change feed still replays the original add.
+    catalog.mark_purged(&[reapable[0].id]).await.unwrap();
+    assert!(catalog.reapable_parts(ht, 0.0).await.unwrap().is_empty());
+    let paths = catalog.all_part_paths(ht).await.unwrap();
+    assert!(paths.contains(&"old.parquet".to_string()));
+    assert!(paths.contains(&"new.parquet".to_string()));
+    let events = catalog.changes_since(ht, CommitId(0), 100).await.unwrap();
+    assert_eq!(
+        events[0].added.len(),
+        1,
+        "purged part must still appear in feed replay"
+    );
+}
