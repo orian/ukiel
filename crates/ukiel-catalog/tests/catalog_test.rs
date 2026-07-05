@@ -511,3 +511,43 @@ async fn commit_with_offsets_is_atomic() {
     let offsets = catalog.ingest_offsets(ht, "events").await.unwrap();
     assert_eq!(offsets.get(&0), Some(&100));
 }
+
+#[tokio::test]
+async fn hypertable_by_id_and_namespace_table_listing() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+
+    let fetched = catalog.get_hypertable_by_id(ht).await.unwrap();
+    assert_eq!(fetched.id, ht);
+    assert_eq!(fetched.name, "events");
+
+    let err = catalog
+        .get_hypertable_by_id(ukiel_core::HypertableId(999_999))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CatalogError::NotFound(_)));
+
+    catalog
+        .create_logical_table(NamespaceId(1), "events", ht)
+        .await
+        .unwrap();
+    catalog
+        .create_logical_table(NamespaceId(1), "clicks", ht)
+        .await
+        .unwrap();
+    catalog
+        .create_logical_table(NamespaceId(2), "events", ht)
+        .await
+        .unwrap();
+
+    let tables = catalog.list_logical_tables(NamespaceId(1)).await.unwrap();
+    let names: Vec<_> = tables.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, vec!["clicks", "events"]);
+    assert!(
+        catalog
+            .list_logical_tables(NamespaceId(99))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

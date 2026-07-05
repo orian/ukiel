@@ -91,4 +91,48 @@ impl PostgresCatalog {
             column_mapping: row.get("column_mapping"),
         })
     }
+
+    pub async fn get_hypertable_by_id(&self, id: HypertableId) -> Result<Hypertable, CatalogError> {
+        let row = sqlx::query(
+            "SELECT id, name, table_schema, partition_spec, sort_key, packing_key
+             FROM hypertables WHERE id = $1",
+        )
+        .bind(id.0)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| CatalogError::NotFound(format!("hypertable id {id}")))?;
+
+        Ok(Hypertable {
+            id: HypertableId(row.get("id")),
+            name: row.get("name"),
+            table_schema: row.get("table_schema"),
+            partition_spec: row.get("partition_spec"),
+            sort_key: row.get("sort_key"),
+            packing_key: row.get("packing_key"),
+        })
+    }
+
+    pub async fn list_logical_tables(
+        &self,
+        namespace_id: NamespaceId,
+    ) -> Result<Vec<LogicalTable>, CatalogError> {
+        let rows = sqlx::query(
+            "SELECT id, namespace_id, name, hypertable_id, column_mapping
+             FROM logical_tables WHERE namespace_id = $1 ORDER BY name",
+        )
+        .bind(namespace_id.0)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| LogicalTable {
+                id: LogicalTableId(row.get("id")),
+                namespace_id: NamespaceId(row.get("namespace_id")),
+                name: row.get("name"),
+                hypertable_id: HypertableId(row.get("hypertable_id")),
+                column_mapping: row.get("column_mapping"),
+            })
+            .collect())
+    }
 }
