@@ -419,3 +419,95 @@ async fn change_feed_replays_commits_in_order() {
     let page = catalog.changes_since(ht, CommitId(0), 1).await.unwrap();
     assert_eq!(page.len(), 1);
 }
+
+use ukiel_catalog::OffsetRange;
+
+#[tokio::test]
+async fn commit_with_offsets_is_atomic() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+
+    // Fresh hypertable: no offsets stored.
+    assert!(
+        catalog
+            .ingest_offsets(ht, "events")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Successful commit advances offsets.
+    catalog
+        .commit_with_offsets(
+            ht,
+            CommitOp::Add {
+                parts: vec![part_meta("p1.parquet", 1, 10)],
+            },
+            &[
+                OffsetRange {
+                    topic: "events".into(),
+                    partition: 0,
+                    first: 0,
+                    last: 41,
+                },
+                OffsetRange {
+                    topic: "events".into(),
+                    partition: 1,
+                    first: 0,
+                    last: 9,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    let offsets = catalog.ingest_offsets(ht, "events").await.unwrap();
+    assert_eq!(offsets.get(&0), Some(&42));
+    assert_eq!(offsets.get(&1), Some(&10));
+
+    // A conflicting commit must NOT advance offsets (same transaction).
+    let bogus_old = vec![ukiel_core::PartId(999_999)];
+    let err = catalog
+        .commit_with_offsets(
+            ht,
+            CommitOp::Replace {
+                old: bogus_old,
+                new: vec![part_meta("p2.parquet", 1, 10)],
+            },
+            &[OffsetRange {
+                topic: "events".into(),
+                partition: 0,
+                first: 42,
+                last: 99,
+            }],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CatalogError::Conflict { .. }));
+
+    let offsets = catalog.ingest_offsets(ht, "events").await.unwrap();
+    assert_eq!(
+        offsets.get(&0),
+        Some(&42),
+        "failed commit must not move offsets"
+    );
+
+    // A later flush upserts over the existing row.
+    catalog
+        .commit_with_offsets(
+            ht,
+            CommitOp::Add {
+                parts: vec![part_meta("p3.parquet", 1, 10)],
+            },
+            &[OffsetRange {
+                topic: "events".into(),
+                partition: 0,
+                first: 42,
+                last: 99,
+            }],
+        )
+        .await
+        .unwrap();
+    let offsets = catalog.ingest_offsets(ht, "events").await.unwrap();
+    assert_eq!(offsets.get(&0), Some(&100));
+}

@@ -3,10 +3,12 @@
 mod commit;
 mod error;
 mod feed;
+mod offsets;
 mod parts;
 mod tables;
 
 pub use error::CatalogError;
+pub use offsets::OffsetRange;
 
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;

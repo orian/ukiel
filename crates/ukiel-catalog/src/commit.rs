@@ -1,6 +1,7 @@
 use sqlx::{Postgres, Transaction};
 use ukiel_core::{CommitId, CommitOp, CommitResult, HypertableId, PartId, PartMeta};
 
+use crate::offsets::OffsetRange;
 use crate::{CatalogError, PostgresCatalog};
 
 impl PostgresCatalog {
@@ -12,6 +13,30 @@ impl PostgresCatalog {
         hypertable_id: HypertableId,
         op: CommitOp,
         idempotency_key: Option<&str>,
+    ) -> Result<CommitResult, CatalogError> {
+        self.commit_inner(hypertable_id, op, idempotency_key, &[])
+            .await
+    }
+
+    /// Like `commit`, additionally advancing ingest offsets in the same
+    /// transaction. Used by ingest workers for exactly-once delivery: on a
+    /// failed commit, offsets do not move and the worker replays from the
+    /// catalog's stored position.
+    pub async fn commit_with_offsets(
+        &self,
+        hypertable_id: HypertableId,
+        op: CommitOp,
+        offsets: &[OffsetRange],
+    ) -> Result<CommitResult, CatalogError> {
+        self.commit_inner(hypertable_id, op, None, offsets).await
+    }
+
+    async fn commit_inner(
+        &self,
+        hypertable_id: HypertableId,
+        op: CommitOp,
+        idempotency_key: Option<&str>,
+        offsets: &[OffsetRange],
     ) -> Result<CommitResult, CatalogError> {
         let mut tx = self.pool.begin().await?;
 
@@ -54,6 +79,21 @@ impl PostgresCatalog {
             CommitOp::Delete { parts } => {
                 tombstone_parts(&mut tx, hypertable_id, commit_id, &parts).await?;
             }
+        }
+
+        for range in offsets {
+            sqlx::query(
+                "INSERT INTO ingest_offsets (hypertable_id, topic, kafka_partition, next_offset)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (hypertable_id, topic, kafka_partition)
+                 DO UPDATE SET next_offset = EXCLUDED.next_offset, updated_at = now()",
+            )
+            .bind(hypertable_id.0)
+            .bind(&range.topic)
+            .bind(range.partition)
+            .bind(range.last + 1)
+            .execute(&mut *tx)
+            .await?;
         }
 
         tx.commit().await?;
