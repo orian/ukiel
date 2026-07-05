@@ -9,7 +9,7 @@ pub mod table;
 pub use commit::{ChangeEvent, CommitOp, CommitResult};
 pub use ids::{CommitId, HypertableId, LogicalTableId, NamespaceId, PartId};
 pub use part::{Part, PartMeta};
-pub use schema::{SchemaError, arrow_schema_from_json};
+pub use schema::{ColumnKind, ColumnSpec, SchemaError, TableColumns, arrow_schema_from_json};
 pub use table::{Hypertable, LogicalTable, Placement};
 
 #[cfg(test)]
