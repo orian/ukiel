@@ -133,13 +133,13 @@ git commit -m "chore: scaffold cargo workspace with ukiel-core and ukiel-catalog
 
 **Interfaces:**
 - Produces (used by every later crate):
-  - `HypertableId(pub i64)`, `LogicalTableId(pub i64)`, `PartId(pub i64)`, `CommitId(pub i64)`, `TenantId(pub i64)`
-  - `PartMeta { path: String, partition_values: serde_json::Value, tenant_min: i64, tenant_max: i64, row_count: i64, size_bytes: i64, level: i16, column_stats: Option<serde_json::Value> }`
+  - `HypertableId(pub i64)`, `LogicalTableId(pub i64)`, `PartId(pub i64)`, `CommitId(pub i64)`, `NamespaceId(pub i64)`
+  - `PartMeta { path: String, partition_values: serde_json::Value, packing_key_min: i64, packing_key_max: i64, row_count: i64, size_bytes: i64, level: i16, column_stats: Option<serde_json::Value> }`
   - `Part { id: PartId, hypertable_id: HypertableId, meta: PartMeta, created_by_commit: CommitId }`
   - `CommitOp::{Add { parts }, Replace { old, new }, Delete { parts }}`, `CommitOp::kind() -> &'static str`
   - `CommitResult::{Committed(CommitId), AlreadyApplied(CommitId)}`
   - `ChangeEvent { commit_id: CommitId, kind: String, added: Vec<Part>, removed: Vec<PartId> }`
-  - `Hypertable { id, name, table_schema, partition_spec, sort_key }`, `LogicalTable { id, tenant_id, name, hypertable_id, column_mapping }`
+  - `Hypertable { id, name, table_schema, partition_spec, sort_key, packing_key }`, `LogicalTable { id, namespace_id, name, hypertable_id, column_mapping }`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -154,7 +154,7 @@ pub mod part;
 pub mod table;
 
 pub use commit::{ChangeEvent, CommitOp, CommitResult};
-pub use ids::{CommitId, HypertableId, LogicalTableId, PartId, TenantId};
+pub use ids::{CommitId, HypertableId, LogicalTableId, PartId, NamespaceId};
 pub use part::{Part, PartMeta};
 pub use table::{Hypertable, LogicalTable};
 
@@ -166,8 +166,8 @@ mod tests {
         PartMeta {
             path: "ht/1/part-0001.parquet".to_string(),
             partition_values: serde_json::json!({"day": "2026-07-05"}),
-            tenant_min: 10,
-            tenant_max: 20,
+            packing_key_min: 10,
+            packing_key_max: 20,
             row_count: 100,
             size_bytes: 4096,
             level: 0,
@@ -225,7 +225,7 @@ id_type!(HypertableId);
 id_type!(LogicalTableId);
 id_type!(PartId);
 id_type!(CommitId);
-id_type!(TenantId);
+id_type!(NamespaceId);
 ```
 
 `crates/ukiel-core/src/part.rs`:
@@ -240,12 +240,12 @@ use crate::ids::{CommitId, HypertableId, PartId};
 pub struct PartMeta {
     /// Object-store key of the Parquet file.
     pub path: String,
-    /// Partition values, e.g. `{"tenant_bucket": 17, "day": "2026-07-05"}`.
+    /// Partition values, e.g. `{"key_bucket": 17, "day": "2026-07-05"}`.
     pub partition_values: serde_json::Value,
-    /// Smallest tenant id contained in the file (packed files span many tenants).
-    pub tenant_min: i64,
-    /// Largest tenant id contained in the file.
-    pub tenant_max: i64,
+    /// Smallest packing-key value contained in the file (packed files span a key range).
+    pub packing_key_min: i64,
+    /// Largest packing-key value contained in the file.
+    pub packing_key_max: i64,
     pub row_count: i64,
     pub size_bytes: i64,
     /// Compaction level: 0 = fresh ingest, higher = more compacted.
@@ -326,29 +326,34 @@ pub struct ChangeEvent {
 ```rust
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{HypertableId, LogicalTableId, TenantId};
+use crate::ids::{HypertableId, LogicalTableId, NamespaceId};
 
-/// A physical table family: many tenants' data packed into shared Parquet files.
+/// A physical table family: many logical tables' data packed into shared
+/// Parquet files, ordered by the packing key.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Hypertable {
     pub id: HypertableId,
     pub name: String,
     /// JSON-serialized column schema, e.g. `{"fields":[{"name":"ts","type":"timestamp_ms"}, ...]}`.
     pub table_schema: serde_json::Value,
-    /// e.g. `{"columns": ["tenant_bucket", "day"]}`.
+    /// e.g. `{"columns": ["key_bucket", "day"]}`.
     pub partition_spec: serde_json::Value,
     /// File sort order, e.g. `["tenant_id", "ts"]`.
     pub sort_key: Vec<String>,
+    /// The i64 column whose min/max every part records for range pruning
+    /// (e.g. `"tenant_id"` in a multitenant deployment).
+    pub packing_key: String,
 }
 
-/// The tenant-visible table: a slice of a hypertable.
+/// A namespaced view over a slice of a hypertable. In a multitenant
+/// deployment, namespace = tenant.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogicalTable {
     pub id: LogicalTableId,
-    pub tenant_id: TenantId,
+    pub namespace_id: NamespaceId,
     pub name: String,
     pub hypertable_id: HypertableId,
-    /// Optional per-tenant column mapping; `None` = identity.
+    /// Optional per-table column mapping; `None` = identity.
     pub column_mapping: Option<serde_json::Value>,
 }
 ```
@@ -396,17 +401,20 @@ CREATE TABLE hypertables (
     table_schema JSONB NOT NULL,
     partition_spec JSONB NOT NULL,
     sort_key TEXT[] NOT NULL,
+    -- The i64 column whose min/max each part records for range pruning
+    -- (e.g. 'tenant_id' in a multitenant deployment).
+    packing_key TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE logical_tables (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    tenant_id BIGINT NOT NULL,
+    namespace_id BIGINT NOT NULL,
     name TEXT NOT NULL,
     hypertable_id BIGINT NOT NULL REFERENCES hypertables(id),
     column_mapping JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (tenant_id, name)
+    UNIQUE (namespace_id, name)
 );
 
 CREATE TABLE commits (
@@ -430,8 +438,8 @@ CREATE TABLE parts (
     hypertable_id BIGINT NOT NULL REFERENCES hypertables(id),
     path TEXT NOT NULL,
     partition_values JSONB NOT NULL,
-    tenant_min BIGINT NOT NULL,
-    tenant_max BIGINT NOT NULL,
+    packing_key_min BIGINT NOT NULL,
+    packing_key_max BIGINT NOT NULL,
     row_count BIGINT NOT NULL,
     size_bytes BIGINT NOT NULL,
     level SMALLINT NOT NULL DEFAULT 0,
@@ -440,8 +448,8 @@ CREATE TABLE parts (
     deleted_by_commit BIGINT REFERENCES commits(id)
 );
 
--- Query planning: live parts of a hypertable, pruned by tenant range.
-CREATE INDEX parts_live_idx ON parts (hypertable_id, tenant_min, tenant_max)
+-- Query planning: live parts of a hypertable, pruned by packing-key range.
+CREATE INDEX parts_live_idx ON parts (hypertable_id, packing_key_min, packing_key_max)
     WHERE deleted_by_commit IS NULL;
 
 -- Change feed: parts added / removed by a commit.
@@ -564,10 +572,10 @@ git commit -m "feat: catalog crate with postgres schema and migrations"
 
 **Interfaces:**
 - Produces (on `PostgresCatalog`):
-  - `create_hypertable(&self, name: &str, table_schema: &serde_json::Value, partition_spec: &serde_json::Value, sort_key: &[String]) -> Result<HypertableId, CatalogError>`
+  - `create_hypertable(&self, name: &str, table_schema: &serde_json::Value, partition_spec: &serde_json::Value, sort_key: &[String], packing_key: &str) -> Result<HypertableId, CatalogError>`
   - `get_hypertable(&self, name: &str) -> Result<Hypertable, CatalogError>` (NotFound if missing)
-  - `create_logical_table(&self, tenant_id: TenantId, name: &str, hypertable_id: HypertableId) -> Result<LogicalTableId, CatalogError>`
-  - `get_logical_table(&self, tenant_id: TenantId, name: &str) -> Result<LogicalTable, CatalogError>` (NotFound if missing)
+  - `create_logical_table(&self, namespace_id: NamespaceId, name: &str, hypertable_id: HypertableId) -> Result<LogicalTableId, CatalogError>`
+  - `get_logical_table(&self, namespace_id: NamespaceId, name: &str) -> Result<LogicalTable, CatalogError>` (NotFound if missing)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -575,7 +583,7 @@ Append to `crates/ukiel-catalog/tests/catalog_test.rs`:
 
 ```rust
 use serde_json::json;
-use ukiel_core::TenantId;
+use ukiel_core::NamespaceId;
 
 fn events_schema() -> serde_json::Value {
     json!({"fields": [
@@ -594,6 +602,7 @@ async fn hypertable_create_and_get() {
             &events_schema(),
             &json!({"columns": ["day"]}),
             &["tenant_id".to_string(), "ts".to_string()],
+            "tenant_id",
         )
         .await
         .unwrap();
@@ -602,6 +611,7 @@ async fn hypertable_create_and_get() {
     assert_eq!(ht.id, id);
     assert_eq!(ht.name, "events");
     assert_eq!(ht.sort_key, vec!["tenant_id", "ts"]);
+    assert_eq!(ht.packing_key, "tenant_id");
     assert_eq!(ht.table_schema, events_schema());
 
     let err = catalog.get_hypertable("missing").await.unwrap_err();
@@ -612,23 +622,23 @@ async fn hypertable_create_and_get() {
 async fn logical_table_create_and_get() {
     let (_pg, catalog) = common::setup().await;
     let ht = catalog
-        .create_hypertable("events", &events_schema(), &json!({"columns": []}), &["tenant_id".to_string()])
+        .create_hypertable("events", &events_schema(), &json!({"columns": []}), &["tenant_id".to_string()], "tenant_id")
         .await
         .unwrap();
 
     let lt_id = catalog
-        .create_logical_table(TenantId(42), "my_events", ht)
+        .create_logical_table(NamespaceId(42), "my_events", ht)
         .await
         .unwrap();
 
-    let lt = catalog.get_logical_table(TenantId(42), "my_events").await.unwrap();
+    let lt = catalog.get_logical_table(NamespaceId(42), "my_events").await.unwrap();
     assert_eq!(lt.id, lt_id);
-    assert_eq!(lt.tenant_id, TenantId(42));
+    assert_eq!(lt.namespace_id, NamespaceId(42));
     assert_eq!(lt.hypertable_id, ht);
     assert_eq!(lt.column_mapping, None);
 
-    // Same table name for a different tenant is a different logical table.
-    let err = catalog.get_logical_table(TenantId(7), "my_events").await.unwrap_err();
+    // Same table name in a different namespace is a different logical table.
+    let err = catalog.get_logical_table(NamespaceId(7), "my_events").await.unwrap_err();
     assert!(matches!(err, ukiel_catalog::CatalogError::NotFound(_)));
 }
 ```
@@ -642,7 +652,7 @@ Expected: compile error (`create_hypertable` not found).
 
 ```rust
 use sqlx::Row;
-use ukiel_core::{Hypertable, HypertableId, LogicalTable, LogicalTableId, TenantId};
+use ukiel_core::{Hypertable, HypertableId, LogicalTable, LogicalTableId, NamespaceId};
 
 use crate::{CatalogError, PostgresCatalog};
 
@@ -653,15 +663,17 @@ impl PostgresCatalog {
         table_schema: &serde_json::Value,
         partition_spec: &serde_json::Value,
         sort_key: &[String],
+        packing_key: &str,
     ) -> Result<HypertableId, CatalogError> {
         let id: i64 = sqlx::query_scalar(
-            "INSERT INTO hypertables (name, table_schema, partition_spec, sort_key)
-             VALUES ($1, $2, $3, $4) RETURNING id",
+            "INSERT INTO hypertables (name, table_schema, partition_spec, sort_key, packing_key)
+             VALUES ($1, $2, $3, $4, $5) RETURNING id",
         )
         .bind(name)
         .bind(table_schema)
         .bind(partition_spec)
         .bind(sort_key)
+        .bind(packing_key)
         .fetch_one(&self.pool)
         .await?;
         Ok(HypertableId(id))
@@ -669,7 +681,8 @@ impl PostgresCatalog {
 
     pub async fn get_hypertable(&self, name: &str) -> Result<Hypertable, CatalogError> {
         let row = sqlx::query(
-            "SELECT id, name, table_schema, partition_spec, sort_key FROM hypertables WHERE name = $1",
+            "SELECT id, name, table_schema, partition_spec, sort_key, packing_key
+             FROM hypertables WHERE name = $1",
         )
         .bind(name)
         .fetch_optional(&self.pool)
@@ -682,20 +695,21 @@ impl PostgresCatalog {
             table_schema: row.get("table_schema"),
             partition_spec: row.get("partition_spec"),
             sort_key: row.get("sort_key"),
+            packing_key: row.get("packing_key"),
         })
     }
 
     pub async fn create_logical_table(
         &self,
-        tenant_id: TenantId,
+        namespace_id: NamespaceId,
         name: &str,
         hypertable_id: HypertableId,
     ) -> Result<LogicalTableId, CatalogError> {
         let id: i64 = sqlx::query_scalar(
-            "INSERT INTO logical_tables (tenant_id, name, hypertable_id)
+            "INSERT INTO logical_tables (namespace_id, name, hypertable_id)
              VALUES ($1, $2, $3) RETURNING id",
         )
-        .bind(tenant_id.0)
+        .bind(namespace_id.0)
         .bind(name)
         .bind(hypertable_id.0)
         .fetch_one(&self.pool)
@@ -705,24 +719,24 @@ impl PostgresCatalog {
 
     pub async fn get_logical_table(
         &self,
-        tenant_id: TenantId,
+        namespace_id: NamespaceId,
         name: &str,
     ) -> Result<LogicalTable, CatalogError> {
         let row = sqlx::query(
-            "SELECT id, tenant_id, name, hypertable_id, column_mapping
-             FROM logical_tables WHERE tenant_id = $1 AND name = $2",
+            "SELECT id, namespace_id, name, hypertable_id, column_mapping
+             FROM logical_tables WHERE namespace_id = $1 AND name = $2",
         )
-        .bind(tenant_id.0)
+        .bind(namespace_id.0)
         .bind(name)
         .fetch_optional(&self.pool)
         .await?
         .ok_or_else(|| {
-            CatalogError::NotFound(format!("logical table '{name}' for tenant {tenant_id}"))
+            CatalogError::NotFound(format!("logical table '{name}' in namespace {namespace_id}"))
         })?;
 
         Ok(LogicalTable {
             id: LogicalTableId(row.get("id")),
-            tenant_id: TenantId(row.get("tenant_id")),
+            namespace_id: NamespaceId(row.get("namespace_id")),
             name: row.get("name"),
             hypertable_id: HypertableId(row.get("hypertable_id")),
             column_mapping: row.get("column_mapping"),
@@ -763,7 +777,7 @@ git commit -m "feat: hypertable and logical table CRUD"
 **Interfaces:**
 - Produces (on `PostgresCatalog`):
   - `commit(&self, hypertable_id: HypertableId, op: CommitOp, idempotency_key: Option<&str>) -> Result<CommitResult, CatalogError>` (ADD path in this task; REPLACE/DELETE in Task 6; idempotency in Task 7)
-  - `live_parts(&self, hypertable_id: HypertableId, tenant: Option<TenantId>) -> Result<Vec<Part>, CatalogError>` — live = `deleted_by_commit IS NULL`; tenant filter = `tenant_min <= t AND tenant_max >= t`; ordered by part id.
+  - `live_parts(&self, hypertable_id: HypertableId, key: Option<i64>) -> Result<Vec<Part>, CatalogError>` — live = `deleted_by_commit IS NULL`; key filter = `packing_key_min <= k AND packing_key_max >= k`; ordered by part id.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -772,12 +786,12 @@ Append to `crates/ukiel-catalog/tests/catalog_test.rs`:
 ```rust
 use ukiel_core::{CommitOp, CommitResult, HypertableId, PartMeta};
 
-fn part_meta(path: &str, tenant_min: i64, tenant_max: i64) -> PartMeta {
+fn part_meta(path: &str, packing_key_min: i64, packing_key_max: i64) -> PartMeta {
     PartMeta {
         path: path.to_string(),
         partition_values: json!({"day": "2026-07-05"}),
-        tenant_min,
-        tenant_max,
+        packing_key_min,
+        packing_key_max,
         row_count: 100,
         size_bytes: 4096,
         level: 0,
@@ -787,7 +801,7 @@ fn part_meta(path: &str, tenant_min: i64, tenant_max: i64) -> PartMeta {
 
 async fn setup_hypertable(catalog: &ukiel_catalog::PostgresCatalog) -> HypertableId {
     catalog
-        .create_hypertable("events", &events_schema(), &json!({"columns": ["day"]}), &["tenant_id".to_string()])
+        .create_hypertable("events", &events_schema(), &json!({"columns": ["day"]}), &["tenant_id".to_string()], "tenant_id")
         .await
         .unwrap()
 }
@@ -812,8 +826,8 @@ async fn commit_add_makes_parts_live() {
     assert_eq!(parts[0].meta.path, "p1.parquet");
     assert_eq!(parts[0].created_by_commit, result.commit_id());
 
-    // Tenant pruning: tenant 60 only overlaps p2.
-    let parts = catalog.live_parts(ht, Some(TenantId(60))).await.unwrap();
+    // Packing-key pruning: key 60 only overlaps p2.
+    let parts = catalog.live_parts(ht, Some(60)).await.unwrap();
     assert_eq!(parts.len(), 1);
     assert_eq!(parts[0].meta.path, "p2.parquet");
 }
@@ -900,15 +914,15 @@ async fn insert_parts(
 ) -> Result<(), CatalogError> {
     for p in parts {
         sqlx::query(
-            "INSERT INTO parts (hypertable_id, path, partition_values, tenant_min, tenant_max,
+            "INSERT INTO parts (hypertable_id, path, partition_values, packing_key_min, packing_key_max,
                                 row_count, size_bytes, level, column_stats, created_by_commit)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(hypertable_id.0)
         .bind(&p.path)
         .bind(&p.partition_values)
-        .bind(p.tenant_min)
-        .bind(p.tenant_max)
+        .bind(p.packing_key_min)
+        .bind(p.packing_key_max)
         .bind(p.row_count)
         .bind(p.size_bytes)
         .bind(p.level)
@@ -951,7 +965,7 @@ async fn tombstone_parts(
 `crates/ukiel-catalog/src/parts.rs`:
 
 ```rust
-use ukiel_core::{CommitId, HypertableId, Part, PartId, PartMeta, TenantId};
+use ukiel_core::{CommitId, HypertableId, Part, PartId, PartMeta, NamespaceId};
 
 use crate::{CatalogError, PostgresCatalog};
 
@@ -961,8 +975,8 @@ pub(crate) struct PartRow {
     pub hypertable_id: i64,
     pub path: String,
     pub partition_values: serde_json::Value,
-    pub tenant_min: i64,
-    pub tenant_max: i64,
+    pub packing_key_min: i64,
+    pub packing_key_max: i64,
     pub row_count: i64,
     pub size_bytes: i64,
     pub level: i16,
@@ -978,8 +992,8 @@ impl From<PartRow> for Part {
             meta: PartMeta {
                 path: r.path,
                 partition_values: r.partition_values,
-                tenant_min: r.tenant_min,
-                tenant_max: r.tenant_max,
+                packing_key_min: r.packing_key_min,
+                packing_key_max: r.packing_key_max,
                 row_count: r.row_count,
                 size_bytes: r.size_bytes,
                 level: r.level,
@@ -990,25 +1004,26 @@ impl From<PartRow> for Part {
     }
 }
 
-pub(crate) const PART_COLUMNS: &str = "id, hypertable_id, path, partition_values, tenant_min, \
-     tenant_max, row_count, size_bytes, level, column_stats, created_by_commit";
+pub(crate) const PART_COLUMNS: &str = "id, hypertable_id, path, partition_values, packing_key_min, \
+     packing_key_max, row_count, size_bytes, level, column_stats, created_by_commit";
 
 impl PostgresCatalog {
-    /// Live parts of a hypertable, optionally pruned to files overlapping one tenant.
+    /// Live parts of a hypertable, optionally pruned to files whose
+    /// packing-key range contains `key`.
     pub async fn live_parts(
         &self,
         hypertable_id: HypertableId,
-        tenant: Option<TenantId>,
+        key: Option<i64>,
     ) -> Result<Vec<Part>, CatalogError> {
         let sql = format!(
             "SELECT {PART_COLUMNS} FROM parts
              WHERE hypertable_id = $1 AND deleted_by_commit IS NULL
-               AND ($2::BIGINT IS NULL OR (tenant_min <= $2 AND tenant_max >= $2))
+               AND ($2::BIGINT IS NULL OR (packing_key_min <= $2 AND packing_key_max >= $2))
              ORDER BY id"
         );
         let rows: Vec<PartRow> = sqlx::query_as(&sql)
             .bind(hypertable_id.0)
-            .bind(tenant.map(|t| t.0))
+            .bind(key)
             .fetch_all(&self.pool)
             .await?;
         Ok(rows.into_iter().map(Part::from).collect())
@@ -1044,7 +1059,7 @@ Expected: 4 tests pass.
 ```bash
 cargo fmt && cargo clippy --all-targets -- -D warnings
 git add crates/ukiel-catalog
-git commit -m "feat: commit protocol (ADD) and live_parts with tenant pruning"
+git commit -m "feat: commit protocol (ADD) and live_parts with packing-key pruning"
 ```
 
 ---
@@ -1396,8 +1411,10 @@ plans: `docs/superpowers/plans/`.
 
 - `crates/ukiel-core` — shared types (ids, parts, commit ops).
 - `crates/ukiel-catalog` — Postgres-backed catalog: transactional part commits
-  (ADD / REPLACE / DELETE with optimistic concurrency), tenant-pruned part
-  listing, ordered change feed.
+  (ADD / REPLACE / DELETE with optimistic concurrency), packing-key-pruned
+  part listing, ordered change feed. The catalog is tenancy-agnostic:
+  logical tables live in namespaces, parts cover packing-key ranges;
+  multitenancy is a deployment mapping (namespace = tenant).
 
 Tests: `cargo test` (integration tests spin up Postgres via testcontainers —
 Docker must be running).

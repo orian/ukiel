@@ -30,13 +30,15 @@ All components horizontal: ingest scales with Kafka partitions, query nodes stat
 
 ### Catalog data model (the heart)
 
-- **Hypertable** — physical table family: Arrow schema, partition spec (e.g. `(tenant_bucket, day)`), sort order (`tenant_id, ts`). Thousands exist, not millions.
-- **Logical table** — tenant-visible: `(tenant_id, name) → hypertable + tenant key + column mapping`. Per-tenant schema customization = column mapping over a wider hypertable schema, or a dedicated hypertable for heavy tenants. 1M tenants = cheap DB rows.
-- **Part** — one Parquet file: path, partition values, tenant_id min/max (packed files span many tenants, dedicated files one), row count, size, column stats, **level** (L0 fresh → L2 compacted).
+The catalog core is **tenancy-agnostic**. It knows two generic concepts: **namespaces** (own logical tables) and a per-hypertable **packing key** (an i64 column whose min/max every part records, used for range pruning and file packing). Multitenancy is a deployment mapping, not part of the engine spec: namespace = tenant, packing key = the `tenant_id` column. Non-multitenant embedders map namespaces to datasets/teams and pack by any i64 key (string keys are hashed by the embedder).
+
+- **Hypertable** — physical table family: Arrow schema, partition spec (e.g. `(key_bucket, day)`), sort order (`tenant_id, ts`), declared packing key. Thousands exist, not millions.
+- **Logical table** — what a client sees: `(namespace_id, name) → hypertable + column mapping`. Per-table schema customization = column mapping over a wider hypertable schema, or a dedicated hypertable for heavy namespaces. 1M namespaces = cheap DB rows.
+- **Part** — one Parquet file: path, partition values, packing-key min/max (packed files span a key range, separated files exactly one key), row count, size, column stats, **level** (L0 fresh → L2 compacted).
 - **Commit** — atomic `ADD` / `REPLACE(old→new)` / `DELETE` of parts with optimistic concurrency: REPLACE fails if any input part is not live; loser retries on fresh state. This one rule resolves mutation-vs-compaction conflicts (README pt 9).
 - **Change feed** — per-hypertable ordered log of commit events (`parts_added`, `parts_replaced`, seq no). MV/compaction workers are durable cursors. (README pt 6.)
 
-Query planning = one indexed catalog query (*live parts where partition ∈ P and tenant range ∋ T*), never an object-store listing.
+Query planning = one indexed catalog query (*live parts where partition ∈ P and packing-key range ∋ k*), never an object-store listing.
 
 ### Ingest (Kafka → Parquet)
 
@@ -50,9 +52,20 @@ Custom DataFusion `CatalogProvider`/`TableProvider`: resolve tenant's logical ta
 
 - Deletes/updates land immediately as **tombstone parts** (delete vectors keyed by row position or key); readers merge them (dimension tables are small — cheap).
 - Background **rewrite workers** fold tombstones into plain Parquet when resources allow (priority: tables with high tombstone ratio; GDPR deletes get deadlines).
-- **Compaction workers** merge L0→L1→L2, re-sorting/packing by tenant; big tenants naturally separate into dedicated files.
+- **Compaction workers** merge L0→L1→L2, re-sorting by packing key; heavy keys naturally separate into dedicated files.
 - Both are just change-feed consumers issuing REPLACE commits; optimistic concurrency arbitrates.
 - V1: copy-on-write REPLACE + compaction only; tombstone read-merge stubbed behind the TableProvider interface.
+
+### Placement policy: per-key deletion & retention
+
+Per-customer data deletion (GDPR) and per-customer retention favor physical separation; the small-file problem at 1M tiny tenants favors packing. Resolution: **placement is a per-hypertable policy, not an architecture choice**, and the catalog supports both shapes natively (a separated file is just a part with `packing_key_min == packing_key_max`).
+
+- **L0 is always packed** — ingest at a 10–20s flush cadence cannot maintain a million open writers. L0 files are short-lived (minutes–hours until compaction).
+- **At rest (L1+), policy per hypertable**: `separated` — compaction splits every packing key into its own files (SaaS default; the right choice when deletion/retention SLAs dominate); or `packed` — small keys share files, sorted by packing key so each key's rows occupy contiguous row groups.
+- **Deletion of key k**: separated files → metadata-only DELETE commit (drop k's files); packed L0/L1 files overlapping k → REPLACE-rewrite without k's rows. Sorted packing makes rewrites cheap: untouched row groups are copied byte-wise, no decode. Worst-case rewrite scope = the hot window, not the lake.
+- **Retention**: policy per logical table (namespace). Separated + time-partitioned data → expiry is metadata-only drops of aged parts. Packed data → retention-aware compaction filters expired rows on every pass, plus a sweep worker that rewrites any file whose expired fraction crosses a threshold.
+- Cost of `separated` at rest: file count scales with active namespaces × partitions. Mitigation: size-based rolling (a small namespace's file spans many days until it reaches target size), so tiny namespaces produce few files, not one per day.
+- All of this runs on the same change-feed + REPLACE machinery as compaction; deletion and retention workers are just more commit authors, arbitrated by optimistic concurrency.
 
 ### MVs
 
