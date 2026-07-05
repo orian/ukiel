@@ -1,0 +1,215 @@
+//! The shared rewrite engine: read parts -> merge -> sort -> split -> encode.
+//! Used by both compaction (merge small files) and deletion (rewrite without
+//! one key). Pure functions over Arrow batches; no catalog access.
+
+use std::sync::Arc;
+
+use arrow::array::{Array, Int64Array, RecordBatch};
+use arrow::compute::{SortColumn, concat_batches, lexsort_to_indices, take};
+use arrow::datatypes::SchemaRef;
+use object_store::path::Path;
+use object_store::{ObjectStore, ObjectStoreExt};
+use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::properties::WriterProperties;
+use ukiel_core::Part;
+
+use crate::CompactorError;
+
+/// Downloads every part and concatenates all row batches into one.
+pub async fn read_parts_to_batch(
+    store: &Arc<dyn ObjectStore>,
+    schema: SchemaRef,
+    parts: &[Part],
+) -> Result<RecordBatch, CompactorError> {
+    let mut batches = Vec::new();
+    for part in parts {
+        let bytes = store
+            .get(&Path::from(part.meta.path.clone()))
+            .await?
+            .bytes()
+            .await?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)?.build()?;
+        for batch in reader {
+            batches.push(batch?);
+        }
+    }
+    Ok(concat_batches(&schema, &batches)?)
+}
+
+/// Lexicographic sort by the named columns (in order).
+pub fn sort_batch(batch: &RecordBatch, sort_key: &[String]) -> Result<RecordBatch, CompactorError> {
+    let mut columns = Vec::with_capacity(sort_key.len());
+    for name in sort_key {
+        let idx = batch
+            .schema()
+            .index_of(name)
+            .map_err(|_| CompactorError::MissingColumn(name.clone()))?;
+        columns.push(SortColumn {
+            values: batch.column(idx).clone(),
+            options: None,
+        });
+    }
+    let indices = lexsort_to_indices(&columns, None)?;
+    let sorted = batch
+        .columns()
+        .iter()
+        .map(|c| take(c.as_ref(), &indices, None))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RecordBatch::try_new(batch.schema(), sorted)?)
+}
+
+/// Splits a batch (already sorted with `packing_key` as primary sort column)
+/// into one contiguous slice per distinct key value.
+pub fn split_by_key(
+    batch: &RecordBatch,
+    packing_key: &str,
+) -> Result<Vec<(i64, RecordBatch)>, CompactorError> {
+    let keys = int64_column(batch, packing_key)?;
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for i in 1..=keys.len() {
+        if i == keys.len() || keys.value(i) != keys.value(start) {
+            out.push((keys.value(start), batch.slice(start, i - start)));
+            start = i;
+        }
+    }
+    Ok(out)
+}
+
+/// Min/max of the packing column.
+pub fn key_range(batch: &RecordBatch, packing_key: &str) -> Result<(i64, i64), CompactorError> {
+    let keys = int64_column(batch, packing_key)?;
+    let min = arrow::compute::min(keys)
+        .ok_or_else(|| CompactorError::MissingColumn(packing_key.to_string()))?;
+    let max = arrow::compute::max(keys)
+        .ok_or_else(|| CompactorError::MissingColumn(packing_key.to_string()))?;
+    Ok((min, max))
+}
+
+/// ZSTD Parquet bytes for one batch.
+pub fn batch_to_parquet(batch: &RecordBatch) -> Result<Vec<u8>, CompactorError> {
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .build();
+    let mut bytes = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), Some(props))?;
+    writer.write(batch)?;
+    writer.close()?;
+    Ok(bytes)
+}
+
+pub(crate) fn int64_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a Int64Array, CompactorError> {
+    let idx = batch
+        .schema()
+        .index_of(name)
+        .map_err(|_| CompactorError::MissingColumn(name.to_string()))?;
+    batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| CompactorError::NotInt64(name.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::memory::InMemory;
+    use serde_json::json;
+    use ukiel_core::{CommitId, HypertableId, PartId, PartMeta, arrow_schema_from_json};
+    use ukiel_ingest::rows_to_parquet;
+
+    fn schema_json() -> serde_json::Value {
+        json!({"fields": [
+            {"name": "tenant_id", "type": "int64"},
+            {"name": "ts", "type": "timestamp_ms"},
+            {"name": "payload", "type": "utf8"}
+        ]})
+    }
+
+    fn part(path: &str, meta_src: &ukiel_ingest::EncodedPart) -> Part {
+        Part {
+            id: PartId(0),
+            hypertable_id: HypertableId(1),
+            meta: PartMeta {
+                path: path.to_string(),
+                partition_values: json!({}),
+                packing_key_min: meta_src.key_min,
+                packing_key_max: meta_src.key_max,
+                row_count: meta_src.row_count,
+                size_bytes: meta_src.bytes.len() as i64,
+                level: 0,
+                column_stats: None,
+            },
+            created_by_commit: CommitId(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_sort_split_round_trip() {
+        let arrow_schema = Arc::new(arrow_schema_from_json(&schema_json()).unwrap());
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        // Two unsorted-across-files L0 parts: keys interleaved.
+        let f1 = rows_to_parquet(
+            &arrow_schema,
+            "tenant_id",
+            "ts",
+            vec![
+                json!({"tenant_id": 2, "ts": 20, "payload": "b1"}),
+                json!({"tenant_id": 7, "ts": 10, "payload": "c1"}),
+            ],
+        )
+        .unwrap();
+        let f2 = rows_to_parquet(
+            &arrow_schema,
+            "tenant_id",
+            "ts",
+            vec![
+                json!({"tenant_id": 1, "ts": 30, "payload": "a1"}),
+                json!({"tenant_id": 7, "ts": 5,  "payload": "c0"}),
+            ],
+        )
+        .unwrap();
+        store
+            .put(&Path::from("p1"), f1.bytes.clone().into())
+            .await
+            .unwrap();
+        store
+            .put(&Path::from("p2"), f2.bytes.clone().into())
+            .await
+            .unwrap();
+        let parts = vec![part("p1", &f1), part("p2", &f2)];
+
+        let merged = read_parts_to_batch(&store, arrow_schema.clone(), &parts)
+            .await
+            .unwrap();
+        assert_eq!(merged.num_rows(), 4);
+
+        let sorted = sort_batch(&merged, &["tenant_id".to_string(), "ts".to_string()]).unwrap();
+        let keys = int64_column(&sorted, "tenant_id").unwrap();
+        assert_eq!(keys.values().as_ref(), &[1, 2, 7, 7]);
+        let ts = int64_column(&sorted, "ts").unwrap();
+        assert_eq!(ts.values().as_ref(), &[30, 20, 5, 10]); // ts sorted within key 7
+
+        assert_eq!(key_range(&sorted, "tenant_id").unwrap(), (1, 7));
+
+        let splits = split_by_key(&sorted, "tenant_id").unwrap();
+        let split_keys: Vec<i64> = splits.iter().map(|(k, _)| *k).collect();
+        assert_eq!(split_keys, vec![1, 2, 7]);
+        assert_eq!(splits[2].1.num_rows(), 2);
+
+        // Encode a slice and read it back.
+        let bytes = batch_to_parquet(&splits[2].1).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+            .unwrap()
+            .build()
+            .unwrap();
+        let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
+        assert_eq!(rows, 2);
+    }
+}

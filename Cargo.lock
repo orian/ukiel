@@ -4515,6 +4515,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ukiel-compactor"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "bytes",
+ "futures",
+ "object_store",
+ "parquet",
+ "serde_json",
+ "testcontainers-modules",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "ukiel-catalog",
+ "ukiel-core",
+ "ukiel-ingest",
+ "uuid",
+]
+
+[[package]]
 name = "ukiel-core"
 version = "0.1.0"
 dependencies = [
