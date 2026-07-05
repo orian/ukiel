@@ -13,3 +13,18 @@ The idea:
 8. Q: how to handle deletes? as the database would be multitenant, we could have a worker rewriting the data, that's all.
 9. conflicts between: mutations and merges
 
+## Development
+
+Rust workspace. Design spec: `docs/superpowers/specs/2026-07-05-ukiel-design.md`,
+plans: `docs/superpowers/plans/`.
+
+- `crates/ukiel-core` — shared types (ids, parts, commit ops).
+- `crates/ukiel-catalog` — Postgres-backed catalog: transactional part commits
+  (ADD / REPLACE / DELETE with optimistic concurrency), packing-key-pruned
+  part listing, ordered change feed. The catalog is tenancy-agnostic:
+  logical tables live in namespaces, parts cover packing-key ranges;
+  multitenancy is a deployment mapping (namespace = tenant).
+
+Tests: `cargo test` (integration tests spin up Postgres via testcontainers —
+Docker must be running).
+
