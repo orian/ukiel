@@ -6,11 +6,11 @@
 
 **Architecture:** The catalog is the transactional heart of Ukiel (spec: `docs/superpowers/specs/2026-07-05-ukiel-design.md`). Parquet files ("parts") are immutable; the catalog tracks which parts are live. All writers (ingest, compaction, mutation workers) commit through one protocol: `ADD` inserts parts, `REPLACE` atomically tombstones old parts and inserts new ones, failing if any old part was already tombstoned (optimistic concurrency — loser retries). Every commit is an ordered change-feed event that downstream workers (MVs, compaction) consume via cursors.
 
-**Tech Stack:** Rust 2021, sqlx 0.9 (Postgres, runtime queries — NOT the compile-time `query!` macros), tokio 1.52, testcontainers-modules 0.15 for integration tests.
+**Tech Stack:** Rust 2024, sqlx 0.9 (Postgres, runtime queries — NOT the compile-time `query!` macros), tokio 1.52, testcontainers-modules 0.15 for integration tests.
 
 ## Global Constraints
 
-- Rust edition 2021, toolchain ≥ 1.91.
+- Rust edition 2024, toolchain ≥ 1.96.
 - Use plain `sqlx::query` / `query_as` / `query_scalar` string queries. Do NOT use `sqlx::query!` macros (they need DATABASE_URL at compile time).
 - Integration tests live in `crates/ukiel-catalog/tests/` and require Docker running. `cargo build` and `ukiel-core` unit tests must work without Docker.
 - Commit messages: conventional style (`feat:`, `test:`, `chore:`). Never add Claude/AI attribution ("Co-Authored-By: Claude", "Generated with Claude Code") to commits.
@@ -41,7 +41,7 @@ members = ["crates/ukiel-core", "crates/ukiel-catalog"]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [workspace.dependencies]
 tokio = { version = "1.52", features = ["macros", "rt-multi-thread"] }

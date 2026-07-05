@@ -12,7 +12,7 @@ Spec: `docs/superpowers/specs/2026-07-05-ukiel-design.md`. V1 is split into 5 pl
 
 Cross-plan constraints (repeat in every plan's Global Constraints):
 
-- Rust edition 2021, toolchain ≥ 1.91
+- Rust edition 2024, toolchain ≥ 1.96
 - Workspace deps pinned in root `Cargo.toml`: tokio 1.52 · sqlx 0.9 · serde_json 1 · thiserror 2 · chrono 0.4 · testcontainers-modules 0.15 · datafusion 54 · object_store 0.14
 - No Claude/AI attribution in commit messages
 - Integration tests use testcontainers (Docker required); unit tests must pass without Docker
