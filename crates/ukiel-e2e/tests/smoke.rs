@@ -14,7 +14,7 @@ use ukiel_e2e::Stack;
 async fn create_ingest_100_and_query() {
     let stack = Stack::start().await;
     let table = stack.create_events_table().await;
-    let ingest = stack.spawn_ingest(&table);
+    let ingest = stack.spawn_ingest(&table).await;
 
     // 1. + 2. Ingest 100 rows.
     let produced = stack.produce_events(&table, 100).await;

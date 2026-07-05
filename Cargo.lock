@@ -4558,6 +4558,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "ukiel-catalog",
+ "ukiel-compactor",
  "ukiel-core",
  "ukiel-ingest",
  "ukiel-query",

@@ -12,10 +12,12 @@ use std::time::{Duration, Instant};
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use rdkafka::config::ClientConfig;
-use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use ukiel_catalog::PostgresCatalog;
+use ukiel_compactor::CompactorError;
+use ukiel_compactor::compactor::{Compactor, CompactorConfig};
 use ukiel_core::{HypertableId, NamespaceId};
 use ukiel_ingest::config::{IngestConfig, TableRoute};
 use ukiel_ingest::consumer::IngestWorker;
@@ -34,7 +36,10 @@ pub struct Table {
     pub hypertable_id: HypertableId,
     pub hypertable_name: String,
     pub topic: String,
+    /// Primary namespace (the first one created); handy for single-tenant tests.
     pub namespace: NamespaceId,
+    /// Every namespace with a logical `events` table over this hypertable.
+    pub namespaces: Vec<NamespaceId>,
     pub ts_column: String,
 }
 
@@ -150,13 +155,78 @@ impl Stack {
             hypertable_name,
             topic,
             namespace,
+            namespaces: vec![namespace],
             ts_column: "ts".to_string(),
+        }
+    }
+
+    /// Like `create_events_table`, but registers `count` distinct namespaces —
+    /// all logical `events` tables over one shared (packed) hypertable, so their
+    /// rows land in the same Parquet files. Namespace ids are per-run unique.
+    pub async fn create_events_table_multi(&self, count: usize) -> Table {
+        let hypertable_name = format!("events_{}", self.nonce);
+        let topic = format!("events_{}", self.nonce);
+        let base = (uuid::Uuid::new_v4().as_u128() as i64).abs() % 1_000_000 + 1;
+        let namespaces: Vec<NamespaceId> =
+            (0..count as i64).map(|i| NamespaceId(base + i)).collect();
+
+        let ht = self
+            .catalog
+            .create_hypertable(
+                &hypertable_name,
+                &Self::events_schema(),
+                &json!({"columns": ["day"]}),
+                &["tenant_id".to_string(), "ts".to_string()],
+                "tenant_id",
+            )
+            .await
+            .expect("create hypertable");
+        for ns in &namespaces {
+            self.catalog
+                .create_logical_table(*ns, "events", ht)
+                .await
+                .expect("create logical table");
+        }
+
+        Table {
+            hypertable_id: ht,
+            hypertable_name,
+            topic,
+            namespace: namespaces[0],
+            namespaces,
+            ts_column: "ts".to_string(),
+        }
+    }
+
+    /// Blocks until `topic` exists with at least one partition (broker
+    /// auto-create is enabled, so a metadata fetch materializes it). The ingest
+    /// worker assigns partitions once at startup; without this it could race a
+    /// cold topic, see zero partitions, and silently consume nothing.
+    pub async fn ensure_topic(&self, topic: &str) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Ok(md) = self
+                .producer
+                .client()
+                .fetch_metadata(Some(topic), Duration::from_secs(5))
+                && let Some(t) = md.topics().iter().find(|t| t.name() == topic)
+                && t.error().is_none()
+                && !t.partitions().is_empty()
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "topic '{topic}' never became ready"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
 
     /// Spawns an in-process ingest worker for `table`, returning a shutdown
     /// token and the worker's join handle. Fast flush interval for test speed.
-    pub fn spawn_ingest(&self, table: &Table) -> IngestHandle {
+    pub async fn spawn_ingest(&self, table: &Table) -> IngestHandle {
+        self.ensure_topic(&table.topic).await;
         let config = IngestConfig {
             brokers: self.brokers.clone(),
             group_id: format!("ukiel-e2e-{}", self.nonce),
@@ -199,6 +269,89 @@ impl Stack {
             payloads.push(payload);
         }
         payloads
+    }
+
+    /// Produces `count` events for an explicit `tenant` (packing-key value),
+    /// tagging payloads `"{tag}-{i}"` so callers can build a per-namespace model.
+    /// Returns the payloads produced.
+    pub async fn produce_events_for(
+        &self,
+        table: &Table,
+        tenant: NamespaceId,
+        tag: &str,
+        count: usize,
+    ) -> Vec<String> {
+        let mut payloads = Vec::with_capacity(count);
+        for i in 0..count {
+            let payload = format!("{tag}-{i}");
+            let ts = 1_000 + i as i64; // all within 1970-01-01
+            let msg = json!({
+                "tenant_id": tenant.0,
+                "ts": ts,
+                "payload": payload,
+            })
+            .to_string();
+            self.producer
+                .send(
+                    FutureRecord::<(), _>::to(&table.topic).payload(&msg),
+                    Duration::from_secs(10),
+                )
+                .await
+                .map_err(|(e, _)| e)
+                .expect("produce");
+            payloads.push(payload);
+        }
+        payloads
+    }
+
+    /// Spawns an in-process compactor loop (fast poll) over all hypertables.
+    pub fn spawn_compactor(&self) -> CompactorHandle {
+        let compactor = Compactor::new(
+            self.catalog.clone(),
+            self.store.clone(),
+            CompactorConfig {
+                worker_name: "e2e-loop".to_string(),
+                poll_interval_ms: 200,
+                ..CompactorConfig::default()
+            },
+        );
+        let shutdown = CancellationToken::new();
+        let token = shutdown.clone();
+        let handle = tokio::spawn(async move { compactor.run(token).await });
+        CompactorHandle { shutdown, handle }
+    }
+
+    /// Runs `run_once` (with a fresh cursor) until a pass merges nothing —
+    /// deterministic quiescence for assertions. Returns total groups merged.
+    pub async fn run_compaction_to_quiescence(&self) -> usize {
+        let compactor = Compactor::new(
+            self.catalog.clone(),
+            self.store.clone(),
+            CompactorConfig {
+                worker_name: "e2e-drain".to_string(),
+                ..CompactorConfig::default()
+            },
+        );
+        let mut total = 0;
+        loop {
+            let stats = compactor.run_once().await.expect("compaction pass");
+            total += stats.merged_groups;
+            if stats.merged_groups == 0 {
+                break;
+            }
+        }
+        total
+    }
+
+    /// Count of live parts at the given compaction level for a hypertable.
+    pub async fn count_parts_at_level(&self, ht: HypertableId, level: i16) -> usize {
+        self.catalog
+            .live_parts(ht, None)
+            .await
+            .expect("live_parts")
+            .iter()
+            .filter(|p| p.meta.level == level)
+            .count()
     }
 
     /// Runs a SQL query for `namespace` through the HTTP endpoint, returning the
@@ -263,5 +416,22 @@ impl IngestHandle {
     /// Aborts the worker abruptly, simulating a crash (no final flush).
     pub fn abort(self) {
         self.handle.abort();
+    }
+}
+
+/// A running compactor loop; stop with `stop()`.
+pub struct CompactorHandle {
+    shutdown: CancellationToken,
+    handle: tokio::task::JoinHandle<Result<(), CompactorError>>,
+}
+
+impl CompactorHandle {
+    /// Signals shutdown and waits for the compactor loop to finish.
+    pub async fn stop(self) {
+        self.shutdown.cancel();
+        self.handle
+            .await
+            .expect("compactor join")
+            .expect("compactor run");
     }
 }

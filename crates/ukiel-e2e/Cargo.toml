@@ -11,6 +11,7 @@ ukiel-core = { workspace = true }
 ukiel-catalog = { workspace = true }
 ukiel-ingest = { workspace = true }
 ukiel-query = { workspace = true }
+ukiel-compactor = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
 rdkafka = { workspace = true }
 tokio = { workspace = true }
