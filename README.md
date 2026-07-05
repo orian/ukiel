@@ -16,7 +16,8 @@ The idea:
 ## Development
 
 Rust workspace. Design spec: `docs/superpowers/specs/2026-07-05-ukiel-design.md`,
-plans: `docs/superpowers/plans/`.
+plans: `docs/superpowers/plans/`, concept notes: `docs/notes/`
+(e.g. [schema management](docs/notes/schema-management.md)).
 
 - `crates/ukiel-core` — shared types (ids, parts, commit ops).
 - `crates/ukiel-catalog` — Postgres-backed catalog: transactional part commits
