@@ -1,5 +1,7 @@
 //! Kafka -> sorted Parquet L0 -> catalog commit.
 
+pub mod config;
+pub mod consumer;
 mod error;
 pub mod flusher;
 pub mod writer;
