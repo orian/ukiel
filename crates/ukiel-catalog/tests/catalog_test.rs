@@ -357,3 +357,65 @@ async fn idempotency_key_dedups_commit() {
     assert!(matches!(third, CommitResult::Committed(_)));
     assert_eq!(catalog.live_parts(ht, None).await.unwrap().len(), 2);
 }
+
+use ukiel_core::CommitId;
+
+#[tokio::test]
+async fn change_feed_replays_commits_in_order() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+
+    catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![part_meta("a.parquet", 1, 10)],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let old_ids: Vec<_> = catalog
+        .live_parts(ht, None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|p| p.id)
+        .collect();
+    catalog
+        .commit(
+            ht,
+            CommitOp::Replace {
+                old: old_ids.clone(),
+                new: vec![part_meta("b.parquet", 1, 10)],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let events = catalog.changes_since(ht, CommitId(0), 100).await.unwrap();
+    assert_eq!(events.len(), 2);
+
+    assert_eq!(events[0].kind, "add");
+    assert_eq!(events[0].added.len(), 1);
+    assert_eq!(events[0].added[0].meta.path, "a.parquet");
+    assert!(events[0].removed.is_empty());
+
+    assert_eq!(events[1].kind, "replace");
+    assert_eq!(events[1].added[0].meta.path, "b.parquet");
+    assert_eq!(events[1].removed, old_ids);
+    assert!(events[0].commit_id < events[1].commit_id);
+
+    // Cursor semantics: resuming after event 0 yields only event 1.
+    let tail = catalog
+        .changes_since(ht, events[0].commit_id, 100)
+        .await
+        .unwrap();
+    assert_eq!(tail.len(), 1);
+    assert_eq!(tail[0].commit_id, events[1].commit_id);
+
+    // Limit is respected.
+    let page = catalog.changes_since(ht, CommitId(0), 1).await.unwrap();
+    assert_eq!(page.len(), 1);
+}

@@ -2,6 +2,7 @@
 
 mod commit;
 mod error;
+mod feed;
 mod parts;
 mod tables;
 
