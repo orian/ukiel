@@ -16,12 +16,11 @@ use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use ukiel_catalog::{OffsetRange, PostgresCatalog};
-use ukiel_core::{Hypertable, arrow_schema_from_json};
+use ukiel_core::Hypertable;
 
 use crate::IngestError;
 use crate::config::{IngestConfig, TableRoute};
 use crate::flusher::{FlushItem, Flusher};
-use crate::writer::rows_to_parquet;
 
 pub struct IngestWorker {
     catalog: PostgresCatalog,
@@ -194,11 +193,11 @@ impl RouteIngest {
         if buffers.ranges.is_empty() {
             return Ok(());
         }
-        let schema = arrow_schema_from_json(&hypertable.table_schema)?;
+        let cols = ukiel_core::TableColumns::parse(&hypertable.table_schema)?;
         let mut items = Vec::new();
         for (day, rows) in buffers.rows_by_day.drain() {
-            let part = rows_to_parquet(
-                &schema,
+            let part = crate::writer::encode_rows(
+                &cols,
                 &hypertable.packing_key,
                 &self.route.ts_column,
                 rows,

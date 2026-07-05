@@ -7,4 +7,4 @@ pub mod flusher;
 pub mod writer;
 
 pub use error::IngestError;
-pub use writer::{EncodedPart, rows_to_parquet};
+pub use writer::{EncodedPart, encode_rows, rows_to_parquet};
