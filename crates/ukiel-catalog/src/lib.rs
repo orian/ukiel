@@ -1,6 +1,8 @@
 //! Postgres-backed catalog: parts, commits, change feed.
 
+mod commit;
 mod error;
+mod parts;
 mod tables;
 
 pub use error::CatalogError;
@@ -11,7 +13,7 @@ use sqlx::postgres::PgPoolOptions;
 /// The catalog service handle. Cheap to clone (wraps a connection pool).
 #[derive(Clone)]
 pub struct PostgresCatalog {
-    pool: PgPool,
+    pub(crate) pool: PgPool,
 }
 
 impl PostgresCatalog {

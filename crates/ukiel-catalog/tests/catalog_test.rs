@@ -1,7 +1,33 @@
 mod common;
 
 use serde_json::json;
-use ukiel_core::NamespaceId;
+use ukiel_core::{CommitOp, CommitResult, HypertableId, NamespaceId, PartMeta};
+
+fn part_meta(path: &str, packing_key_min: i64, packing_key_max: i64) -> PartMeta {
+    PartMeta {
+        path: path.to_string(),
+        partition_values: json!({"day": "2026-07-05"}),
+        packing_key_min,
+        packing_key_max,
+        row_count: 100,
+        size_bytes: 4096,
+        level: 0,
+        column_stats: None,
+    }
+}
+
+async fn setup_hypertable(catalog: &ukiel_catalog::PostgresCatalog) -> HypertableId {
+    catalog
+        .create_hypertable(
+            "events",
+            &events_schema(),
+            &json!({"columns": ["day"]}),
+            &["tenant_id".to_string()],
+            "tenant_id",
+        )
+        .await
+        .unwrap()
+}
 
 fn events_schema() -> serde_json::Value {
     json!({"fields": [
@@ -76,4 +102,35 @@ async fn logical_table_create_and_get() {
         .await
         .unwrap_err();
     assert!(matches!(err, ukiel_catalog::CatalogError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn commit_add_makes_parts_live() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+
+    let result = catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![
+                    part_meta("p1.parquet", 1, 50),
+                    part_meta("p2.parquet", 51, 99),
+                ],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(result, CommitResult::Committed(_)));
+
+    let parts = catalog.live_parts(ht, None).await.unwrap();
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0].meta.path, "p1.parquet");
+    assert_eq!(parts[0].created_by_commit, result.commit_id());
+
+    // Packing-key pruning: key 60 only overlaps p2.
+    let parts = catalog.live_parts(ht, Some(60)).await.unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].meta.path, "p2.parquet");
 }
