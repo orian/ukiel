@@ -44,8 +44,12 @@ impl IngestWorker {
 
     /// Consumes all configured routes until `shutdown` is cancelled.
     /// Buffered rows are flushed one final time on shutdown.
+    ///
+    /// Route tasks are owned by a `JoinSet` so that dropping this future
+    /// (a crash / cancellation) aborts them — otherwise a detached route task
+    /// would keep consuming Kafka and committing after the worker is gone.
     pub async fn run(&self, shutdown: CancellationToken) -> Result<(), IngestError> {
-        let mut handles = Vec::new();
+        let mut set = tokio::task::JoinSet::new();
         for route in &self.config.tables {
             let task = RouteIngest {
                 catalog: self.catalog.clone(),
@@ -54,10 +58,10 @@ impl IngestWorker {
                 route: route.clone(),
             };
             let token = shutdown.clone();
-            handles.push(tokio::spawn(async move { task.run(token).await }));
+            set.spawn(async move { task.run(token).await });
         }
-        for handle in handles {
-            handle.await.expect("route task panicked")?;
+        while let Some(res) = set.join_next().await {
+            res.expect("route task panicked")?;
         }
         Ok(())
     }

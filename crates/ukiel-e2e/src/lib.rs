@@ -354,6 +354,33 @@ impl Stack {
             .count()
     }
 
+    /// Deletes all of one packing key's data from a hypertable (GDPR-style),
+    /// via the compactor's atomic REPLACE deletion path. Returns the stats.
+    pub async fn delete_key(
+        &self,
+        ht: HypertableId,
+        key: i64,
+    ) -> ukiel_compactor::deletion::DeletionStats {
+        let hypertable = self
+            .catalog
+            .get_hypertable_by_id(ht)
+            .await
+            .expect("get hypertable");
+        ukiel_compactor::deletion::delete_key(&self.catalog, &self.store, &hypertable, key)
+            .await
+            .expect("delete_key")
+    }
+
+    /// Whether any live part still claims `key` in its packing-key range.
+    pub async fn any_live_part_claims(&self, ht: HypertableId, key: i64) -> bool {
+        self.catalog
+            .live_parts(ht, Some(key))
+            .await
+            .expect("live_parts")
+            .iter()
+            .any(|p| p.meta.packing_key_min <= key && p.meta.packing_key_max >= key)
+    }
+
     /// Runs a SQL query for `namespace` through the HTTP endpoint, returning the
     /// `rows` JSON array (or an Err with the HTTP body on non-200).
     pub async fn query(&self, namespace: NamespaceId, sql: &str) -> Result<Value, String> {
