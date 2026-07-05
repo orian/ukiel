@@ -3,11 +3,13 @@
 pub mod commit;
 pub mod ids;
 pub mod part;
+pub mod schema;
 pub mod table;
 
 pub use commit::{ChangeEvent, CommitOp, CommitResult};
 pub use ids::{CommitId, HypertableId, LogicalTableId, NamespaceId, PartId};
 pub use part::{Part, PartMeta};
+pub use schema::{SchemaError, arrow_schema_from_json};
 pub use table::{Hypertable, LogicalTable};
 
 #[cfg(test)]
