@@ -34,4 +34,10 @@ impl PostgresCatalog {
         sqlx::migrate!("./migrations").run(&self.pool).await?;
         Ok(())
     }
+
+    /// Raw pool access for tests and migrations-adjacent tooling.
+    /// Not part of the stable API.
+    pub fn pool_for_tests(&self) -> &sqlx::PgPool {
+        &self.pool
+    }
 }

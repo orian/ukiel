@@ -316,3 +316,70 @@ async fn competing_compactors_never_lose_data() {
         "at least one pass merged: {s1:?} {s2:?}"
     );
 }
+
+pub async fn sqlx_update_schema(env: &Env, schema: &serde_json::Value) {
+    // Direct DB update: stands in for the future alter_hypertable_add_column.
+    sqlx::query("UPDATE hypertables SET table_schema = $1 WHERE id = $2")
+        .bind(schema)
+        .bind(env.ht.0)
+        .execute(env.catalog.pool_for_tests())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn compaction_backfills_materialized_columns_added_later() {
+    let env = setup().await;
+
+    // Write two L0 files with the ORIGINAL schema (no materialized column) —
+    // these are "old files" from before the column existed.
+    add_l0(
+        &env,
+        "d1",
+        vec![json!({"tenant_id": 1, "ts": 5, "payload": "a"})],
+    )
+    .await;
+    add_l0(
+        &env,
+        "d1",
+        vec![json!({"tenant_id": 1, "ts": 6, "payload": "b"})],
+    )
+    .await;
+
+    // Schema evolves: a materialized column is added (additive, nullable).
+    let evolved = json!({"fields": [
+        {"name": "tenant_id", "type": "int64"},
+        {"name": "ts", "type": "timestamp_ms"},
+        {"name": "payload", "type": "utf8"},
+        {"name": "ts_plus_key", "type": "int64", "materialized": "ts + tenant_id"}
+    ]});
+    sqlx_update_schema(&env, &evolved).await;
+
+    let compactor = Compactor::new(
+        env.catalog.clone(),
+        env.store.clone(),
+        CompactorConfig::default(),
+    );
+    let stats = compactor.run_once().await.unwrap();
+    assert_eq!(stats.merged_groups, 1);
+
+    // The L1 file physically contains the backfilled materialized column.
+    let ht = env.catalog.get_hypertable("events").await.unwrap();
+    let schema = std::sync::Arc::new(
+        ukiel_core::TableColumns::parse(&ht.table_schema)
+            .unwrap()
+            .physical_schema(),
+    );
+    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
+    assert_eq!(parts.len(), 1);
+    let batch = rewrite::read_parts_to_batch(&env.store, schema, &parts)
+        .await
+        .unwrap();
+    let idx = batch.schema().index_of("ts_plus_key").unwrap();
+    let col: &arrow::array::Int64Array = batch.column(idx).as_any().downcast_ref().unwrap();
+    assert_eq!(
+        col.values().as_ref(),
+        &[6, 7],
+        "ts + tenant_id, backfilled and sorted"
+    );
+}

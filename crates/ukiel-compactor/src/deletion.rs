@@ -11,7 +11,7 @@ use object_store::ObjectStore;
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use ukiel_catalog::PostgresCatalog;
-use ukiel_core::{CommitOp, Hypertable, PartMeta, arrow_schema_from_json};
+use ukiel_core::{CommitOp, Hypertable, PartMeta};
 
 use crate::CompactorError;
 use crate::rewrite;
@@ -34,7 +34,8 @@ pub async fn delete_key(
         return Ok(DeletionStats::default());
     }
 
-    let schema = Arc::new(arrow_schema_from_json(&hypertable.table_schema)?);
+    let cols = ukiel_core::TableColumns::parse(&hypertable.table_schema)?;
+    let schema = Arc::new(cols.physical_schema());
     let mut stats = DeletionStats::default();
     let mut new_parts: Vec<PartMeta> = Vec::new();
 
@@ -49,6 +50,7 @@ pub async fn delete_key(
         // Packed file: rewrite without the key's rows.
         let batch =
             rewrite::read_parts_to_batch(store, schema.clone(), std::slice::from_ref(part)).await?;
+        let batch = ukiel_expr::apply_defaults_and_materialized(batch, &cols)?;
         let keys = rewrite::int64_column(&batch, &hypertable.packing_key)?;
         let mask = neq(keys, &Int64Array::new_scalar(key))?;
         let kept = filter_record_batch(&batch, &mask)?;

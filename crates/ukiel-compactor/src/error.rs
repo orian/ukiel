@@ -10,6 +10,8 @@ pub enum CompactorError {
     ObjectStore(#[from] object_store::Error),
     #[error(transparent)]
     Catalog(#[from] ukiel_catalog::CatalogError),
+    #[error(transparent)]
+    Expr(#[from] ukiel_expr::ExprError),
     #[error("column '{0}' not found in schema")]
     MissingColumn(String),
     #[error("column '{0}' is not Int64")]

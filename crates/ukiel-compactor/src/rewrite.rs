@@ -17,7 +17,9 @@ use ukiel_core::Part;
 
 use crate::CompactorError;
 
-/// Downloads every part and concatenates all row batches into one.
+/// Downloads every part and concatenates all row batches into one, adapting
+/// each file to `schema`: a column the file predates contributes NULLs
+/// (additive schema evolution).
 pub async fn read_parts_to_batch(
     store: &Arc<dyn ObjectStore>,
     schema: SchemaRef,
@@ -32,10 +34,24 @@ pub async fn read_parts_to_batch(
             .await?;
         let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)?.build()?;
         for batch in reader {
-            batches.push(batch?);
+            batches.push(adapt_to_schema(batch?, &schema)?);
         }
     }
     Ok(concat_batches(&schema, &batches)?)
+}
+
+/// Adapts a file batch to the target schema: columns the file predates are
+/// filled with NULLs (additive schema evolution).
+fn adapt_to_schema(batch: RecordBatch, target: &SchemaRef) -> Result<RecordBatch, CompactorError> {
+    let columns = target
+        .fields()
+        .iter()
+        .map(|field| match batch.schema().index_of(field.name()) {
+            Ok(idx) => batch.column(idx).clone(),
+            Err(_) => arrow::array::new_null_array(field.data_type(), batch.num_rows()),
+        })
+        .collect::<Vec<_>>();
+    Ok(RecordBatch::try_new(target.clone(), columns)?)
 }
 
 /// Lexicographic sort by the named columns (in order).

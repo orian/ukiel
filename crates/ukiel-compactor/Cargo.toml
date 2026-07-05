@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 ukiel-core = { workspace = true }
 ukiel-catalog = { workspace = true }
+ukiel-expr = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true }
 object_store = { workspace = true }
@@ -21,3 +22,4 @@ tracing = { workspace = true }
 [dev-dependencies]
 ukiel-ingest = { workspace = true }
 testcontainers-modules = { workspace = true }
+sqlx = { workspace = true }

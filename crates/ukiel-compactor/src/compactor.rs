@@ -9,7 +9,7 @@ use object_store::ObjectStore;
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use ukiel_catalog::{CatalogError, PostgresCatalog};
-use ukiel_core::{CommitOp, Hypertable, Part, PartMeta, Placement, arrow_schema_from_json};
+use ukiel_core::{CommitOp, Hypertable, Part, PartMeta, Placement};
 
 use crate::CompactorError;
 use crate::rewrite;
@@ -155,8 +155,12 @@ impl Compactor {
         hypertable: &Hypertable,
         group: &[Part],
     ) -> Result<usize, CompactorError> {
-        let schema = Arc::new(arrow_schema_from_json(&hypertable.table_schema)?);
+        let cols = ukiel_core::TableColumns::parse(&hypertable.table_schema)?;
+        let schema = Arc::new(cols.physical_schema());
         let merged = rewrite::read_parts_to_batch(&self.store, schema, group).await?;
+        // Rewrites recompute write-time columns: this is what backfills a
+        // materialized column added after these files were written.
+        let merged = ukiel_expr::apply_defaults_and_materialized(merged, &cols)?;
         let sorted = rewrite::sort_batch(&merged, &hypertable.sort_key)?;
         let partition_values = group[0].meta.partition_values.clone();
 

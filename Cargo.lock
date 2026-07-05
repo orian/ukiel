@@ -4524,6 +4524,7 @@ dependencies = [
  "object_store",
  "parquet",
  "serde_json",
+ "sqlx",
  "testcontainers-modules",
  "thiserror",
  "tokio",
@@ -4531,6 +4532,7 @@ dependencies = [
  "tracing",
  "ukiel-catalog",
  "ukiel-core",
+ "ukiel-expr",
  "ukiel-ingest",
  "uuid",
 ]
@@ -4613,6 +4615,7 @@ dependencies = [
  "tokio-util",
  "ukiel-catalog",
  "ukiel-core",
+ "ukiel-expr",
  "uuid",
 ]
 
