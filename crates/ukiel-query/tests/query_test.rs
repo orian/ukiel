@@ -145,6 +145,19 @@ pub fn all_i64(batches: &[RecordBatch], column: &str) -> Vec<i64> {
     out
 }
 
+pub fn all_f64(batches: &[RecordBatch], column: &str) -> Vec<f64> {
+    let mut out = Vec::new();
+    for b in batches {
+        let idx = b.schema().index_of(column).unwrap();
+        let arr: &datafusion::arrow::array::Float64Array =
+            b.column(idx).as_any().downcast_ref().unwrap();
+        for i in 0..arr.len() {
+            out.push(arr.value(i));
+        }
+    }
+    out
+}
+
 /// Registers the provider directly on a bare SessionContext (schema-provider
 /// wiring is exercised separately in the context tests).
 async fn ctx_with_provider(h: &Harness, namespace: i64) -> SessionContext {
@@ -303,4 +316,113 @@ async fn cache_serves_reads_after_inner_store_loses_the_object() {
         .await
         .unwrap();
     assert_eq!(all_strings(&batches, "payload"), vec!["a1", "a2"]);
+}
+
+#[tokio::test]
+async fn alias_columns_compute_at_query_time() {
+    let h = setup().await;
+    // A second hypertable with default/materialized/alias columns.
+    let rich = json!({"fields": [
+        {"name": "tenant_id", "type": "int64"},
+        {"name": "ts", "type": "timestamp_ms"},
+        {"name": "amount", "type": "float64", "default": "0.0"},
+        {"name": "doubled", "type": "float64", "materialized": "amount * 2.0"},
+        {"name": "half", "type": "float64", "alias": "amount / 2.0"}
+    ]});
+    let ht = h
+        .catalog
+        .create_hypertable(
+            "rich",
+            &rich,
+            &json!({"columns": []}),
+            &["tenant_id".to_string(), "ts".to_string()],
+            "tenant_id",
+        )
+        .await
+        .unwrap();
+    h.catalog
+        .create_logical_table(NamespaceId(1), "rich", ht)
+        .await
+        .unwrap();
+
+    // One file via the spec-aware encoder (amount omitted in row 2).
+    let cols = ukiel_core::TableColumns::parse(&rich).unwrap();
+    let part = ukiel_ingest::encode_rows(
+        &cols,
+        "tenant_id",
+        "ts",
+        vec![
+            json!({"tenant_id": 1, "ts": 1, "amount": 8.0}),
+            json!({"tenant_id": 1, "ts": 2}),
+        ],
+    )
+    .unwrap();
+    let path = format!("ht/{ht}/L0/rich.parquet");
+    let size = part.bytes.len() as i64;
+    h.store
+        .put(&Path::from(path.clone()), part.bytes.into())
+        .await
+        .unwrap();
+    h.catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![PartMeta {
+                    path,
+                    partition_values: json!({}),
+                    packing_key_min: part.key_min,
+                    packing_key_max: part.key_max,
+                    row_count: part.row_count,
+                    size_bytes: size,
+                    level: 0,
+                    column_stats: None,
+                }],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let store_url = url::Url::parse(STORE_URL).unwrap();
+    let ctx = ukiel_query::context::session_for_namespace(
+        &h.catalog,
+        NamespaceId(1),
+        h.store.clone(),
+        &store_url,
+    )
+    .await
+    .unwrap();
+
+    // Alias computed at read time; default and materialized read from storage.
+    let batches = ctx
+        .sql("SELECT amount, doubled, half FROM rich ORDER BY ts")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(all_f64(&batches, "amount"), vec![8.0, 0.0]);
+    assert_eq!(all_f64(&batches, "doubled"), vec![16.0, 0.0]);
+    assert_eq!(all_f64(&batches, "half"), vec![4.0, 0.0]);
+
+    // SELECT * includes alias and materialized columns (documented divergence
+    // from ClickHouse) and still works.
+    let batches = ctx
+        .sql("SELECT * FROM rich")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches[0].num_columns(), 5);
+
+    // Filtering on an alias works (DataFusion applies it above our scan).
+    let batches = ctx
+        .sql("SELECT ts FROM rich WHERE half > 1.0")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(all_i64(&batches, "ts"), vec![1]);
 }

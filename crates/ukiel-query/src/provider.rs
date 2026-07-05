@@ -16,6 +16,7 @@ use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{binary, col, lit};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::filter::FilterExec;
@@ -23,14 +24,18 @@ use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::scalar::ScalarValue;
 use ukiel_catalog::PostgresCatalog;
-use ukiel_core::{Hypertable, arrow_schema_from_json};
+use ukiel_core::{Hypertable, TableColumns};
 
 use crate::QueryError;
 
 pub struct UkielTableProvider {
     catalog: PostgresCatalog,
     hypertable: Hypertable,
-    schema: SchemaRef,
+    /// stored + default + materialized — what the Parquet scan produces.
+    physical_schema: SchemaRef,
+    /// physical + alias — what SQL sees.
+    query_schema: SchemaRef,
+    columns: TableColumns,
     packing_key_value: i64,
     store_url: ObjectStoreUrl,
 }
@@ -51,11 +56,15 @@ impl UkielTableProvider {
         packing_key_value: i64,
         store_url: ObjectStoreUrl,
     ) -> Result<Self, QueryError> {
-        let schema = Arc::new(arrow_schema_from_json(&hypertable.table_schema)?);
+        let columns = TableColumns::parse(&hypertable.table_schema)?;
+        let physical_schema = Arc::new(columns.physical_schema());
+        let query_schema = Arc::new(columns.query_schema());
         Ok(Self {
             catalog,
             hypertable,
-            schema,
+            physical_schema,
+            query_schema,
+            columns,
             packing_key_value,
             store_url,
         })
@@ -65,7 +74,7 @@ impl UkielTableProvider {
 #[async_trait]
 impl TableProvider for UkielTableProvider {
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        self.query_schema.clone()
     }
 
     fn table_type(&self) -> TableType {
@@ -99,7 +108,7 @@ impl TableProvider for UkielTableProvider {
             .map(|p| PartitionedFile::new(p.meta.path.clone(), p.meta.size_bytes as u64))
             .collect();
 
-        let source = Arc::new(ParquetSource::new(self.schema.clone()));
+        let source = Arc::new(ParquetSource::new(self.physical_schema.clone()));
         let config = FileScanConfigBuilder::new(self.store_url.clone(), source)
             .with_file_group(FileGroup::new(files))
             .build();
@@ -107,23 +116,40 @@ impl TableProvider for UkielTableProvider {
 
         // Mandatory namespace isolation, before projection can drop the column.
         let predicate = binary(
-            col(&self.hypertable.packing_key, &self.schema)?,
+            col(&self.hypertable.packing_key, &self.physical_schema)?,
             Operator::Eq,
             lit(ScalarValue::Int64(Some(self.packing_key_value))),
-            &self.schema,
+            &self.physical_schema,
         )?;
-        let mut plan: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(predicate, scan)?);
+        let filtered: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(predicate, scan)?);
 
-        if let Some(indices) = projection {
-            let exprs = indices
-                .iter()
-                .map(|&i| {
-                    let field = self.schema.field(i);
-                    Ok((col(field.name(), &self.schema)?, field.name().clone()))
-                })
-                .collect::<DfResult<Vec<_>>>()?;
-            plan = Arc::new(ProjectionExec::try_new(exprs, plan)?);
-        }
+        // Projection maps each requested query-schema column to either a
+        // physical column or the alias's compiled expression. Runs even for
+        // SELECT * so alias columns exist in the output. `TableColumns.specs`
+        // is index-aligned with `query_schema` (every spec, in order).
+        let indices: Vec<usize> = match projection {
+            Some(p) => p.clone(),
+            None => (0..self.query_schema.fields().len()).collect(),
+        };
+        let exprs = indices
+            .iter()
+            .map(|&i| {
+                let field = self.query_schema.field(i);
+                let spec = &self.columns.specs[i];
+                let expr: Arc<dyn PhysicalExpr> = match &spec.kind {
+                    ukiel_core::ColumnKind::Alias(sql) => {
+                        let compiled =
+                            ukiel_expr::compile(sql, &self.physical_schema, &spec.data_type)
+                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                        compiled.into_physical()
+                    }
+                    _ => col(field.name(), &self.physical_schema)?,
+                };
+                Ok((expr, field.name().clone()))
+            })
+            .collect::<DfResult<Vec<_>>>()?;
+        let mut plan: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(exprs, filtered)?);
+
         if let Some(n) = limit {
             plan = Arc::new(GlobalLimitExec::new(plan, 0, Some(n)));
         }

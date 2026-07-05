@@ -4639,6 +4639,7 @@ dependencies = [
  "tokio",
  "ukiel-catalog",
  "ukiel-core",
+ "ukiel-expr",
  "ukiel-ingest",
  "url",
  "uuid",

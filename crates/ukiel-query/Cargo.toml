@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 ukiel-core = { workspace = true }
 ukiel-catalog = { workspace = true }
+ukiel-expr = { workspace = true }
 datafusion = { workspace = true }
 object_store = { workspace = true }
 axum = { workspace = true }
