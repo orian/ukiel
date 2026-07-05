@@ -33,6 +33,11 @@ plans: `docs/superpowers/plans/`, concept notes: `docs/notes/`
   scans (no object-store listings), namespace isolation injected into the
   physical plan, HTTP SQL endpoint (`POST /api/query`), local-disk
   read-through cache in front of the object store.
+- `crates/ukiel-compactor` — background rewrite workers on the change feed:
+  L0→L1 compaction honoring each hypertable's placement policy (`packed` or
+  `separated` per key), and atomic key deletion (metadata-only for dedicated
+  files, rewrite for packed ones). All swaps are optimistic REPLACE commits;
+  losers replan from fresh state.
 - `crates/ukiel-e2e` — end-to-end suite against the docker-compose stack
   (Kafka + Postgres + MinIO); tests are `#[ignore]`d by default. Philosophy
   and scenario catalog: `docs/superpowers/specs/2026-07-05-ukiel-testing-design.md`.
