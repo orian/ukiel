@@ -1,6 +1,7 @@
 //! Postgres-backed catalog: parts, commits, change feed.
 
 mod error;
+mod tables;
 
 pub use error::CatalogError;
 

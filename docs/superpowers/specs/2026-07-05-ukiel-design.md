@@ -73,7 +73,7 @@ MV = durable change-feed cursor + SQL transform + target logical table. MV worke
 
 ## V1 implementation plan (Rust workspace)
 
-Crates: `ukiel-catalog` (model + Postgres impl + commit protocol + change feed), `ukiel-ingest` (Kafka consumer, buffering, Parquet writer), `ukiel-query` (DataFusion providers, tenant scoping, server: HTTP + Arrow Flight SQL), `ukiel-compactor` (change-feed-driven L0 merging), `ukiel-core` (shared types).
+Crates: `ukiel-catalog` (model + Postgres impl + commit protocol + change feed), `ukiel-ingest` (Kafka consumer, buffering, Parquet writer), `ukiel-query` (DataFusion providers, tenant scoping, server: HTTP; Arrow Flight SQL post-v1), `ukiel-compactor` (change-feed-driven L0 merging), `ukiel-core` (shared types).
 
 Build order:
 1. `ukiel-core` + `ukiel-catalog`: schema (hypertables, logical_tables, parts, commits, change_feed), commit protocol with optimistic REPLACE, Postgres via sqlx; property tests for commit conflicts.
