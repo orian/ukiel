@@ -551,3 +551,50 @@ async fn hypertable_by_id_and_namespace_table_listing() {
             .is_empty()
     );
 }
+
+use ukiel_core::Placement;
+
+#[tokio::test]
+async fn placement_cursors_and_listing() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+
+    // Placement defaults to packed and is settable.
+    assert_eq!(
+        catalog.get_hypertable("events").await.unwrap().placement,
+        Placement::Packed
+    );
+    catalog
+        .set_placement(ht, Placement::Separated)
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog.get_hypertable("events").await.unwrap().placement,
+        Placement::Separated
+    );
+
+    // Listing returns every hypertable.
+    let all = catalog.list_hypertables().await.unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].id, ht);
+
+    // Cursors: 0 when absent, then upsert.
+    assert_eq!(
+        catalog.get_cursor("compactor", ht).await.unwrap(),
+        CommitId(0)
+    );
+    catalog
+        .set_cursor("compactor", ht, CommitId(7))
+        .await
+        .unwrap();
+    catalog
+        .set_cursor("compactor", ht, CommitId(9))
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog.get_cursor("compactor", ht).await.unwrap(),
+        CommitId(9)
+    );
+    // Cursors are per worker name.
+    assert_eq!(catalog.get_cursor("mv", ht).await.unwrap(), CommitId(0));
+}

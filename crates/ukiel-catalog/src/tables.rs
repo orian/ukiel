@@ -1,5 +1,5 @@
 use sqlx::Row;
-use ukiel_core::{Hypertable, HypertableId, LogicalTable, LogicalTableId, NamespaceId};
+use ukiel_core::{Hypertable, HypertableId, LogicalTable, LogicalTableId, NamespaceId, Placement};
 
 use crate::{CatalogError, PostgresCatalog};
 
@@ -28,7 +28,7 @@ impl PostgresCatalog {
 
     pub async fn get_hypertable(&self, name: &str) -> Result<Hypertable, CatalogError> {
         let row = sqlx::query(
-            "SELECT id, name, table_schema, partition_spec, sort_key, packing_key
+            "SELECT id, name, table_schema, partition_spec, sort_key, packing_key, placement
              FROM hypertables WHERE name = $1",
         )
         .bind(name)
@@ -43,6 +43,10 @@ impl PostgresCatalog {
             partition_spec: row.get("partition_spec"),
             sort_key: row.get("sort_key"),
             packing_key: row.get("packing_key"),
+            placement: match row.get::<String, _>("placement").as_str() {
+                "separated" => Placement::Separated,
+                _ => Placement::Packed,
+            },
         })
     }
 
@@ -94,7 +98,7 @@ impl PostgresCatalog {
 
     pub async fn get_hypertable_by_id(&self, id: HypertableId) -> Result<Hypertable, CatalogError> {
         let row = sqlx::query(
-            "SELECT id, name, table_schema, partition_spec, sort_key, packing_key
+            "SELECT id, name, table_schema, partition_spec, sort_key, packing_key, placement
              FROM hypertables WHERE id = $1",
         )
         .bind(id.0)
@@ -109,6 +113,10 @@ impl PostgresCatalog {
             partition_spec: row.get("partition_spec"),
             sort_key: row.get("sort_key"),
             packing_key: row.get("packing_key"),
+            placement: match row.get::<String, _>("placement").as_str() {
+                "separated" => Placement::Separated,
+                _ => Placement::Packed,
+            },
         })
     }
 
@@ -132,6 +140,43 @@ impl PostgresCatalog {
                 name: row.get("name"),
                 hypertable_id: HypertableId(row.get("hypertable_id")),
                 column_mapping: row.get("column_mapping"),
+            })
+            .collect())
+    }
+
+    pub async fn set_placement(
+        &self,
+        id: HypertableId,
+        placement: Placement,
+    ) -> Result<(), CatalogError> {
+        sqlx::query("UPDATE hypertables SET placement = $1 WHERE id = $2")
+            .bind(placement.as_str())
+            .bind(id.0)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_hypertables(&self) -> Result<Vec<Hypertable>, CatalogError> {
+        let rows = sqlx::query(
+            "SELECT id, name, table_schema, partition_spec, sort_key, packing_key, placement
+             FROM hypertables ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| Hypertable {
+                id: HypertableId(row.get("id")),
+                name: row.get("name"),
+                table_schema: row.get("table_schema"),
+                partition_spec: row.get("partition_spec"),
+                sort_key: row.get("sort_key"),
+                packing_key: row.get("packing_key"),
+                placement: match row.get::<String, _>("placement").as_str() {
+                    "separated" => Placement::Separated,
+                    _ => Placement::Packed,
+                },
             })
             .collect())
     }

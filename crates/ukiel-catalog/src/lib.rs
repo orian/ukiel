@@ -1,6 +1,7 @@
 //! Postgres-backed catalog: parts, commits, change feed.
 
 mod commit;
+mod cursors;
 mod error;
 mod feed;
 mod offsets;
