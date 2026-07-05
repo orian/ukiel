@@ -4567,6 +4567,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ukiel-expr"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "datafusion",
+ "serde_json",
+ "thiserror",
+ "ukiel-core",
+]
+
+[[package]]
 name = "ukiel-gc"
 version = "0.1.0"
 dependencies = [

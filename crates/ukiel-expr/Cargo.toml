@@ -1,0 +1,11 @@
+[package]
+name = "ukiel-expr"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ukiel-core = { workspace = true }
+datafusion = { workspace = true }
+arrow = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
