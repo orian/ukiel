@@ -134,3 +134,173 @@ async fn commit_add_makes_parts_live() {
     assert_eq!(parts.len(), 1);
     assert_eq!(parts[0].meta.path, "p2.parquet");
 }
+
+use ukiel_catalog::CatalogError;
+
+#[tokio::test]
+async fn replace_swaps_parts_atomically() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+
+    catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![
+                    part_meta("l0-1.parquet", 1, 10),
+                    part_meta("l0-2.parquet", 1, 10),
+                ],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let old_ids: Vec<_> = catalog
+        .live_parts(ht, None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|p| p.id)
+        .collect();
+
+    // Compaction: two L0 files -> one L1 file.
+    let mut compacted = part_meta("l1-1.parquet", 1, 10);
+    compacted.level = 1;
+    catalog
+        .commit(
+            ht,
+            CommitOp::Replace {
+                old: old_ids.clone(),
+                new: vec![compacted],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let live = catalog.live_parts(ht, None).await.unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].meta.path, "l1-1.parquet");
+    assert_eq!(live[0].meta.level, 1);
+
+    // Replacing already-tombstoned parts conflicts.
+    let err = catalog
+        .commit(
+            ht,
+            CommitOp::Replace {
+                old: old_ids,
+                new: vec![part_meta("x.parquet", 1, 10)],
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        CatalogError::Conflict {
+            expected: 2,
+            live_matched: 0
+        }
+    ));
+
+    // The failed commit must not have added parts.
+    assert_eq!(catalog.live_parts(ht, None).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn delete_tombstones_parts() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+
+    catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![part_meta("p1.parquet", 1, 10)],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let ids: Vec<_> = catalog
+        .live_parts(ht, None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|p| p.id)
+        .collect();
+
+    catalog
+        .commit(ht, CommitOp::Delete { parts: ids }, None)
+        .await
+        .unwrap();
+    assert!(catalog.live_parts(ht, None).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn concurrent_replace_exactly_one_wins() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+
+    catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![part_meta("l0.parquet", 1, 10)],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let old_ids: Vec<_> = catalog
+        .live_parts(ht, None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|p| p.id)
+        .collect();
+
+    let (c1, c2) = (catalog.clone(), catalog.clone());
+    let (o1, o2) = (old_ids.clone(), old_ids.clone());
+    let t1 = tokio::spawn(async move {
+        c1.commit(
+            ht,
+            CommitOp::Replace {
+                old: o1,
+                new: vec![part_meta("winner-a.parquet", 1, 10)],
+            },
+            None,
+        )
+        .await
+    });
+    let t2 = tokio::spawn(async move {
+        c2.commit(
+            ht,
+            CommitOp::Replace {
+                old: o2,
+                new: vec![part_meta("winner-b.parquet", 1, 10)],
+            },
+            None,
+        )
+        .await
+    });
+
+    let r1 = t1.await.unwrap();
+    let r2 = t2.await.unwrap();
+
+    let ok_count = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+    let conflict_count = [&r1, &r2]
+        .iter()
+        .filter(|r| matches!(r, Err(CatalogError::Conflict { .. })))
+        .count();
+    assert_eq!(
+        ok_count, 1,
+        "exactly one replace must win, got {r1:?} / {r2:?}"
+    );
+    assert_eq!(conflict_count, 1);
+
+    // Exactly the winner's part is live.
+    let live = catalog.live_parts(ht, None).await.unwrap();
+    assert_eq!(live.len(), 1);
+    assert!(live[0].meta.path.starts_with("winner-"));
+}
