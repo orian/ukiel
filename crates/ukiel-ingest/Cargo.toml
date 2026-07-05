@@ -1,0 +1,24 @@
+[package]
+name = "ukiel-ingest"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ukiel-core = { workspace = true }
+ukiel-catalog = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true }
+object_store = { workspace = true }
+rdkafka = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+testcontainers-modules = { workspace = true, features = ["kafka"] }
