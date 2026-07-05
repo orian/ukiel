@@ -69,6 +69,7 @@ A test-only workspace member (no library code beyond the harness):
 - **I5 — Race safety:** concurrent ingest and compaction commits never lose or duplicate rows.
 - **I6 — Progress under poison:** malformed messages are skipped and never stall the stream (offsets advance past them).
 - **I7 — Deletion:** after a packing key's data is deleted, no query returns it; all other keys are unaffected. *(activates with plan 4's deletion worker)*
+- **I8 — GC safety:** GC never deletes an object a query or feed consumer can still reach; eventually every unreferenced object is deleted.
 
 ### Scenarios
 
@@ -81,6 +82,7 @@ A test-only workspace member (no library code beyond the harness):
 | S5 | **Scale smoke** | I2, catalog planning | 1,000 namespaces × few rows in one hypertable (heavily packed); query a random sample of 50 namespaces; assert correctness and that per-query part pruning returns bounded file counts (catalog query, not a perf benchmark). |
 | S6 | **Compaction equivalence** *(with plan 4)* | I4, I5 | Run S1's load; snapshot per-namespace results; run compactor to quiescence *while ingest continues*; assert results identical, L0 part count reduced, no commit conflicts surfaced as data errors. |
 | S7 | **Key deletion** *(with plan 4)* | I7 | After S1 converges, delete one namespace's key; assert its queries return empty, neighbors in the same packed files are intact. |
+| S8 | **GC hygiene** *(with plan 6)* | I8, storage lifecycle | After an S6-style run plus a key deletion, run GC to quiescence with zero graces: every object in the bucket is referenced by a live part, and every live part's object exists. No referenced object was removed (queries still return the full model). |
 
 All scenarios S1–S7 are implemented in `crates/ukiel-e2e/tests/` (plus an S0 smoke); this table remains the authoritative statement of what each one must keep proving.
 
