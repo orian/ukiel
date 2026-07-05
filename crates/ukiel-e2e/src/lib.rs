@@ -373,6 +373,18 @@ impl Stack {
         total
     }
 
+    /// Number of live parts the catalog returns for a query — all parts when
+    /// `key` is `None`, or those whose packing-key range contains `key`. This is
+    /// exactly the file set a scan would open (catalog planning, never a store
+    /// listing), so it bounds per-query fan-out.
+    pub async fn live_part_count(&self, ht: HypertableId, key: Option<i64>) -> usize {
+        self.catalog
+            .live_parts(ht, key)
+            .await
+            .expect("live_parts")
+            .len()
+    }
+
     /// Count of live parts at the given compaction level for a hypertable.
     pub async fn count_parts_at_level(&self, ht: HypertableId, level: i16) -> usize {
         self.catalog
