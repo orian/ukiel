@@ -304,3 +304,56 @@ async fn concurrent_replace_exactly_one_wins() {
     assert_eq!(live.len(), 1);
     assert!(live[0].meta.path.starts_with("winner-"));
 }
+
+#[tokio::test]
+async fn idempotency_key_dedups_commit() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+
+    let key = "0:0-99"; // kafka partition 0, offsets 0..=99
+    let first = catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![part_meta("p1.parquet", 1, 10)],
+            },
+            Some(key),
+        )
+        .await
+        .unwrap();
+    let CommitResult::Committed(first_id) = first else {
+        panic!("first commit must be Committed, got {first:?}");
+    };
+
+    // Ingest worker crashed after commit, re-flushed the same offset range.
+    let second = catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![part_meta("p1-retry.parquet", 1, 10)],
+            },
+            Some(key),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second, CommitResult::AlreadyApplied(first_id));
+
+    // The retry's parts were NOT inserted.
+    let live = catalog.live_parts(ht, None).await.unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].meta.path, "p1.parquet");
+
+    // A different key commits normally.
+    let third = catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![part_meta("p2.parquet", 1, 10)],
+            },
+            Some("0:100-199"),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(third, CommitResult::Committed(_)));
+    assert_eq!(catalog.live_parts(ht, None).await.unwrap().len(), 2);
+}
