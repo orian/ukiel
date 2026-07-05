@@ -28,6 +28,10 @@ plans: `docs/superpowers/plans/`.
   commits. Exactly-once: Kafka offsets are stored in the catalog in the same
   transaction as the part commit; workers resume from catalog offsets and
   never commit Kafka group offsets.
+- `crates/ukiel-query` — DataFusion query serving: catalog-planned Parquet
+  scans (no object-store listings), namespace isolation injected into the
+  physical plan, HTTP SQL endpoint (`POST /api/query`), local-disk
+  read-through cache in front of the object store.
 
 Tests: `cargo test` (integration tests spin up Postgres via testcontainers —
 Docker must be running).
