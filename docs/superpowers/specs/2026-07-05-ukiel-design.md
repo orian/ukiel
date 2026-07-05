@@ -34,6 +34,35 @@ The catalog core is **tenancy-agnostic**. It knows two generic concepts: **names
 
 - **Hypertable** — physical table family: Arrow schema, partition spec (e.g. `(key_bucket, day)`), sort order (`tenant_id, ts`), declared packing key. Thousands exist, not millions.
 - **Logical table** — what a client sees: `(namespace_id, name) → hypertable + column mapping`. Per-table schema customization = column mapping over a wider hypertable schema, or a dedicated hypertable for heavy namespaces. 1M namespaces = cheap DB rows.
+
+#### Hypertable vs logical table
+
+One physical storage pool shared by many virtual tables.
+
+A **hypertable is physical storage**: it owns the Parquet files and defines the on-disk schema, sort order, partition spec, and packing key. There is roughly one per *kind of data*, not per customer. Ingest writes files into hypertables; compaction, deletion, and retention workers operate on hypertable files.
+
+A **logical table is what a client names**: a catalog row saying "namespace 42's table `events` is a slice of hypertable `events_v1`". It owns no files — it is a pointer plus access scope. Millions exist; each is one cheap DB row.
+
+```
+Hypertable "events_v1"                      (physical, 1 of ~thousands)
+  schema: tenant_id, ts, payload · packing key: tenant_id
+  parts: ht/7/L0/a.parquet   [key range 100–4500]   ← packed, many tenants
+         ht/7/L1/b.parquet   [key range 4200–4200]  ← one big tenant
+
+Logical table (namespace=100, "events") ──┐
+Logical table (namespace=101, "events") ──┼──► all point at hypertable "events_v1"
+Logical table (namespace=4200, "events") ─┘
+```
+
+Query path for tenant 101's `SELECT * FROM events`:
+
+1. Resolve logical table `(namespace 101, "events")` → hypertable `events_v1` — *which physical pool?*
+2. Catalog lookup: live parts of `events_v1` whose packing-key range contains 101 — *which files could hold their rows?* (`a.parquet` yes, `b.parquet` no)
+3. Scan those files with `tenant_id = 101` injected as a mandatory plan-time filter — *which rows inside the packed file are theirs?*
+
+The logical table answers "what does this client's name refer to, and what slice may they see"; the hypertable answers "how are bytes laid out, sorted, packed, and compacted". This split is what makes the 1M-tenant math work: physically-per-tenant tables would mean millions of tiny files and metadata trees (rejected Approach B), while packing lets tiny tenants share files and big tenants graduate to dedicated ones — invisibly, because the client-facing logical table never changes; only which parts hold its rows does.
+
+`column_mapping` (currently always `None`) is the reserved hook for per-tenant schema customization: a logical `events` could expose a renamed/subset view over a wider hypertable schema, or a heavy tenant can get a dedicated hypertable entirely.
 - **Part** — one Parquet file: path, partition values, packing-key min/max (packed files span a key range, separated files exactly one key), row count, size, column stats, **level** (L0 fresh → L2 compacted).
 - **Commit** — atomic `ADD` / `REPLACE(old→new)` / `DELETE` of parts with optimistic concurrency: REPLACE fails if any input part is not live; loser retries on fresh state. This one rule resolves mutation-vs-compaction conflicts (README pt 9).
 - **Change feed** — per-hypertable ordered log of commit events (`parts_added`, `parts_replaced`, seq no). MV/compaction workers are durable cursors. (README pt 6.)
