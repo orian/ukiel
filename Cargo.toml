@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ukiel-core", "crates/ukiel-catalog", "crates/ukiel-ingest", "crates/ukiel-query", "crates/ukiel-compactor", "crates/ukiel-e2e"]
+members = ["crates/ukiel-core", "crates/ukiel-catalog", "crates/ukiel-ingest", "crates/ukiel-query", "crates/ukiel-compactor", "crates/ukiel-gc", "crates/ukiel-e2e"]
 
 [workspace.package]
 version = "0.1.0"
@@ -34,3 +34,4 @@ ukiel-catalog = { path = "crates/ukiel-catalog" }
 ukiel-ingest = { path = "crates/ukiel-ingest" }
 ukiel-query = { path = "crates/ukiel-query" }
 ukiel-compactor = { path = "crates/ukiel-compactor" }
+ukiel-gc = { path = "crates/ukiel-gc" }

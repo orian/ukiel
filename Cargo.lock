@@ -4567,6 +4567,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ukiel-gc"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "futures",
+ "object_store",
+ "serde_json",
+ "testcontainers-modules",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "ukiel-catalog",
+ "ukiel-core",
+]
+
+[[package]]
 name = "ukiel-ingest"
 version = "0.1.0"
 dependencies = [
