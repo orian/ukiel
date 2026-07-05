@@ -1,6 +1,6 @@
 # Ukiel V1 Roadmap
 
-Spec: `docs/superpowers/specs/2026-07-05-ukiel-design.md`. V1 is split into 5 plans, executed in order. Each plan produces working, tested software. Detailed plans are written just-in-time (after the previous plan merges) so interfaces referenced are real, not guessed.
+Spec: `docs/superpowers/specs/2026-07-05-ukiel-design.md`. V1 is split into sequential plans (6 so far), executed in order. Each plan produces working, tested software. Detailed plans are written just-in-time (after the previous plan merges) so interfaces referenced are real, not guessed.
 
 | # | Plan | Scope | Status |
 |---|------|-------|--------|

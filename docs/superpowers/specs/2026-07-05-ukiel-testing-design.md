@@ -82,7 +82,7 @@ A test-only workspace member (no library code beyond the harness):
 | S6 | **Compaction equivalence** *(with plan 4)* | I4, I5 | Run S1's load; snapshot per-namespace results; run compactor to quiescence *while ingest continues*; assert results identical, L0 part count reduced, no commit conflicts surfaced as data errors. |
 | S7 | **Key deletion** *(with plan 4)* | I7 | After S1 converges, delete one namespace's key; assert its queries return empty, neighbors in the same packed files are intact. |
 
-S1–S5 are implementable immediately (plans 1–3 shipped); S6–S7 are specified now so the compactor plan is written against them.
+All scenarios S1–S7 are implemented in `crates/ukiel-e2e/tests/` (plus an S0 smoke); this table remains the authoritative statement of what each one must keep proving.
 
 ### CI
 
