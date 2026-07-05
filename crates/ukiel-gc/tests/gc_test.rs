@@ -151,3 +151,95 @@ async fn reaps_tombstoned_parts_after_grace() {
         .unwrap();
     assert_eq!(events.len(), 2, "add + replace events survive purging");
 }
+
+#[tokio::test]
+async fn sweeps_only_old_unreferenced_objects() {
+    let env = setup().await;
+    // One committed part, one orphan under the prefix, one object elsewhere.
+    let committed = upload(&env, "committed").await;
+    env.catalog
+        .commit(
+            env.ht,
+            CommitOp::Add {
+                parts: vec![committed],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    env.store
+        .put(
+            &Path::from(format!("ht/{}/L0/orphan.parquet", env.ht)),
+            b"junk".to_vec().into(),
+        )
+        .await
+        .unwrap();
+    env.store
+        .put(&Path::from("unrelated/file"), b"keep".to_vec().into())
+        .await
+        .unwrap();
+
+    // Orphan grace not elapsed: nothing swept (protects in-flight commits).
+    let stats = gc(&env, 3600.0, 3600).run_once().await.unwrap();
+    assert_eq!(stats.swept_orphans, 0);
+
+    // Grace 0: the orphan goes, the committed part and out-of-prefix object stay.
+    let stats = gc(&env, 3600.0, 0).run_once().await.unwrap();
+    assert_eq!(stats.swept_orphans, 1);
+    let remaining = object_paths(&env.store).await;
+    assert_eq!(remaining.len(), 2);
+    assert!(remaining.iter().any(|p| p.ends_with("committed.parquet")));
+    assert!(remaining.iter().any(|p| p == "unrelated/file"));
+}
+
+#[tokio::test]
+async fn lagging_consumer_cursor_blocks_reaping() {
+    let env = setup().await;
+    let p = upload(&env, "old").await;
+    env.catalog
+        .commit(env.ht, CommitOp::Add { parts: vec![p] }, None)
+        .await
+        .unwrap();
+    let old: Vec<_> = env
+        .catalog
+        .live_parts(env.ht, None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|p| p.id)
+        .collect();
+    let replacement = upload(&env, "new").await;
+    let result = env
+        .catalog
+        .commit(
+            env.ht,
+            CommitOp::Replace {
+                old,
+                new: vec![replacement],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let replace_id = result.commit_id();
+
+    // A consumer that hasn't processed the replace yet fences the reap.
+    env.catalog
+        .set_cursor("mv", env.ht, CommitId(replace_id.0 - 1))
+        .await
+        .unwrap();
+    let stats = gc(&env, 0.0, 3600).run_once().await.unwrap();
+    assert_eq!(stats.reaped_parts, 0);
+    assert_eq!(object_paths(&env.store).await.len(), 2);
+
+    // Caught up: reap proceeds.
+    env.catalog
+        .set_cursor("mv", env.ht, replace_id)
+        .await
+        .unwrap();
+    let stats = gc(&env, 0.0, 3600).run_once().await.unwrap();
+    assert_eq!(stats.reaped_parts, 1);
+    let remaining = object_paths(&env.store).await;
+    assert_eq!(remaining.len(), 1);
+    assert!(remaining[0].ends_with("new.parquet"));
+}
