@@ -32,7 +32,13 @@ plans: `docs/superpowers/plans/`.
   scans (no object-store listings), namespace isolation injected into the
   physical plan, HTTP SQL endpoint (`POST /api/query`), local-disk
   read-through cache in front of the object store.
+- `crates/ukiel-e2e` — end-to-end suite against the docker-compose stack
+  (Kafka + Postgres + MinIO); tests are `#[ignore]`d by default. Philosophy
+  and scenario catalog: `docs/superpowers/specs/2026-07-05-ukiel-testing-design.md`.
 
-Tests: `cargo test` (integration tests spin up Postgres via testcontainers —
-Docker must be running).
+Tests: `cargo test` (integration tests spin up Postgres/Kafka via
+testcontainers — Docker must be running). End-to-end: `make e2e`.
+
+Known issues: `docs/issues/` (0001: query endpoint trusts caller-supplied
+namespace — do not expose to untrusted callers until auth lands).
 

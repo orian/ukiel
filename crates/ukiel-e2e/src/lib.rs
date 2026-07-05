@@ -60,7 +60,7 @@ impl Stack {
             "UKIEL_E2E_PG",
             "postgres://postgres:postgres@127.0.0.1:5432/postgres",
         );
-        let s3_endpoint = env_or("UKIEL_E2E_S3", "http://127.0.0.1:9000");
+        let s3_endpoint = env_or("UKIEL_E2E_S3", "http://127.0.0.1:19000");
 
         let catalog = PostgresCatalog::connect(&pg)
             .await

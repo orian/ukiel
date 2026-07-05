@@ -14,6 +14,8 @@ Companion to `2026-07-05-ukiel-design.md`. This document defines how Ukiel is te
 
 Unit tests cover pure logic: schema mapping, Parquet encoding and sort order, config parsing. Component tests prove each crate's *contract* against its real dependency (all of plans 1–3's integration tests are this layer). E2e tests prove *system invariants* across process boundaries — things no single crate can prove alone.
 
+Component tests run with `--test-threads=2` (`make test`): each test starts its own containers, and unbounded parallelism (one container start per CPU) makes testcontainers' log-wait flake with `EndOfStream` errors.
+
 ### Principles
 
 1. **Real dependencies over mocks.** Ukiel's correctness claims — commit atomicity, optimistic concurrency, exactly-once ingest — *are* Postgres transaction semantics and Kafka replay semantics. A mocked Postgres would test our assumptions instead of our claims. We mock only what is both slow *and* semantically boring for the test at hand: component tests use `object_store::memory::InMemory` because S3 semantics aren't what they're proving; the e2e layer uses MinIO because there they are.
@@ -36,9 +38,9 @@ One `docker-compose.yml` at the repo root:
 
 - `kafka` — `apache/kafka` (KRaft, no zookeeper), port 9092.
 - `postgres` — `postgres:17`, port 5432.
-- `minio` — `minio/minio` + a one-shot `mc` init container creating bucket `ukiel`, ports 9000/9001.
+- `minio` — `minio/minio` + a one-shot `mc` init container creating bucket `ukiel`, host ports 19000/19001 (9000 is contested on dev machines — ClickHouse native protocol lives there).
 
-The e2e harness does **not** manage containers (unlike component tests): it connects to whatever the compose stack exposes, configured via env vars with compose-matching defaults — `UKIEL_E2E_KAFKA` (default `127.0.0.1:9092`), `UKIEL_E2E_PG` (default `postgres://postgres:postgres@127.0.0.1:5432/postgres`), `UKIEL_E2E_S3` (default `http://127.0.0.1:9000`, bucket `ukiel`, credentials `minioadmin`/`minioadmin`). This keeps the suite equally runnable against a laptop compose stack, a CI service block, or a staging environment.
+The e2e harness does **not** manage containers (unlike component tests): it connects to whatever the compose stack exposes, configured via env vars with compose-matching defaults — `UKIEL_E2E_KAFKA` (default `127.0.0.1:9092`), `UKIEL_E2E_PG` (default `postgres://postgres:postgres@127.0.0.1:5432/postgres`), `UKIEL_E2E_S3` (default `http://127.0.0.1:19000`, bucket `ukiel`, credentials `minioadmin`/`minioadmin`). This keeps the suite equally runnable against a laptop compose stack, a CI service block, or a staging environment.
 
 Workflow:
 

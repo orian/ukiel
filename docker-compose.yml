@@ -42,12 +42,12 @@ services:
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
-    # Host ports are overridable so the stack can dodge a host-side port clash
-    # (e.g. ClickHouse also defaults to 9000). Defaults match the testing spec.
-    # If you override UKIEL_MINIO_PORT, set UKIEL_E2E_S3 to match.
+    # Host ports default to 19000/19001: 9000 is contested on dev machines
+    # (ClickHouse native protocol, other MinIOs). Overridable; if you override
+    # UKIEL_MINIO_PORT, set UKIEL_E2E_S3 to match.
     ports:
-      - "${UKIEL_MINIO_PORT:-9000}:9000"
-      - "${UKIEL_MINIO_CONSOLE_PORT:-9001}:9001"
+      - "${UKIEL_MINIO_PORT:-19000}:9000"
+      - "${UKIEL_MINIO_CONSOLE_PORT:-19001}:9001"
     healthcheck:
       test: ["CMD-SHELL", "mc ready local || exit 1"]
       interval: 3s
