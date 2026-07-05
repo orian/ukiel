@@ -213,3 +213,106 @@ async fn separated_compaction_gives_each_key_its_own_file() {
         );
     }
 }
+
+use tokio_util::sync::CancellationToken;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_ingest_and_compaction_preserve_all_rows() {
+    let env = setup().await;
+    let compactor = Compactor::new(
+        env.catalog.clone(),
+        env.store.clone(),
+        CompactorConfig {
+            poll_interval_ms: 50,
+            ..CompactorConfig::default()
+        },
+    );
+    let shutdown = CancellationToken::new();
+    let worker = {
+        let token = shutdown.clone();
+        tokio::spawn(async move { compactor.run(token).await })
+    };
+
+    // A writer races the compactor: 20 single-row L0 commits.
+    for i in 0..20 {
+        add_l0(
+            &env,
+            "d1",
+            vec![json!({"tenant_id": i % 3, "ts": i, "payload": format!("row-{i}")})],
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // Let compaction converge, then stop it.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    shutdown.cancel();
+    worker.await.unwrap().unwrap();
+
+    // Invariant I5: nothing lost, nothing duplicated — regardless of how many
+    // merge rounds won or conflicted.
+    let expected: HashSet<String> = (0..20).map(|i| format!("row-{i}")).collect();
+    assert_eq!(live_payloads(&env).await, expected);
+    let total: i64 = env
+        .catalog
+        .live_parts(env.ht, None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|p| p.meta.row_count)
+        .sum();
+    assert_eq!(total, 20);
+
+    // Compaction actually happened: fewer live parts than the 20 committed.
+    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
+    assert!(
+        parts.len() < 20,
+        "expected some merging, got {} parts",
+        parts.len()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn competing_compactors_never_lose_data() {
+    let env = setup().await;
+    for i in 0..4 {
+        add_l0(
+            &env,
+            "d1",
+            vec![json!({"tenant_id": 1, "ts": i, "payload": format!("v{i}")})],
+        )
+        .await;
+    }
+    let before = live_payloads(&env).await;
+
+    // Two compactors with distinct cursors plan from the same live state.
+    let c1 = Compactor::new(
+        env.catalog.clone(),
+        env.store.clone(),
+        CompactorConfig {
+            worker_name: "c1".into(),
+            ..CompactorConfig::default()
+        },
+    );
+    let c2 = Compactor::new(
+        env.catalog.clone(),
+        env.store.clone(),
+        CompactorConfig {
+            worker_name: "c2".into(),
+            ..CompactorConfig::default()
+        },
+    );
+    let (r1, r2) = tokio::join!(c1.run_once(), c2.run_once());
+    let (s1, s2) = (r1.unwrap(), r2.unwrap());
+
+    // Whatever interleaving happened — one merged, both merged sequentially,
+    // or one conflicted — the data is intact and exactly one L1 lineage wins.
+    assert_eq!(live_payloads(&env).await, before);
+    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
+    let total: i64 = parts.iter().map(|p| p.meta.row_count).sum();
+    assert_eq!(total, 4);
+    assert!(
+        s1.merged_groups + s2.merged_groups >= 1,
+        "at least one pass merged: {s1:?} {s2:?}"
+    );
+}

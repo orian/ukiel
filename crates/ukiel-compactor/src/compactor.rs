@@ -61,6 +61,29 @@ impl Compactor {
         }
     }
 
+    /// Ticks `run_once` until cancelled. Conflicts are expected under
+    /// concurrency and are never fatal; real errors stop the worker.
+    pub async fn run(
+        &self,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Result<(), CompactorError> {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(
+            self.config.poll_interval_ms,
+        ));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return Ok(()),
+                _ = ticker.tick() => {
+                    let stats = self.run_once().await?;
+                    if stats.merged_groups > 0 || stats.conflicts > 0 {
+                        tracing::info!(?stats, "compaction pass");
+                    }
+                }
+            }
+        }
+    }
+
     /// One idempotent pass over every hypertable.
     pub async fn run_once(&self) -> Result<CompactionStats, CompactorError> {
         let mut stats = CompactionStats::default();
