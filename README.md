@@ -24,6 +24,10 @@ plans: `docs/superpowers/plans/`.
   part listing, ordered change feed. The catalog is tenancy-agnostic:
   logical tables live in namespaces, parts cover packing-key ranges;
   multitenancy is a deployment mapping (namespace = tenant).
+- `crates/ukiel-ingest` — Kafka → sorted ZSTD Parquet L0 files → catalog
+  commits. Exactly-once: Kafka offsets are stored in the catalog in the same
+  transaction as the part commit; workers resume from catalog offsets and
+  never commit Kafka group offsets.
 
 Tests: `cargo test` (integration tests spin up Postgres via testcontainers —
 Docker must be running).
