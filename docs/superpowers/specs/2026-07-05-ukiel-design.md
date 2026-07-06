@@ -79,6 +79,8 @@ Ingest workers own Kafka partition subsets; buffer rows per (hypertable, day); f
 
 Custom DataFusion `CatalogProvider`/`TableProvider`: resolve tenant's logical table → prune parts via catalog → scan Parquet with `tenant_id` predicate pushed down (files sorted by tenant → row-group pruning is effective). Tenant isolation enforced by injecting the tenant filter at plan time (not SQL rewriting); quotas/limits per tenant at the session level. V1 cache: local NVMe read-through cache; distributed cache tier is an interface with a no-op impl.
 
+**Schema introspection.** The per-namespace session enables DataFusion's `information_schema`, so clients discover their own tables and columns over the same SQL endpoint — `SELECT table_name FROM information_schema.tables`, `SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '…'` — scoped to the namespace (a namespace only sees the logical tables it owns, with the query-time schema including `materialized`/`alias` columns). There is no separate introspection API; the SQL endpoint is the client-facing view. The operator's cross-namespace view is the catalog itself — plain Postgres tables (`hypertables`, `logical_tables`, `parts`, …) queried directly (schema JSON, placement, part counts/sizes/levels per hypertable).
+
 ### Mutations (hybrid) & compaction
 
 - Deletes/updates land immediately as **tombstone parts** (delete vectors keyed by row position or key); readers merge them (dimension tables are small — cheap).
