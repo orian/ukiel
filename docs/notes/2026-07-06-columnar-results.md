@@ -1,5 +1,13 @@
 # Columnar result formats for the query API
 
+> **Status: implemented.** `POST /api/query` accepts `format`
+> (`rows` default / `columns` / `arrow`) and `Accept:
+> application/vnd.apache.arrow.stream`; both JSON formats carry the `schema`
+> block, errors are always JSON. The `ukiel:type` hint (`timestamp_ms`) rides
+> Arrow field metadata (`ukiel_core::ukiel_type_of`) and is verified to survive
+> plain column references end to end. The `max_result_rows`/bytes cap noted
+> below still lands with the statement-timeout/quota work (issue 0002).
+
 `POST /api/query` currently returns row-oriented JSON: `{"rows": [{"col":
 val, ...}, ...]}`. That is convenient for small app queries and terrible for
 analytical result sets: every row repeats every column name, numbers lose
