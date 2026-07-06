@@ -5,10 +5,8 @@
 //! consumers. Catalog rows of purged parts are kept (stamped `purged_at`) so
 //! feed replay works and the sweeper can distinguish purged from orphaned.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
-use futures::TryStreamExt;
 use object_store::ObjectStore;
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
@@ -100,33 +98,25 @@ impl Gc {
         Ok(())
     }
 
-    /// Deletes objects under the hypertable's prefix that the catalog has
-    /// never committed and that are older than the orphan grace.
+    /// Deletes objects for orphaned upload-intents past the grace, then clears
+    /// their intent rows. No object-store listing — orphans are a catalog query
+    /// (see `reconcile` for the listing-based backstop).
     async fn sweep(&self, hypertable: &Hypertable, stats: &mut GcStats) -> Result<(), GcError> {
-        let known: HashSet<String> = self
+        let orphans = self
             .catalog
-            .all_part_paths(hypertable.id)
-            .await?
-            .into_iter()
-            .collect();
-        let prefix = Path::from(format!("ht/{}", hypertable.id));
-        let objects: Vec<_> = self.store.list(Some(&prefix)).try_collect().await?;
-        let now = chrono::Utc::now();
-
-        for meta in objects {
-            if known.contains(meta.location.as_ref()) {
-                continue;
-            }
-            let age = now - meta.last_modified;
-            if age.num_seconds() >= self.config.orphan_grace_secs {
-                match self.store.delete(&meta.location).await {
-                    Ok(()) | Err(object_store::Error::NotFound { .. }) => {
-                        stats.swept_orphans += 1;
-                    }
-                    Err(e) => return Err(e.into()),
-                }
+            .orphaned_pending_objects(hypertable.id, self.config.orphan_grace_secs as f64)
+            .await?;
+        if orphans.is_empty() {
+            return Ok(());
+        }
+        for path in &orphans {
+            match self.store.delete(&Path::from(path.clone())).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(e.into()),
             }
         }
+        self.catalog.clear_pending_objects(&orphans).await?;
+        stats.swept_orphans += orphans.len();
         Ok(())
     }
 

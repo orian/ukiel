@@ -153,9 +153,10 @@ async fn reaps_tombstoned_parts_after_grace() {
 }
 
 #[tokio::test]
-async fn sweeps_only_old_unreferenced_objects() {
+async fn sweeps_orphaned_intent_after_grace() {
     let env = setup().await;
-    // One committed part, one orphan under the prefix, one object elsewhere.
+    // A committed object (has a live part) and an orphan (intent + object, no
+    // commit — a crashed writer).
     let committed = upload(&env, "committed").await;
     env.catalog
         .commit(
@@ -167,29 +168,36 @@ async fn sweeps_only_old_unreferenced_objects() {
         )
         .await
         .unwrap();
-    env.store
-        .put(
-            &Path::from(format!("ht/{}/L0/orphan.parquet", env.ht)),
-            b"junk".to_vec().into(),
-        )
+
+    let orphan_path = format!("ht/{}/L0/orphan.parquet", env.ht);
+    env.catalog
+        .register_pending_objects(env.ht, std::slice::from_ref(&orphan_path))
         .await
         .unwrap();
     env.store
-        .put(&Path::from("unrelated/file"), b"keep".to_vec().into())
+        .put(&Path::from(orphan_path.clone()), b"junk".to_vec().into())
         .await
         .unwrap();
 
-    // Orphan grace not elapsed: nothing swept (protects in-flight commits).
+    // Grace not elapsed: the orphan is protected (its commit might still land).
     let stats = gc(&env, 3600.0, 3600).run_once().await.unwrap();
     assert_eq!(stats.swept_orphans, 0);
+    assert_eq!(object_paths(&env.store).await.len(), 2);
 
-    // Grace 0: the orphan goes, the committed part and out-of-prefix object stay.
+    // Grace 0: the orphan object and its intent row go; the committed part stays.
     let stats = gc(&env, 3600.0, 0).run_once().await.unwrap();
     assert_eq!(stats.swept_orphans, 1);
     let remaining = object_paths(&env.store).await;
-    assert_eq!(remaining.len(), 2);
-    assert!(remaining.iter().any(|p| p.ends_with("committed.parquet")));
-    assert!(remaining.iter().any(|p| p == "unrelated/file"));
+    assert_eq!(remaining.len(), 1);
+    assert!(remaining[0].ends_with("committed.parquet"));
+    assert!(
+        env.catalog
+            .orphaned_pending_objects(env.ht, 0.0)
+            .await
+            .unwrap()
+            .is_empty(),
+        "swept orphan's intent row must be cleared"
+    );
 }
 
 #[tokio::test]
