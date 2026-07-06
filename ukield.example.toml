@@ -1,0 +1,59 @@
+# ukield example configuration. Start the compose stack first:
+#   docker compose up -d --wait
+# then: cargo run -p ukield -- --config ukield.example.toml
+
+# Which workers this process runs (default: all four).
+roles = ["ingest", "query", "compactor", "gc"]
+
+[catalog]
+url = "postgres://postgres:postgres@127.0.0.1:5432/postgres"
+
+[object_store]
+kind = "s3" # or "memory" for a throwaway in-process store (no MinIO needed)
+endpoint = "http://127.0.0.1:19000"
+bucket = "ukiel"
+access_key_id = "minioadmin"
+secret_access_key = "minioadmin"
+allow_http = true
+
+[query]
+listen = "127.0.0.1:8080"
+cache_dir = "" # non-empty = local read-through cache directory
+
+[ingest]
+brokers = "127.0.0.1:9092"
+group_id = "ukield"
+flush_interval_ms = 2000 # demo-friendly freshness; production default 10000
+max_buffer_rows = 100000
+
+[compactor]
+poll_interval_ms = 5000
+min_l0_files = 2
+
+[gc]
+poll_interval_ms = 60000
+tombstone_grace_secs = 900
+orphan_grace_secs = 3600
+
+# Tables are bootstrapped idempotently at startup. `topic`/`ts_column` are the
+# pre-pipelines routing config (see docs/notes/2026-07-06-pipelines.md).
+[[tables]]
+name = "events"
+topic = "events"
+ts_column = "ts"
+packing_key = "tenant_id"
+sort_key = ["tenant_id", "ts"]
+partition_columns = ["day"]
+namespaces = [1, 2, 3]
+
+[[tables.columns]]
+name = "tenant_id"
+type = "int64"
+
+[[tables.columns]]
+name = "ts"
+type = "timestamp_ms"
+
+[[tables.columns]]
+name = "payload"
+type = "utf8"

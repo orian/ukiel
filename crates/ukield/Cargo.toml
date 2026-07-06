@@ -1,0 +1,29 @@
+[package]
+name = "ukield"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ukiel-core = { workspace = true }
+ukiel-catalog = { workspace = true }
+ukiel-ingest = { workspace = true }
+ukiel-query = { workspace = true }
+ukiel-compactor = { workspace = true }
+ukiel-gc = { workspace = true }
+ukiel-expr = { workspace = true }
+object_store = { workspace = true, features = ["aws"] }
+axum = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+url = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+testcontainers-modules = { workspace = true, features = ["kafka"] }
+rdkafka = { workspace = true }
+reqwest = { workspace = true }
