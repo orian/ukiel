@@ -93,9 +93,10 @@ endpoint: `SELECT table_name FROM information_schema.tables`.
   rewrites = organic backfill) / `alias` (computed at query time). See
   `docs/notes/2026-07-06-materialized-columns.md`.
 - `crates/ukiel-gc` — object garbage collection: reaps tombstoned parts'
-  objects after a grace period (fenced by worker cursors so lagging feed
-  consumers are safe) and sweeps never-committed orphans left by crashed or
-  conflicted writers. Purged parts keep catalog rows for feed replay.
+  objects after a grace period (fenced by worker cursors) and sweeps orphaned
+  uploads via a write-ahead intent table (`pending_objects`) — no object-store
+  listing on the hot path. A rare `reconcile` pass lists the bucket as
+  defense-in-depth. Purged parts keep catalog rows for feed replay.
 - `crates/ukiel-e2e` — end-to-end suite against the docker-compose stack
   (Kafka + Postgres + MinIO); tests are `#[ignore]`d by default. Philosophy
   and scenario catalog: `docs/superpowers/specs/2026-07-05-ukiel-testing-design.md`.
