@@ -11,6 +11,15 @@ pub enum CatalogError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// A concurrent writer already advanced this topic-partition's ingest
+    /// offset past the range being committed (issue 0003: two ingest workers
+    /// on one topic). The commit was rolled back; the losing worker must stop —
+    /// its consumed batch is a duplicate.
+    #[error(
+        "ingest offset race on {topic}/{partition}: stored next_offset moved past this commit's range"
+    )]
+    OffsetRace { topic: String, partition: i32 },
+
     #[error(transparent)]
     Db(#[from] sqlx::Error),
 

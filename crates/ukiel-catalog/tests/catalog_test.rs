@@ -423,6 +423,62 @@ async fn change_feed_replays_commits_in_order() {
 use ukiel_catalog::OffsetRange;
 
 #[tokio::test]
+async fn duplicate_offset_commit_is_rejected_and_rolled_back() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let range = |first, last| OffsetRange {
+        topic: "events".to_string(),
+        partition: 0,
+        first,
+        last,
+    };
+    let commit_add =
+        |catalog: ukiel_catalog::PostgresCatalog, path: &'static str, r: OffsetRange| async move {
+            catalog
+                .commit_with_offsets(
+                    ht,
+                    CommitOp::Add {
+                        parts: vec![part_meta(path, 1, 10)],
+                    },
+                    &[r],
+                )
+                .await
+        };
+
+    // Writer A commits rows for offsets 0..=9.
+    commit_add(catalog.clone(), "p-a.parquet", range(0, 9))
+        .await
+        .unwrap();
+    let live_before = catalog.live_parts(ht, None).await.unwrap().len();
+
+    // Writer B (a duplicate consumer) tries to commit the same offsets.
+    let err = commit_add(catalog.clone(), "p-b.parquet", range(0, 9))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CatalogError::OffsetRace { ref topic, partition: 0 } if topic == "events"),
+        "{err:?}"
+    );
+
+    // The whole transaction rolled back: no duplicate part appeared.
+    assert_eq!(
+        catalog.live_parts(ht, None).await.unwrap().len(),
+        live_before
+    );
+
+    // The real writer continues from 10 — sequential progress still works.
+    commit_add(catalog.clone(), "p-c.parquet", range(10, 19))
+        .await
+        .unwrap();
+
+    // Offset gaps stay legal (compacted topics): next stored is 20, a range
+    // starting at 25 commits fine.
+    commit_add(catalog.clone(), "p-d.parquet", range(25, 30))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn commit_with_offsets_is_atomic() {
     let (_pg, catalog) = common::setup().await;
     let ht = setup_hypertable(&catalog).await;

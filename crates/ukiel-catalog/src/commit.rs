@@ -82,18 +82,32 @@ impl PostgresCatalog {
         }
 
         for range in offsets {
-            sqlx::query(
+            // CAS, not upsert (issue 0003): the update only applies while the
+            // stored cursor has not advanced past this range's start. `<=`
+            // (not `=`) keeps offset gaps legal (compacted topics). Zero rows
+            // affected = another writer got here first: roll everything back.
+            let affected = sqlx::query(
                 "INSERT INTO ingest_offsets (hypertable_id, topic, kafka_partition, next_offset)
                  VALUES ($1, $2, $3, $4)
                  ON CONFLICT (hypertable_id, topic, kafka_partition)
-                 DO UPDATE SET next_offset = EXCLUDED.next_offset, updated_at = now()",
+                 DO UPDATE SET next_offset = EXCLUDED.next_offset, updated_at = now()
+                 WHERE ingest_offsets.next_offset <= $5",
             )
             .bind(hypertable_id.0)
             .bind(&range.topic)
             .bind(range.partition)
             .bind(range.last + 1)
+            .bind(range.first)
             .execute(&mut *tx)
-            .await?;
+            .await?
+            .rows_affected();
+
+            if affected == 0 {
+                return Err(CatalogError::OffsetRace {
+                    topic: range.topic.clone(),
+                    partition: range.partition,
+                });
+            }
         }
 
         tx.commit().await?;
