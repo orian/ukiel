@@ -133,19 +133,36 @@ impl RouteIngest {
             .catalog
             .ingest_offsets(hypertable.id, &self.route.topic)
             .await?;
-        let metadata = consumer.fetch_metadata(Some(&self.route.topic), Duration::from_secs(10))?;
-        let topic_meta = metadata
-            .topics()
-            .iter()
-            .find(|t| t.name() == self.route.topic)
-            .ok_or_else(|| {
-                IngestError::Config(format!("topic '{}' not found", self.route.topic))
-            })?;
 
+        // Partitions are assigned once at startup, so we must wait for the
+        // topic to actually exist with partitions. A freshly-declared topic is
+        // auto-created lazily; a metadata fetch that races that creation can
+        // report zero partitions, which would silently consume nothing.
         let mut tpl = TopicPartitionList::new();
-        for p in topic_meta.partitions() {
-            let next = stored.get(&p.id()).copied().unwrap_or(0);
-            tpl.add_partition_offset(&self.route.topic, p.id(), Offset::Offset(next))?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let metadata =
+                consumer.fetch_metadata(Some(&self.route.topic), Duration::from_secs(10))?;
+            let partitions = metadata
+                .topics()
+                .iter()
+                .find(|t| t.name() == self.route.topic)
+                .map(|t| t.partitions())
+                .unwrap_or(&[]);
+            if !partitions.is_empty() {
+                for p in partitions {
+                    let next = stored.get(&p.id()).copied().unwrap_or(0);
+                    tpl.add_partition_offset(&self.route.topic, p.id(), Offset::Offset(next))?;
+                }
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(IngestError::Config(format!(
+                    "topic '{}' has no partitions after 30s",
+                    self.route.topic
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
         consumer.assign(&tpl)?;
         Ok(consumer)
