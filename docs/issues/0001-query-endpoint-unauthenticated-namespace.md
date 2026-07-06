@@ -52,6 +52,17 @@ Until fixed, the endpoint must only be reachable by fully trusted callers
 exposure allows one tenant to read every other tenant's data by changing one
 integer.
 
+**Amplified by `information_schema` (2026-07-06):** sessions now expose
+namespace-scoped introspection (`information_schema.tables`/`columns`). The
+scoping itself is correct (a session only sees its own namespace's tables —
+regression-tested), but combined with this issue it makes reconnaissance
+cheap: an attacker can iterate `namespace_id` values and map every tenant's
+table inventory with one query each — table names themselves can be
+sensitive. It also widens the unauthenticated DB-load surface
+(`information_schema.columns` resolves every table via catalog queries, on
+top of the per-request session build). Both are reasons to prioritize the
+auth extractor and the statement-timeout/quota work (issue 0002).
+
 ## Fix
 
 Derive `NamespaceId` from an **authenticated principal**, never from the body:
