@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement the enforcement half of the design doc's "Limits & guardrails" section: (a) **ingest backpressure** — the flusher defers flushes when live L0 count in its target partitions crosses a slowdown threshold (halving flush rate ⇒ fewer, bigger L0 files) and stops past a stop threshold with a memory safety valve; (b) **finalization sweep aggregation in SQL** — `finalize_once` stops fetching every live part of every hypertable and instead asks Postgres for candidate partitions; (c) a **partition-spread warning** when one flush covers many partitions (a hard cap is impossible: a flush's Kafka offset range covers all consumed rows, so exactly-once forbids flushing some days and deferring others).
+**Goal:** Implement the enforcement half of the design doc's "Limits & guardrails" section: (a) **ingest backpressure** — the flusher defers flushes when live L0 count in its target partitions crosses a slowdown threshold (halving flush rate ⇒ fewer, bigger L0 files) and stops past a stop threshold with a memory safety valve; (b) **finalization sweep aggregation in SQL** — `finalize_once` stops fetching every live part of every hypertable and instead asks Postgres for candidate partitions; (c) a **partition-spread warning** when one flush covers many partitions (a hard cap is impossible: a flush's Kafka offset range covers all consumed rows, so exactly-once forbids flushing some days and deferring others); (d) the **S8 GC-hygiene e2e scenario** the testing design specs (invariant I8) but which was never implemented when plan 6 landed.
 
 **Architecture:** Three new catalog probes (`live_l0_parts`, `finalize_candidates`, `live_partition_parts`). Backpressure is a pure decision function in `ukiel-ingest` (`flush_decision`) unit-testable without Docker, wired into `RouteIngest::flush` before buffers are drained (deferring must not lose rows); Kafka offsets only advance with flushes, so deferral is automatically exactly-once-safe. Shutdown flushes bypass the guardrail (`force`). Observability is `tracing` warnings + existing stats-struct patterns; metric emission (`ingest_backpressure_deferrals_total`, `ingest_flush_partitions`, `compactor_unfinalized_partitions`) lands with monitoring phase P1 (`docs/superpowers/specs/2026-07-06-ukiel-monitoring.md`), not here.
 
@@ -551,6 +551,42 @@ Expected: whole workspace green. Optionally `make e2e`.
 ```bash
 git add crates/ukield ukield.example.toml docs/
 git commit -m "feat: guardrail config in ukield; docs mark plan 18 executed"
+```
+
+---
+
+### Task 6: S8 — GC hygiene e2e scenario (testing-design debt)
+
+**Files:**
+- Create or extend: the scenario module in `crates/ukiel-e2e` (follow the existing S0–S7 file/module layout; all e2e tests are `#[ignore]`d and run via `make e2e`)
+
+**Interfaces:**
+- Implements S8 exactly as specced in `docs/superpowers/specs/2026-07-05-ukiel-testing-design.md` (scenario table, row S8): after an S6-style load-plus-compaction run **and a key deletion**, run GC to quiescence with **zero graces** (`tombstone_grace_secs: 0`, `orphan_grace_secs: 0` in the test's GC config), then assert the storage-lifecycle bijection.
+
+- [ ] **Step 1: Write the scenario**
+
+Using the `Stack` harness and the in-memory oracle model exactly as S6/S7 do:
+
+1. Run S6's load shape (multi-tenant ingest, compactor running concurrently, drain to quiescence).
+2. Delete one packing key via the deletion worker (as S7 does), updating the oracle model.
+3. Run GC to quiescence with zero graces (reaper + orphan sweep until a full pass reaps and sweeps nothing).
+4. Assert, in both directions:
+   - every object in the bucket is the `path` of a **live** part (list the bucket once — allowed here, this is a test, not a hot path);
+   - every live part's object exists (`head` each);
+   - every namespace's query results still equal the oracle model (no referenced object was removed).
+
+- [ ] **Step 2: Verify**
+
+Run: `make e2e`
+Expected: S8 passes alongside S0–S7. If S8 exposes a real reaper/sweeper bug (that is what it exists to do), fix it in `ukiel-gc` before proceeding — a red S8 is a finding, not a flake.
+
+- [ ] **Step 3: Update the testing-design status and commit**
+
+In `docs/superpowers/specs/2026-07-05-ukiel-testing-design.md`, mark S8 implemented (matching however S6/S7 are annotated), and in `docs/superpowers/plans/2026-07-05-ukiel-v1-roadmap.md` row 5, extend the scenario list to S8.
+
+```bash
+git add crates/ukiel-e2e docs/
+git commit -m "test: S8 gc-hygiene e2e scenario - bucket and live parts are a bijection after gc"
 ```
 
 ---

@@ -58,6 +58,7 @@ alert traces back to an invariant or an SLO.
 | `query_requests_total{format,status}` | counter | rate + error ratio |
 | `query_duration_seconds{class}` | histogram | p50/p95/p99; `class` = coarse shape (select/aggregate/introspection), not SQL text |
 | `query_rows_returned` | histogram | runaway result sets (ties to the 0002 quota work) |
+| `query_timeouts_total` | counter | statement-timeout expiries (plan 19 / issue 0002) — a rate here means tenants are hitting the rail; sustained growth is a capacity or pruning problem wearing a timeout costume |
 | `query_parts_scanned` / `query_parts_pruned` | histogram | pruning effectiveness in production, not just benchmarks |
 | `query_objectstore_requests_total{op}` | counter | the cost metric (same counting wrapper the perf spec defines) |
 | `cache_hits_total` / `cache_misses_total{tier}` | counter | NVMe file cache and Parquet metadata cache (plan 13's counters) — hit-ratio drop predicts latency regression and disk pressure |
@@ -128,7 +129,7 @@ of query nodes; workers don't need readiness (they self-heal by replanning).
 
 ## Implementation phases
 
-- **P1 (one small plan):** `metrics` facade in the five worker crates —
+- **P1 (roadmap row 20, `ukiel-metrics-p1`):** `metrics` facade in the five worker crates —
   the stats structs already returned by `run_once`/flush paths become
   counters/histograms at their call sites; Prometheus exporter + `/metrics`
   + `/readyz` in `ukield`; cache/metadata-cache counters exposed.

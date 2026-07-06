@@ -1,7 +1,7 @@
 # 0002 — GC tombstone grace is not enforced against query duration
 
 - **Severity:** Medium (correct failure, not corruption — but unbounded queries can break)
-- **Status:** Open — known v1 gap
+- **Status:** Open — fix planned: plan 19 (`docs/superpowers/plans/2026-07-06-ukiel-safety-rails.md`), statement timeout + startup invariant check
 - **Components:** `crates/ukiel-gc`, `crates/ukiel-query`
 - **Found by:** design review, 2026-07-06
 

@@ -130,6 +130,17 @@ ClickHouse's parts/partition limits exist because parts are *physical residents*
 
 Partition granularity itself is a maintenance knob, not a query commitment (planning prunes by key range + part stats, never partition equality). Day is right for the events workload — finalization latency, merge RAM (merges hold a group in memory until streaming merge lands), retention granularity. The per-partition file floor is answered by **partition coalescing** (future plan): rewrite aged day-partitions into month-partitions on the same REPLACE machinery — the time-axis analog of the plan-17 key-axis ladder. Fully dynamic layout (parts as key × time rectangles, no calendar boxes — possible precisely because partitions are tags) is deliberately deferred: it complicates ingest buffering and merge planning for marginal benefit over coalescing.
 
+## Backup & disaster recovery
+
+The catalog is the single source of truth — losing Postgres means losing the lake (the bucket becomes unreferenced object soup). The architecture makes DR unusually cheap, because parts are immutable, catalog rows are never deleted, and ingest offsets live *in* the catalog. **Any Postgres PITR snapshot at time T is a consistent lake**, provided two time-window invariants (same shape as the GC grace / issue-0002 invariant):
+
+1. **`gc.tombstone_grace > max_backup_lag`** — every object the snapshot considers live was, at worst, tombstoned after T and therefore not yet reaped when the snapshot is restored. Nothing the restored catalog references is missing.
+2. **`kafka_retention > max_backup_lag`** — the restored `ingest_offsets` also rewind to T, so ingest *replays exactly the lost window* from Kafka: data ingested after T self-heals. This is the payoff of catalog-anchored offsets — the backup story for ingested data is Kafka retention, not Postgres backup frequency.
+
+What about work committed after T? REPLACE outputs (compaction, deletion rewrites) lose their catalog rows, but their *input* parts are live again in the restored catalog — and REPLACE is equivalence-preserving, so no data is lost; the ladder simply redoes the work. The now-unreferenced post-T objects are cleaned by the orphan machinery (`reconcile` backstop; upload-intent rows also rewind to T). One operational rule: **pause GC after a restore** until one full grace has elapsed, so the reaper never acts on rewound bookkeeping. Deletions (GDPR) executed after T must be re-issued — deletion requests should be durable outside the catalog (queue/ticket), which is worth stating in the deletion-worker's eventual productization.
+
+Not yet done (deferred): a documented restore runbook, automated `tombstone_grace >= backup_lag` validation at deploy time, and periodic restore drills. Time-travel reads (below) would give restores named, testable consistency points.
+
 ## Implementation status
 
 Executed plan-by-plan; the authoritative status table is
@@ -160,7 +171,16 @@ exactly-once, compaction equivalence under racing ingest, and key deletion.
   (issue 0001); do not expose to untrusted callers until an authenticated
   principal supplies it.
 - **Statement timeout** — the GC tombstone grace assumes bounded query
-  duration (issue 0002).
+  duration (issue 0002). Fix planned: plan 19
+  (`docs/superpowers/plans/2026-07-06-ukiel-safety-rails.md`).
+- **Concurrent ingest writers double-commit** (issue 0003) — the
+  `ingest_offsets` upsert is last-writer-wins and every worker assigns all
+  Kafka partitions, so two ingest processes on one topic silently duplicate
+  data. Plan 19 adds an offset CAS turning this into a loud error; true
+  horizontal ingest (partition-subset leases) remains future work.
+- **Unbounded event time** (issue 0004) — junk partitions from bad
+  timestamps plus the permanent `"unknown"` day. Plan 19 bounds event time
+  at ingest (out-of-window rows skipped like poison).
 - **Level ladder & size-targeted placement** — designed, plan written and
   ready to execute (plan 17,
   `docs/superpowers/plans/2026-07-06-ukiel-lsm-hierarchy.md`): fanout ladder
@@ -181,3 +201,18 @@ exactly-once, compaction equivalence under racing ingest, and key deletion.
   feed horizon + purged-row pruning** (part/commit rows currently grow
   forever; the feed's replay-forever guarantee needs a bound before catalog
   sharding is the only lever).
+- **Time travel (`AS OF` reads)** — nearly free: the catalog already
+  retains full history, so a snapshot read at commit N is one predicate
+  (`created_by_commit <= N AND (deleted_by_commit IS NULL OR
+  deleted_by_commit > N)`), bounded by the GC grace for object
+  availability. Would also fix a subtle gap: a multi-table query resolves
+  each table's live parts independently, so a REPLACE landing between
+  resolutions yields cross-table snapshot skew today; pinning one commit id
+  per query session closes it. Also gives backup/restore named consistency
+  points. Schema supports it now; deliberately unbuilt.
+- **Late-data re-finalization write amp** — a finalized partition that
+  receives late events correctly reopens (the quiet-check fails, the ladder
+  resumes), but a slow trickle re-finalizes the whole partition per late
+  batch. Acceptable while late data is rare and event time is bounded
+  (issue 0004); if it becomes hot, the mitigation is routing very-late rows
+  to a sibling partition folded in at coalescing time.
