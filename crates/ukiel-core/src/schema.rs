@@ -3,7 +3,15 @@
 //! Supported field types: `int64`, `float64`, `utf8`, `bool`, `timestamp_ms`.
 //! v1 maps `timestamp_ms` to Arrow `Int64` (epoch milliseconds).
 
+use std::collections::HashMap;
+
 use arrow::datatypes::{DataType, Field, Schema};
+
+/// Arrow field-metadata key carrying the Ukiel type name where it can't be
+/// recovered from the Arrow `DataType` alone (currently only `timestamp_ms`,
+/// which is stored as `Int64`). Inert for storage and query — it only rides
+/// along so result-schema introspection can surface the declared type.
+pub const UKIEL_TYPE_META: &str = "ukiel:type";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SchemaError {
@@ -11,6 +19,22 @@ pub enum SchemaError {
     Invalid(String),
     #[error("unsupported field type '{0}'")]
     UnsupportedType(String),
+}
+
+/// The Ukiel type name for a (result) Arrow field, per the columnar-results
+/// resolution rule: prefer the `ukiel:type` metadata hint (survives plain
+/// column references), else map the Arrow type, else the lowercase Arrow name.
+pub fn ukiel_type_of(field: &Field) -> String {
+    if let Some(t) = field.metadata().get(UKIEL_TYPE_META) {
+        return t.clone();
+    }
+    match field.data_type() {
+        DataType::Int64 => "int64".to_string(),
+        DataType::Float64 => "float64".to_string(),
+        DataType::Utf8 => "utf8".to_string(),
+        DataType::Boolean => "bool".to_string(),
+        other => format!("{other:?}").to_lowercase(),
+    }
 }
 
 /// How a column gets its value. Expressions are DataFusion SQL strings over
@@ -36,6 +60,9 @@ pub struct ColumnSpec {
     pub data_type: DataType,
     pub nullable: bool,
     pub kind: ColumnKind,
+    /// The declared Ukiel type name (e.g. `timestamp_ms`), preserved because
+    /// several names (`int64`, `timestamp_ms`) collapse to the same Arrow type.
+    pub ukiel_type: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,6 +118,7 @@ impl TableColumns {
                 data_type,
                 nullable,
                 kind,
+                ukiel_type: type_name.to_string(),
             });
         }
         Ok(TableColumns { specs })
@@ -101,7 +129,20 @@ impl TableColumns {
             self.specs
                 .iter()
                 .filter(|s| include(&s.kind))
-                .map(|s| Field::new(&s.name, s.data_type.clone(), s.nullable))
+                .map(|s| {
+                    let field = Field::new(&s.name, s.data_type.clone(), s.nullable);
+                    // Attach the type hint only where the Arrow type is
+                    // ambiguous (timestamp_ms vs int64); other names map back
+                    // cleanly from the Arrow type.
+                    if s.ukiel_type == "timestamp_ms" {
+                        field.with_metadata(HashMap::from([(
+                            UKIEL_TYPE_META.to_string(),
+                            s.ukiel_type.clone(),
+                        )]))
+                    } else {
+                        field
+                    }
+                })
                 .collect::<Vec<_>>(),
         )
     }
@@ -213,5 +254,48 @@ mod tests {
         ]}))
         .unwrap_err();
         assert!(matches!(err, SchemaError::Invalid(_)));
+    }
+
+    #[test]
+    fn timestamp_ms_carries_type_hint_metadata() {
+        let schema = arrow_schema_from_json(&json!({"fields": [
+            {"name": "tenant_id", "type": "int64"},
+            {"name": "ts", "type": "timestamp_ms"}
+        ]}))
+        .unwrap();
+
+        // ts is stored as Int64 but tagged so introspection can recover the type.
+        assert_eq!(schema.field(1).data_type(), &DataType::Int64);
+        assert_eq!(
+            schema
+                .field(1)
+                .metadata()
+                .get(UKIEL_TYPE_META)
+                .map(String::as_str),
+            Some("timestamp_ms")
+        );
+        // Plain int64 carries no hint (recoverable from the Arrow type).
+        assert!(schema.field(0).metadata().get(UKIEL_TYPE_META).is_none());
+    }
+
+    #[test]
+    fn ukiel_type_of_resolves_hint_then_arrow_type() {
+        let schema = arrow_schema_from_json(&json!({"fields": [
+            {"name": "ts", "type": "timestamp_ms"},
+            {"name": "n", "type": "int64"},
+            {"name": "amount", "type": "float64"},
+            {"name": "payload", "type": "utf8"},
+            {"name": "flag", "type": "bool"}
+        ]}))
+        .unwrap();
+        assert_eq!(ukiel_type_of(schema.field(0)), "timestamp_ms"); // via metadata
+        assert_eq!(ukiel_type_of(schema.field(1)), "int64");
+        assert_eq!(ukiel_type_of(schema.field(2)), "float64");
+        assert_eq!(ukiel_type_of(schema.field(3)), "utf8");
+        assert_eq!(ukiel_type_of(schema.field(4)), "bool");
+
+        // A bare Int64 field with no metadata (a computed column) -> int64.
+        let computed = Field::new("expr", DataType::Int64, true);
+        assert_eq!(ukiel_type_of(&computed), "int64");
     }
 }
