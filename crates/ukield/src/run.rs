@@ -50,6 +50,8 @@ pub async fn run_with_bound_addr(
     shutdown: CancellationToken,
     bound: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
 ) -> anyhow::Result<()> {
+    crate::config::validate(&cfg)?;
+
     let catalog = PostgresCatalog::connect(&cfg.catalog.url)
         .await
         .context("connecting to catalog")?;
@@ -108,6 +110,7 @@ pub async fn run_with_bound_addr(
             catalog: catalog.clone(),
             store: store.clone(),
             store_url: store_url.clone(),
+            statement_timeout: std::time::Duration::from_secs(cfg.query.statement_timeout_secs),
         };
         let listener = tokio::net::TcpListener::bind(&cfg.query.listen)
             .await

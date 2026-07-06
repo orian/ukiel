@@ -77,6 +77,9 @@ pub struct QueryConfig {
     pub listen: String,
     /// Non-empty = wrap the store in the local read-through cache.
     pub cache_dir: String,
+    /// Statement timeout in seconds (issue 0002: must stay below
+    /// gc.tombstone_grace_secs — validated at startup by `validate`).
+    pub statement_timeout_secs: u64,
 }
 
 impl Default for QueryConfig {
@@ -84,8 +87,28 @@ impl Default for QueryConfig {
         Self {
             listen: "127.0.0.1:8080".to_string(),
             cache_dir: String::new(),
+            statement_timeout_secs: 300,
         }
     }
+}
+
+/// Issue 0002 invariant: a query that outlives the GC tombstone grace can
+/// observe deleted objects. Refuse the configuration outright when one process
+/// runs both roles (a split deployment can't see both sides — the invariant
+/// note stays in the config comment).
+pub fn validate(cfg: &UkieldConfig) -> anyhow::Result<()> {
+    if cfg.roles.contains(&Role::Query)
+        && cfg.roles.contains(&Role::Gc)
+        && cfg.query.statement_timeout_secs as f64 >= cfg.gc.tombstone_grace_secs
+    {
+        anyhow::bail!(
+            "query.statement_timeout_secs ({}) must be < gc.tombstone_grace_secs ({}): \
+             a query outliving the grace can read reaped objects (issue 0002)",
+            cfg.query.statement_timeout_secs,
+            cfg.gc.tombstone_grace_secs
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -319,6 +342,22 @@ mod tests {
             ]})
         );
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn valid_default_timeout_passes_invariant() {
+        // Defaults: statement_timeout 300 < gc grace 900, all roles present.
+        let cfg: UkieldConfig = toml::from_str(EXAMPLE).unwrap();
+        assert_eq!(cfg.query.statement_timeout_secs, 300);
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn timeout_at_or_above_grace_is_refused() {
+        let raw = format!("{EXAMPLE}\n[query]\nstatement_timeout_secs = 900\n");
+        let cfg: UkieldConfig = toml::from_str(&raw).unwrap();
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("issue 0002"), "{err}");
     }
 
     #[test]

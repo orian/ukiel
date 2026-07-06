@@ -5,11 +5,18 @@ use serde_json::json;
 use ukiel_query::server::{AppState, router};
 
 async fn spawn_server() -> (String, query_test::Harness) {
+    spawn_server_with_timeout(std::time::Duration::from_secs(300)).await
+}
+
+async fn spawn_server_with_timeout(
+    statement_timeout: std::time::Duration,
+) -> (String, query_test::Harness) {
     let h = setup().await;
     let state = AppState {
         catalog: h.catalog.clone(),
         store: h.store.clone(),
         store_url: url::Url::parse(STORE_URL).unwrap(),
+        statement_timeout,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -17,6 +24,28 @@ async fn spawn_server() -> (String, query_test::Harness) {
         axum::serve(listener, router(state)).await.unwrap();
     });
     (format!("http://{addr}"), h)
+}
+
+#[tokio::test]
+async fn statement_timeout_returns_408() {
+    // ZERO timeout makes expiry deterministic without a genuinely slow query.
+    let (base, _h) = spawn_server_with_timeout(std::time::Duration::ZERO).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/api/query"))
+        .json(&json!({"namespace_id": 2, "sql": "SELECT payload FROM events"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 408);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("statement timeout")),
+        "expected statement-timeout error, got {body}"
+    );
 }
 
 #[tokio::test]

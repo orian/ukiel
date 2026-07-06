@@ -19,6 +19,7 @@ allow_http = true
 [query]
 listen = "127.0.0.1:8080"
 cache_dir = "" # non-empty = local read-through cache directory
+statement_timeout_secs = 300 # must be < gc.tombstone_grace_secs (issue 0002)
 
 [ingest]
 brokers = "127.0.0.1:9092"

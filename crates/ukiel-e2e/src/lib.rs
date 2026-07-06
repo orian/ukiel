@@ -96,6 +96,7 @@ impl Stack {
             catalog: catalog.clone(),
             store: store.clone(),
             store_url: store_url.clone(),
+            statement_timeout: std::time::Duration::from_secs(300),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

@@ -23,6 +23,10 @@ pub struct AppState {
     pub catalog: PostgresCatalog,
     pub store: Arc<dyn ObjectStore>,
     pub store_url: url::Url,
+    /// Issue 0002: bounds query duration so the GC tombstone grace is a real
+    /// guarantee (deployment invariant: this < gc.tombstone_grace). Also the
+    /// runaway-query rail for a tenant-facing SQL endpoint.
+    pub statement_timeout: std::time::Duration,
 }
 
 #[derive(serde::Deserialize)]
@@ -64,28 +68,43 @@ async fn run_query_inner(
     headers: HeaderMap,
     req: QueryRequest,
 ) -> Result<Response, (StatusCode, String)> {
-    let ctx = session_for_namespace(
-        &state.catalog,
-        NamespaceId(req.namespace_id),
-        state.store.clone(),
-        &state.store_url,
-    )
-    .await
-    .map_err(bad_request)?;
-
-    let options = SQLOptions::new()
-        .with_allow_ddl(false)
-        .with_allow_dml(false)
-        .with_allow_statements(false);
-    let df = ctx
-        .sql_with_options(&req.sql, options)
+    // Issue 0002: planning + execution run under one statement timeout, so a
+    // query can never outlive the GC tombstone grace and read reaped objects.
+    // Result formatting stays outside — it's cheap and already has the data.
+    let timeout = state.statement_timeout;
+    let (planned_schema, batches): (SchemaRef, Vec<_>) = tokio::time::timeout(timeout, async {
+        let ctx = session_for_namespace(
+            &state.catalog,
+            NamespaceId(req.namespace_id),
+            state.store.clone(),
+            &state.store_url,
+        )
         .await
         .map_err(bad_request)?;
 
-    // Capture the result schema before `collect` consumes the frame; the
-    // collected batches carry the definitive runtime schema when non-empty.
-    let planned_schema: SchemaRef = df.schema().inner().clone();
-    let batches = df.collect().await.map_err(bad_request)?;
+        let options = SQLOptions::new()
+            .with_allow_ddl(false)
+            .with_allow_dml(false)
+            .with_allow_statements(false);
+        let df = ctx
+            .sql_with_options(&req.sql, options)
+            .await
+            .map_err(bad_request)?;
+
+        // Capture the result schema before `collect` consumes the frame; the
+        // collected batches carry the definitive runtime schema when non-empty.
+        let planned_schema: SchemaRef = df.schema().inner().clone();
+        let batches = df.collect().await.map_err(bad_request)?;
+        Ok::<_, (StatusCode, String)>((planned_schema, batches))
+    })
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::REQUEST_TIMEOUT,
+            format!("query exceeded statement timeout ({}s)", timeout.as_secs()),
+        )
+    })??;
+
     let schema = batches
         .first()
         .map(|b| b.schema())
