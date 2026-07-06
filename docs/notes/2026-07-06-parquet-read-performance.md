@@ -74,7 +74,9 @@ Perf smoke numbers get appended here after each plan.
 
 ## Baseline & results
 
-(Recorded by plan executors; medians from `tests/perf_smoke.rs`.)
+(Recorded by plan executors; medians from `tests/perf_smoke.rs`. Methodology,
+tiers beyond this micro harness, and results discipline:
+`docs/superpowers/specs/2026-07-06-ukiel-performance-testing.md`.)
 
 | Scenario | Baseline | After plan 11 | After stats pruning |
 |---|---|---|---|

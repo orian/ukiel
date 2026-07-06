@@ -1,6 +1,6 @@
 # Ukiel Testing Design: Philosophy & End-to-End Tests
 
-Companion to `2026-07-05-ukiel-design.md`. This document defines how Ukiel is tested at every layer and designs the end-to-end (e2e) suite that runs against real Kafka, Postgres, and MinIO. The task-level implementation plan for the e2e suite is plan 5 of the roadmap and derives from this document.
+Companion to `2026-07-05-ukiel-design.md`. This document defines how Ukiel is tested at every layer and designs the end-to-end (e2e) suite that runs against real Kafka, Postgres, and MinIO. The task-level implementation plan for the e2e suite is plan 5 of the roadmap and derives from this document. Performance testing has its own companion spec (`2026-07-06-ukiel-performance-testing.md`); production observability likewise (`2026-07-06-ukiel-monitoring.md` — the invariants below double as its alert catalog).
 
 ## Testing philosophy
 
