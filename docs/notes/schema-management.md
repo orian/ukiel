@@ -71,6 +71,13 @@ shape it:
    the change feed, REPLACE-committing converted files, arbitrated by
    optimistic concurrency — same machinery as compaction. Deliberately last.
 
+Column kinds (`default` / `materialized` / `alias` expressions) are documented
+in [materialized-columns.md](materialized-columns.md). Note that compactor
+reads are schema-adapting (old files contribute NULLs for later-added
+columns) and rewrites recompute write-time expressions — additive evolution
+plus organic backfill already works at the storage layer; only the
+`alter_hypertable_add_column` API with validation remains future work.
+
 When needed, the plan-sized first slice is: `alter_hypertable_add_column` with
 compatibility validation (nullable-or-default enforced, name collisions
 rejected), a schema-version stamp on parts so files predating a column are

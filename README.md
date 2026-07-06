@@ -38,6 +38,10 @@ plans: `docs/superpowers/plans/`, concept notes: `docs/notes/`
   `separated` per key), and atomic key deletion (metadata-only for dedicated
   files, rewrite for packed ones). All swaps are optimistic REPLACE commits;
   losers replan from fresh state.
+- `crates/ukiel-expr` — deterministic SQL expression engine for column
+  specs: `default` / `materialized` (computed at write + recomputed on
+  rewrites = organic backfill) / `alias` (computed at query time). See
+  `docs/notes/materialized-columns.md`.
 - `crates/ukiel-gc` — object garbage collection: reaps tombstoned parts'
   objects after a grace period (fenced by worker cursors so lagging feed
   consumers are safe) and sweeps never-committed orphans left by crashed or
