@@ -75,6 +75,8 @@ The logical table answers "what does this client's name refer to, and what slice
 
 Ingest workers own Kafka partition subsets; buffer rows per (hypertable, day); flush every ~10s (per-table knob) as sorted, ZSTD Parquet L0 files; then commit to the catalog. **Exactly-once via catalog-anchored offsets**: Kafka offsets are stored in `ingest_offsets` in the *same transaction* as the part commit, workers seek Kafka from catalog offsets on startup, and Kafka consumer-group offsets are never committed — so a crash anywhere replays from exactly the right position. (Commit idempotency keys exist as a secondary mechanism for other writers.) Poison messages are skipped while their offsets still advance. Read-your-writes = data visible at next commit (~flush interval).
 
+**Backfills & migrations.** Customers migrating from other systems arrive with years of history — this is a first-class flow, not an exception, and every ingest guardrail must have a per-stream escape hatch rather than a server-wide toggle. The event-time bounds (issue 0004 / plan 19) are deliberately asymmetric for this reason: the *future* bound is hard (nothing legitimate is from the future — it only catches unit bugs), while the *past* bound is a server default that a backfill table overrides (`max_event_age_days = 0` = unbounded), so migration history is never silently dropped and lifting the window for one table doesn't open it for all. Downstream, backfill behavior is already by-design: writes to cold partitions reopen them (the finalization quiet-check fails, the ladder resumes, the partition re-finalizes when the backfill completes), the plan-18 partition-spread warning firing during a migration is expected, and ingest backpressure paces the backfill against compaction automatically. Once pipelines land (plan 8), a migration becomes its own kafka→parquet pipeline with its own bounds, transform, and pacing — per-stream properties, which is the endgame shape.
+
 ### Query path
 
 Custom DataFusion `CatalogProvider`/`TableProvider`: resolve tenant's logical table → prune parts via catalog → scan Parquet with `tenant_id` predicate pushed down (files sorted by tenant → row-group pruning is effective). Tenant isolation enforced by injecting the tenant filter at plan time (not SQL rewriting); quotas/limits per tenant at the session level. V1 cache: local NVMe read-through cache; distributed cache tier is an interface with a no-op impl.
@@ -180,7 +182,10 @@ exactly-once, compaction equivalence under racing ingest, and key deletion.
   horizontal ingest (partition-subset leases) remains future work.
 - **Unbounded event time** (issue 0004) — junk partitions from bad
   timestamps plus the permanent `"unknown"` day. Plan 19 bounds event time
-  at ingest (out-of-window rows skipped like poison).
+  at ingest with **asymmetric** semantics: the future bound is hard
+  (garbage by definition), the past bound is a server default overridable
+  per table (`0` = unbounded) so customer migrations carrying decades-old
+  history are never silently dropped (see "Backfills & migrations").
 - **Level ladder & size-targeted placement** — designed, plan written and
   ready to execute (plan 17,
   `docs/superpowers/plans/2026-07-06-ukiel-lsm-hierarchy.md`): fanout ladder

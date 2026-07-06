@@ -4,7 +4,7 @@
 
 **Goal:** Close three open correctness/hygiene issues with small, independent rails: (a) **statement timeout** on the query endpoint plus the `query_timeout < gc.tombstone_grace` startup invariant (issue 0002 — GC's safety window is currently enforced by nobody); (b) **ingest offset CAS** so two ingest workers on one topic become a loud error instead of silent data duplication (issue 0003); (c) **event-time bounds** at ingest so bad timestamps are skipped like poison instead of minting junk partitions or the permanent `"unknown"` day (issue 0004).
 
-**Architecture:** All three are independent of each other and of plans 17/18. (a) lives in `ukiel-query::server` (wrap planning+collect in `tokio::time::timeout`, HTTP 408 on expiry) and `ukield` (config + refuse-to-start validation). (b) is one SQL change in `ukiel-catalog::commit_inner` — the offsets upsert becomes conditional on `ingest_offsets.next_offset <= range.first` (`<=`, not `=`, so offset gaps from compacted topics stay legal) plus a dedicated `CatalogError::OffsetRace` that rolls the whole commit transaction back. (c) is a pure bounds predicate in `ukiel-ingest` applied in `buffer_message`, removing the `"unknown"` fallback (an unrepresentable `ts` is by definition out of bounds); skipped rows advance offsets exactly like poison messages.
+**Architecture:** All three are independent of each other and of plans 17/18. (a) lives in `ukiel-query::server` (wrap planning+collect in `tokio::time::timeout`, HTTP 408 on expiry) and `ukield` (config + refuse-to-start validation). (b) is one SQL change in `ukiel-catalog::commit_inner` — the offsets upsert becomes conditional on `ingest_offsets.next_offset <= range.first` (`<=`, not `=`, so offset gaps from compacted topics stay legal) plus a dedicated `CatalogError::OffsetRace` that rolls the whole commit transaction back. (c) is a pure bounds predicate in `ukiel-ingest` applied in `buffer_message`, removing the `"unknown"` fallback (an unrepresentable `ts` is by definition out of bounds); skipped rows advance offsets exactly like poison messages. The bounds are **asymmetric**: the future bound is server-wide and hard (nothing legitimate is from the future), but the past bound is a server *default* overridable per table with `0` = unbounded — **customer migrations from other systems legitimately carry decades-old history and must never be silently dropped**; a backfill table lifts its own bound without opening the window for every other table.
 
 **Tech Stack:** Rust edition 2024, sqlx/Postgres, axum/tokio, testcontainers component tests.
 
@@ -292,7 +292,7 @@ git commit -m "feat: ingest offset CAS - duplicate writers fail loudly (issue 00
 - Modify: `ukield.example.toml`
 
 **Interfaces:**
-- Produces: `IngestConfig { max_event_age_days: u64 (serde default 3650), max_event_future_secs: u64 (serde default 3600), .. }`; `pub(crate) fn event_time_in_bounds(ts_ms: i64, now_ms: i64, config: &IngestConfig) -> bool`; out-of-bounds rows are skipped with offsets advancing (poison semantics); the `day = "unknown"` fallback is deleted.
+- Produces: `IngestConfig { max_event_age_days: u64 (serde default 3650; server-wide default), max_event_future_secs: u64 (serde default 3600; server-wide, hard), .. }`; `TableRoute.max_event_age_days: Option<u64>` (serde default `None` = use the server default; `Some(0)` = **unbounded past** — the migration/backfill setting); `pub(crate) fn event_time_in_bounds(ts_ms: i64, now_ms: i64, max_age_days: u64 /* 0 = unbounded */, max_future_secs: u64) -> bool`; out-of-bounds rows are skipped with offsets advancing (poison semantics); the `day = "unknown"` fallback is deleted.
 
 - [ ] **Step 1: Write the failing unit tests (no Docker)**
 
@@ -301,21 +301,30 @@ Extend the `mod tests` in `crates/ukiel-ingest/src/consumer.rs` (the `cfg()` hel
 ```rust
     #[test]
     fn event_time_bounds() {
-        let c = cfg(); // max_event_age_days: 3650, max_event_future_secs: 3600
         let now_ms: i64 = 1_780_000_000_000; // fixed "now" for determinism
 
-        assert!(event_time_in_bounds(now_ms, now_ms, &c));
-        assert!(event_time_in_bounds(now_ms - 24 * 3600 * 1000, now_ms, &c)); // yesterday
-        assert!(event_time_in_bounds(now_ms + 3_599_000, now_ms, &c)); // 59m59s ahead
+        // Normal streaming table: (max_age_days, max_future_secs) = (3650, 3600).
+        assert!(event_time_in_bounds(now_ms, now_ms, 3650, 3600));
+        assert!(event_time_in_bounds(now_ms - 24 * 3600 * 1000, now_ms, 3650, 3600)); // yesterday
+        assert!(event_time_in_bounds(now_ms + 3_599_000, now_ms, 3650, 3600)); // 59m59s ahead
 
         // Too far future: year-3000-style producer bugs.
-        assert!(!event_time_in_bounds(now_ms + 3_601_000, now_ms, &c));
+        assert!(!event_time_in_bounds(now_ms + 3_601_000, now_ms, 3650, 3600));
         // Too old: beyond the age window.
         let age_ms = 3650i64 * 24 * 3600 * 1000;
-        assert!(!event_time_in_bounds(now_ms - age_ms - 1000, now_ms, &c));
-        // Unrepresentable timestamps are out of bounds by construction.
-        assert!(!event_time_in_bounds(i64::MAX, now_ms, &c));
-        assert!(!event_time_in_bounds(i64::MIN, now_ms, &c));
+        assert!(!event_time_in_bounds(now_ms - age_ms - 1000, now_ms, 3650, 3600));
+
+        // Migration/backfill table: max_age_days = 0 -> unbounded past.
+        // Decades-old history from a customer migrating off another system
+        // is admitted...
+        assert!(event_time_in_bounds(0, now_ms, 0, 3600)); // epoch-era events
+        assert!(event_time_in_bounds(now_ms - age_ms * 5, now_ms, 0, 3600));
+        // ...while the future bound still catches garbage on that table too.
+        assert!(!event_time_in_bounds(now_ms + 3_601_000, now_ms, 0, 3600));
+
+        // Unrepresentable timestamps are out of bounds regardless of config.
+        assert!(!event_time_in_bounds(i64::MAX, now_ms, 0, 3600));
+        assert!(!event_time_in_bounds(i64::MIN, now_ms, 0, 3600));
     }
 ```
 
@@ -329,12 +338,15 @@ Expected: compile error (fields + function missing).
 1. `crates/ukiel-ingest/src/config.rs` — add to `IngestConfig` with serde defaults (same pattern as plan 18's fields):
 
 ```rust
-    /// Reject (skip like poison) events older than this many days
-    /// (issue 0004). Raise temporarily for historical backfills.
+    /// Server default: reject (skip like poison) events older than this
+    /// many days (issue 0004). Overridable per table via
+    /// `TableRoute.max_event_age_days` — migration/backfill tables set 0
+    /// (unbounded) so decades-old history is never dropped.
     #[serde(default = "default_max_event_age_days")]
     pub max_event_age_days: u64,
-    /// Reject (skip like poison) events with timestamps further in the
-    /// future than this (clock skew allowance; catches sec-vs-ms unit bugs).
+    /// Server-wide, hard: reject (skip like poison) events further in the
+    /// future than this (clock skew allowance; catches sec-vs-ms unit
+    /// bugs). Not overridable — nothing legitimate is from the future.
     #[serde(default = "default_max_event_future_secs")]
     pub max_event_future_secs: u64,
 ```
@@ -349,18 +361,44 @@ fn default_max_event_future_secs() -> u64 {
 }
 ```
 
+and to `TableRoute`:
+
+```rust
+    /// Per-table past bound override (issue 0004): `None` = the server
+    /// default (`IngestConfig.max_event_age_days`), `Some(0)` = unbounded —
+    /// the migration/backfill setting. Post-plan-8 this becomes a
+    /// per-pipeline property.
+    #[serde(default)]
+    pub max_event_age_days: Option<u64>,
+```
+
 2. `crates/ukiel-ingest/src/consumer.rs`:
 
 Add near `flush_decision`:
 
 ```rust
 /// Issue 0004: bounds event time so bad producer timestamps can't mint junk
-/// partitions (or the old permanent "unknown" day). Pure for testability;
-/// saturating arithmetic keeps i64::MIN/MAX out of bounds by construction.
-pub(crate) fn event_time_in_bounds(ts_ms: i64, now_ms: i64, config: &IngestConfig) -> bool {
-    let max_age_ms = (config.max_event_age_days as i64).saturating_mul(24 * 3600 * 1000);
-    let max_future_ms = (config.max_event_future_secs as i64).saturating_mul(1000);
-    ts_ms >= now_ms.saturating_sub(max_age_ms) && ts_ms <= now_ms.saturating_add(max_future_ms)
+/// partitions (or the old permanent "unknown" day). Asymmetric by design:
+/// `max_age_days` is the per-table-resolvable past bound (0 = unbounded,
+/// for migrations importing decades-old history), the future bound is hard.
+/// Pure for testability; an unrepresentable ts is out of bounds regardless.
+pub(crate) fn event_time_in_bounds(
+    ts_ms: i64,
+    now_ms: i64,
+    max_age_days: u64,
+    max_future_secs: u64,
+) -> bool {
+    if chrono::DateTime::from_timestamp_millis(ts_ms).is_none() {
+        return false; // no partition value can be derived: junk by definition
+    }
+    if max_age_days > 0 {
+        let max_age_ms = (max_age_days as i64).saturating_mul(24 * 3600 * 1000);
+        if ts_ms < now_ms.saturating_sub(max_age_ms) {
+            return false;
+        }
+    }
+    let max_future_ms = (max_future_secs as i64).saturating_mul(1000);
+    ts_ms <= now_ms.saturating_add(max_future_ms)
 }
 ```
 
@@ -369,8 +407,18 @@ In `buffer_message`, after the `ts` extraction and before the packing-key check,
 ```rust
         // Out-of-bounds event time: skip like poison — the offset above has
         // already advanced, the row is dropped visibly (warn), and no junk
-        // partition is minted (issue 0004).
-        if !event_time_in_bounds(ts, chrono::Utc::now().timestamp_millis(), &self.config) {
+        // partition is minted (issue 0004). The past bound resolves per
+        // table so migration streams can carry old history.
+        let max_age = self
+            .route
+            .max_event_age_days
+            .unwrap_or(self.config.max_event_age_days);
+        if !event_time_in_bounds(
+            ts,
+            chrono::Utc::now().timestamp_millis(),
+            max_age,
+            self.config.max_event_future_secs,
+        ) {
             tracing::warn!(ts, "event time out of bounds; row skipped");
             return;
         }
@@ -394,11 +442,19 @@ with:
         };
 ```
 
-3. `ukield`: add the two fields to `IngestSection` + `Default` (3650 / 3600), pass through in `run.rs`, and append to `ukield.example.toml` `[ingest]`:
+3. `ukield`: add the two server fields to `IngestSection` + `Default` (3650 / 3600) and pass through in `run.rs`; add `max_event_age_days: Option<u64>` (serde default `None`) to `TableConfig` and plumb it into the `TableRoute` construction in `run.rs`. Append to `ukield.example.toml` `[ingest]`:
 
 ```toml
-max_event_age_days = 3650    # skip events older than this (raise for backfills)
-max_event_future_secs = 3600 # skip events from the future (unit-bug detector)
+max_event_age_days = 3650    # server default past bound (per-table overridable)
+max_event_future_secs = 3600 # hard future bound (unit-bug detector)
+```
+
+and under the `[[tables]]` comment block:
+
+```toml
+# max_event_age_days = 0  # per-table past-bound override; 0 = unbounded —
+#                         # set on backfill tables when migrating customers
+#                         # from other systems, so old history is never dropped
 ```
 
 - [ ] **Step 4: Verify — unit, component, whole workspace**
@@ -407,7 +463,7 @@ Run: `cargo test -p ukiel-ingest --lib`
 Expected: `event_time_bounds` PASS.
 
 Run: `cargo test -p ukiel-ingest -p ukield -- --test-threads=2 && make test`
-Expected: all green. If any existing consumer test produces fixture events with tiny epoch-ms timestamps (e.g. `ts: 10`), those rows would now be skipped as ancient — set `max_event_age_days` high enough in that test's `IngestConfig` (e.g. `30_000`) rather than weakening the default.
+Expected: all green. If any existing consumer test produces fixture events with tiny epoch-ms timestamps (e.g. `ts: 10`), those rows would now be skipped as ancient — set that test route's `max_event_age_days: Some(0)` (unbounded, the same knob a migration table uses) rather than weakening the server default.
 
 - [ ] **Step 5: Lint and commit**
 
@@ -448,6 +504,6 @@ git commit -m "docs: issues 0002-0004 resolved by safety rails, roadmap row 19 e
 
 ## Self-review notes
 
-- **Issue coverage**: 0002 → Task 1 (timeout + startup invariant, wrap covers planning *and* collect); 0003 → Task 2 (CAS with `<=` gap tolerance, rollback proven by the no-duplicate-part assertion); 0004 → Task 3 (bounds + `"unknown"` removal, poison semantics preserved — offsets advance before the skip).
-- **Type consistency**: `AppState.statement_timeout: Duration` matches Task 1's test and `run.rs` wiring; `CatalogError::OffsetRace { topic, partition }` matches the test's `matches!`; `event_time_in_bounds(i64, i64, &IngestConfig) -> bool` matches its unit tests and the `buffer_message` call.
+- **Issue coverage**: 0002 → Task 1 (timeout + startup invariant, wrap covers planning *and* collect); 0003 → Task 2 (CAS with `<=` gap tolerance, rollback proven by the no-duplicate-part assertion); 0004 → Task 3 (asymmetric bounds — hard future, per-table past with `0` = unbounded for migrations — plus `"unknown"` removal; poison semantics preserved: offsets advance before the skip).
+- **Type consistency**: `AppState.statement_timeout: Duration` matches Task 1's test and `run.rs` wiring; `CatalogError::OffsetRace { topic, partition }` matches the test's `matches!`; `event_time_in_bounds(i64, i64, u64, u64) -> bool` matches its unit tests and the `buffer_message` call site (which resolves `route.max_event_age_days.unwrap_or(config.max_event_age_days)`).
 - **Independence**: no task depends on plans 17/18; the only shared surface with plan 18 is the `cfg()` test helper in `consumer.rs` (whichever plan lands second extends it — both say so).

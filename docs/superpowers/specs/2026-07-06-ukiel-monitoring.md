@@ -35,6 +35,7 @@ alert traces back to an invariant or an SLO.
 | `ingest_flush_rows` / `ingest_flush_bytes` | histogram | small-flush syndrome shows here before it shows in L0 counts |
 | `ingest_rows_total{hypertable}` | counter | throughput |
 | `ingest_poison_messages_total{topic}` | counter | I6; a step change means a producer broke |
+| `ingest_out_of_bounds_total{hypertable}` | counter | event-time bound skips (plan 19 / issue 0004) — dropping is by design but never silent; a spike on a *migration* table means its per-table bound override is missing |
 | `ingest_commit_failures_total` | counter | commit errors (not conflicts — ADD doesn't conflict) |
 | `ingest_freshness_seconds{hypertable}` | gauge | now − max event ts of last flush: the user-facing freshness proxy (I3) |
 | `ingest_backpressure_deferrals_total{hypertable}` | counter | plan-18 guardrail: flushes deferred because live L0 count crossed the slowdown/stop thresholds — nonzero means compaction is behind and ingest is self-throttling (by design) |
