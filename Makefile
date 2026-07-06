@@ -1,6 +1,6 @@
 # Ukiel developer targets.
 
-.PHONY: test e2e e2e-up e2e-down
+.PHONY: test e2e e2e-up e2e-down play
 
 # Unit + component tests (Docker required for testcontainers).
 # --test-threads=2: each component test starts its own containers; unbounded
@@ -20,3 +20,8 @@ e2e-up:
 
 e2e-down:
 	docker compose down -v
+
+# Run the all-in-one server against the compose stack with the example config.
+play:
+	docker compose up -d --wait
+	cargo run -p ukield -- --config ukield.example.toml

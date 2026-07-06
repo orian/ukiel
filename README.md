@@ -1,6 +1,6 @@
 Ukiel is a lake. Here, a data lake. In real world it's a lake in Olsztyn, Poland.
 
-Experimenta. Not production ready. Testing ideas from my head.
+Experimental. Not production ready. Testing ideas from my head.
 
 # Genesis
 
@@ -13,9 +13,15 @@ The experiences at the moment:
 ClickHouse OSS at some scale is causing lot of troubles that are not easily fixable,
 the company iself is going in a direction that could be hard for us.
 
-Why not Iceberg? It's overcomplicated and there are problems I'm not gonna solve.
+Why not Iceberg? It's overcomplicated and there are problems I'm not gonna solve
+(e.g. S3 Iceberg table does not support planScan).
 DeltaLake is IMHO more prod ready than Iceberg, but I perceive both as an interop solution.
+It seems to me that the way those work is: each query engine uses the catalog to exchange the data 
+but builds all the mechanics above it.
 Both could be added as external sync later.
+
+But all in all, i just want something to experiment quickly without a fuss. I don't really expect this to go production
+soon, but i'd like to run it in prod to test query performance.
 
 # The idea:
 
@@ -35,6 +41,26 @@ Both could be added as external sync later.
 Rust workspace. Design spec: `docs/superpowers/specs/2026-07-05-ukiel-design.md`,
 plans: `docs/superpowers/plans/`, concept notes: `docs/notes/`
 (e.g. [schema management](docs/notes/schema-management.md)).
+
+### Quickstart
+
+```sh
+make play           # compose stack (Kafka/Postgres/MinIO) + the ukield server
+```
+
+Then, in another terminal, produce an event and query it back:
+
+```sh
+echo '{"tenant_id": 1, "ts": 1751800000000, "payload": "hello"}' | \
+  docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
+    --bootstrap-server localhost:9092 --topic events
+
+curl -s -X POST http://127.0.0.1:8080/api/query \
+  -H 'content-type: application/json' \
+  -d '{"namespace_id": 1, "sql": "SELECT payload FROM events"}'
+```
+
+Tables, namespaces, and server roles are declared in `ukield.example.toml`.
 
 - `crates/ukiel-core` — shared types (ids, parts, commit ops).
 - `crates/ukiel-catalog` — Postgres-backed catalog: transactional part commits
@@ -66,6 +92,9 @@ plans: `docs/superpowers/plans/`, concept notes: `docs/notes/`
 - `crates/ukiel-e2e` — end-to-end suite against the docker-compose stack
   (Kafka + Postgres + MinIO); tests are `#[ignore]`d by default. Philosophy
   and scenario catalog: `docs/superpowers/specs/2026-07-05-ukiel-testing-design.md`.
+- `crates/ukield` — the all-in-one server binary: ingest + query + compactor
+  + GC in one process (per-role deployment via `roles = [...]`), idempotent
+  table bootstrap from TOML config, graceful shutdown.
 
 Tests: `cargo test` (integration tests spin up Postgres/Kafka via
 testcontainers — Docker must be running). End-to-end: `make e2e`.
