@@ -1,10 +1,21 @@
 Ukiel is a lake. Here, a data lake. In real world it's a lake in Olsztyn, Poland.
 
+Experimenta. Not production ready. Testing ideas from my head.
+
 # Genesis
 
-This is an experiment based on:
+I want an _infinitely_ horizontally scalable, distributed, S3 based, compute-storage separated system.
 
-1. My 1.5 year of running PB 
+The experiences at the moment:
+1. My 1.5 year of running PB+ scale ClickHouse at PostHog
+2. My 3 years of building Oxla - a distributed, S3 based, compute-storage separated database.
+
+ClickHouse OSS at some scale is causing lot of troubles that are not easily fixable,
+the company iself is going in a direction that could be hard for us.
+
+Why not Iceberg? It's overcomplicated and there are problems I'm not gonna solve.
+DeltaLake is IMHO more prod ready than Iceberg, but I perceive both as an interop solution.
+Both could be added as external sync later.
 
 # The idea:
 
