@@ -431,6 +431,56 @@ async fn alias_columns_compute_at_query_time() {
 async fn information_schema_lists_namespace_tables_and_columns() {
     let h = setup().await;
     let store_url = url::Url::parse(STORE_URL).unwrap();
+
+    // Give namespace 2 a distinctly-named table so a scoping leak would be
+    // visible: if namespace 1's information_schema saw namespace 2's tables,
+    // `secrets` would show up. (setup() already gives both ns 1 and ns 2 an
+    // `events` table, which alone can't distinguish scoping from a leak.)
+    h.catalog
+        .create_logical_table(NamespaceId(2), "secrets", h.ht)
+        .await
+        .unwrap();
+
+    async fn table_names(h: &Harness, ns: i64, store_url: &url::Url) -> Vec<String> {
+        let ctx = ukiel_query::context::session_for_namespace(
+            &h.catalog,
+            NamespaceId(ns),
+            h.store.clone(),
+            store_url,
+        )
+        .await
+        .unwrap();
+        let batches = ctx
+            .sql(
+                "SELECT table_name FROM information_schema.tables \
+                  WHERE table_schema = 'public' ORDER BY table_name",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        all_strings(&batches, "table_name")
+    }
+
+    // Namespace 1 sees only its own table — never namespace 2's `secrets`.
+    let ns1 = table_names(&h, 1, &store_url).await;
+    assert_eq!(ns1, vec!["events"]);
+    assert!(
+        !ns1.contains(&"secrets".to_string()),
+        "namespace 1 must not see namespace 2's tables"
+    );
+
+    // Namespace 2 sees both of its own tables.
+    assert_eq!(
+        table_names(&h, 2, &store_url).await,
+        vec!["events", "secrets"]
+    );
+
+    // A namespace with no logical tables gets an empty list, not an error.
+    assert!(table_names(&h, 999, &store_url).await.is_empty());
+
+    // Columns too (name + type), via the provider's query schema.
     let ctx = ukiel_query::context::session_for_namespace(
         &h.catalog,
         NamespaceId(1),
@@ -439,21 +489,6 @@ async fn information_schema_lists_namespace_tables_and_columns() {
     )
     .await
     .unwrap();
-
-    // Tables are introspectable over SQL (this is what an HTTP client would run).
-    let batches = ctx
-        .sql(
-            "SELECT table_name FROM information_schema.tables \
-              WHERE table_schema = 'public' ORDER BY table_name",
-        )
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-    assert_eq!(all_strings(&batches, "table_name"), vec!["events"]);
-
-    // Columns too (name + type), via the provider's query schema.
     let batches = ctx
         .sql(
             "SELECT column_name FROM information_schema.columns \
