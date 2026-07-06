@@ -64,11 +64,13 @@ lakehouses don't have one. Prune before I/O exists:
 
 ## Sequencing
 
-Plan 11 = 0+1+2+3 (all in `ukiel-query` + a few writer lines, immediately
-measurable). Then Tier 2 #4 as a small plan (writer/catalog/provider each a
-few lines). Then #11. Then the Tier-3 batch on the compactor. #5/#6 last —
-most differentiated, most design work. Perf smoke numbers get appended here
-after each plan.
+All planned (roadmap rows in parentheses): Tier 1 = plan 11
+(`ukiel-scan-pushdown`); Tier-2 #4 = plan 12 (`catalog-stats-pruning`);
+Tier-4 #11 = plan 13 (`parquet-metadata-cache`); Tier-3 #7–10 = plan 14
+(`file-layout`); Tier-4 #12–13 = plan 15 (`cache-tiering`); Tier-2 #5–6 =
+plan 16 (`key-index`, execute after 11/12/14). Recommended execution order:
+11 → 12 → 13 → 14 → 15 → 16, though 13/14/15 are mutually independent.
+Perf smoke numbers get appended here after each plan.
 
 ## Baseline & results
 
