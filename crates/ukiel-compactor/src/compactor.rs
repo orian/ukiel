@@ -175,10 +175,18 @@ impl Compactor {
                 .collect(),
         };
 
+        // Assign L1 paths and record upload intent before any upload.
         let mut new_parts = Vec::with_capacity(outputs.len());
-        for (key_min, key_max, batch) in &outputs {
+        let paths: Vec<String> = outputs
+            .iter()
+            .map(|_| format!("ht/{}/L1/{}.parquet", hypertable.id, uuid::Uuid::new_v4()))
+            .collect();
+        self.catalog
+            .register_pending_objects(hypertable.id, &paths)
+            .await?;
+
+        for ((key_min, key_max, batch), path) in outputs.iter().zip(paths) {
             let bytes = rewrite::batch_to_parquet(batch)?;
-            let path = format!("ht/{}/L1/{}.parquet", hypertable.id, uuid::Uuid::new_v4());
             let size_bytes = bytes.len() as i64;
             self.store
                 .put(&Path::from(path.clone()), bytes.into())

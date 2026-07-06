@@ -1,12 +1,17 @@
 #![allow(dead_code)]
 
 use std::collections::HashSet;
+use std::fmt;
 use std::sync::Arc;
 
 use arrow::array::Array;
+use futures::stream::BoxStream;
 use object_store::memory::InMemory;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::{
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OsResult,
+};
 use serde_json::json;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::ContainerAsync;
@@ -381,5 +386,141 @@ async fn compaction_backfills_materialized_columns_added_later() {
         col.values().as_ref(),
         &[6, 7],
         "ts + tenant_id, backfilled and sorted"
+    );
+}
+
+/// Object store that fails every upload but delegates reads/lists — lets a test
+/// exercise the "registered, upload failed, never committed" window.
+#[derive(Debug)]
+struct FailingPutStore {
+    inner: Arc<dyn ObjectStore>,
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for FailingPutStore {
+    async fn put_opts(
+        &self,
+        _location: &object_store::path::Path,
+        _payload: PutPayload,
+        _opts: PutOptions,
+    ) -> OsResult<PutResult> {
+        Err(object_store::Error::Generic {
+            store: "failing",
+            source: "put disabled".into(),
+        })
+    }
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: PutMultipartOptions,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: GetOptions,
+    ) -> OsResult<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OsResult<object_store::path::Path>>,
+    ) -> BoxStream<'static, OsResult<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> BoxStream<'static, OsResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> OsResult<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+impl fmt::Display for FailingPutStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "FailingPutStore")
+    }
+}
+
+#[tokio::test]
+async fn compaction_registers_intent_before_upload() {
+    let env = setup().await;
+    add_l0(
+        &env,
+        "d1",
+        vec![json!({"tenant_id": 1, "ts": 1, "payload": "a"})],
+    )
+    .await;
+    add_l0(
+        &env,
+        "d1",
+        vec![json!({"tenant_id": 1, "ts": 2, "payload": "b"})],
+    )
+    .await;
+
+    let failing: Arc<dyn ObjectStore> = Arc::new(FailingPutStore {
+        inner: env.store.clone(),
+    });
+    let compactor = Compactor::new(env.catalog.clone(), failing, CompactorConfig::default());
+    let result = compactor.run_once().await;
+
+    assert!(result.is_err(), "upload failure must abort the merge");
+    assert!(
+        !env.catalog
+            .orphaned_pending_objects(env.ht, 0.0)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the L1 path must be registered as intent before it is uploaded"
+    );
+    // Nothing was committed: the two L0s are still live.
+    assert_eq!(env.catalog.live_parts(env.ht, None).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn deletion_registers_intent_before_upload() {
+    let env = setup().await;
+    // A packed file (keys 7 and 8) that a key-7 deletion must rewrite.
+    add_l0(
+        &env,
+        "d1",
+        vec![
+            json!({"tenant_id": 7, "ts": 1, "payload": "seven"}),
+            json!({"tenant_id": 8, "ts": 2, "payload": "eight"}),
+        ],
+    )
+    .await;
+    let ht = env.catalog.get_hypertable("events").await.unwrap();
+    let failing: Arc<dyn ObjectStore> = Arc::new(FailingPutStore {
+        inner: env.store.clone(),
+    });
+
+    let result = ukiel_compactor::deletion::delete_key(&env.catalog, &failing, &ht, 7).await;
+    assert!(
+        result.is_err(),
+        "upload failure must abort the deletion rewrite"
+    );
+    assert!(
+        !env.catalog
+            .orphaned_pending_objects(env.ht, 0.0)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the rewritten path must be registered as intent before it is uploaded"
     );
 }

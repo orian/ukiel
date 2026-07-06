@@ -23,3 +23,4 @@ tracing = { workspace = true }
 ukiel-ingest = { workspace = true }
 testcontainers-modules = { workspace = true }
 sqlx = { workspace = true }
+async-trait = { workspace = true }

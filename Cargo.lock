@@ -4621,6 +4621,7 @@ name = "ukiel-compactor"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "bytes",
  "futures",
  "object_store",

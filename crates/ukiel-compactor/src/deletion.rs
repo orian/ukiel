@@ -68,6 +68,9 @@ pub async fn delete_key(
             part.meta.level,
             uuid::Uuid::new_v4()
         );
+        catalog
+            .register_pending_objects(hypertable.id, std::slice::from_ref(&path))
+            .await?;
         let size_bytes = bytes.len() as i64;
         store.put(&Path::from(path.clone()), bytes.into()).await?;
         new_parts.push(PartMeta {
