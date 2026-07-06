@@ -424,12 +424,13 @@ impl Stack {
     }
 
     /// Runs a SQL query for `namespace` through the HTTP endpoint, returning the
-    /// `rows` JSON array (or an Err with the HTTP body on non-200).
+    /// `rows` JSON array (or an Err with the HTTP body on non-200). Pins the
+    /// `rows` format explicitly (the server default is `columns`).
     pub async fn query(&self, namespace: NamespaceId, sql: &str) -> Result<Value, String> {
         let resp = self
             .client
             .post(format!("{}/api/query", self.query_base))
-            .json(&json!({"namespace_id": namespace.0, "sql": sql}))
+            .json(&json!({"namespace_id": namespace.0, "sql": sql, "format": "rows"}))
             .send()
             .await
             .expect("query request");

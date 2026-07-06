@@ -12,13 +12,14 @@ use serde_json::{Value, json};
 
 use crate::QueryError;
 
-/// Requested result encoding. `rows` is the default (unchanged legacy shape,
-/// now with an additive `schema` sibling).
+/// Requested result encoding. `columns` is the default — Ukiel is columnar end
+/// to end and analytical result sets are cheaper and more useful column-shaped;
+/// `rows` (row-oriented JSON) and `arrow` (IPC stream) are opt-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ResultFormat {
-    #[default]
     Rows,
+    #[default]
     Columns,
     Arrow,
 }

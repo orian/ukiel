@@ -1,12 +1,16 @@
 # Columnar result formats for the query API
 
 > **Status: implemented.** `POST /api/query` accepts `format`
-> (`rows` default / `columns` / `arrow`) and `Accept:
+> (`columns` **default** / `rows` / `arrow`) and `Accept:
 > application/vnd.apache.arrow.stream`; both JSON formats carry the `schema`
 > block, errors are always JSON. The `ukiel:type` hint (`timestamp_ms`) rides
 > Arrow field metadata (`ukiel_core::ukiel_type_of`) and is verified to survive
 > plain column references end to end. The `max_result_rows`/bytes cap noted
 > below still lands with the statement-timeout/quota work (issue 0002).
+>
+> **The default is `columns`, not `rows`** (changed from this note's original
+> proposal): the columnar shape is the better default for an analytical,
+> columnar engine, and defaults are what most callers use. `rows` is opt-in.
 
 `POST /api/query` currently returns row-oriented JSON: `{"rows": [{"col":
 val, ...}, ...]}`. That is convenient for small app queries and terrible for
@@ -26,8 +30,8 @@ current behavior; no breaking change):
 
 | `format` | Response | Content-Type |
 |---|---|---|
-| `rows` (default) | `{"schema": [...], "rows": [{...}, ...]}` | `application/json` |
-| `columns` | JSON columnar (below) | `application/json` |
+| `columns` (default) | JSON columnar (below) | `application/json` |
+| `rows` | `{"schema": [...], "rows": [{...}, ...]}` | `application/json` |
 | `arrow` | Arrow IPC stream, raw bytes | `application/vnd.apache.arrow.stream` |
 
 `Accept: application/vnd.apache.arrow.stream` acts as an alternative to

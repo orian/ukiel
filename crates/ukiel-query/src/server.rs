@@ -91,6 +91,8 @@ async fn run_query_inner(
         .map(|b| b.schema())
         .unwrap_or(planned_schema);
 
+    // Explicit `format` wins; otherwise the Arrow `Accept` header opts into the
+    // stream, and everything else takes the default (`columns`).
     let format = req.format.unwrap_or_else(|| {
         let accepts_arrow = headers
             .get(header::ACCEPT)
@@ -100,7 +102,7 @@ async fn run_query_inner(
         if accepts_arrow {
             ResultFormat::Arrow
         } else {
-            ResultFormat::Rows
+            ResultFormat::default()
         }
     });
 

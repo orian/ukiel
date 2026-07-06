@@ -62,11 +62,12 @@ curl -s -X POST http://127.0.0.1:8080/api/query \
 
 Tables, namespaces, and server roles are declared in `ukield.example.toml`.
 
-Results come back row-oriented JSON by default (with an additive `schema`
-block); add `"format": "columns"` for columnar JSON or `"format": "arrow"`
-(or `Accept: application/vnd.apache.arrow.stream`) for a lossless Arrow IPC
-stream — see `docs/notes/2026-07-06-columnar-results.md`. Browse the schema
-over the same endpoint: `SELECT table_name FROM information_schema.tables`.
+Results come back **columnar JSON by default** (`{"schema": [...], "columns":
+{col: [...]}, "row_count": N}` — cheaper and chart/dataframe-ready); add
+`"format": "rows"` for row-oriented JSON or `"format": "arrow"` (or `Accept:
+application/vnd.apache.arrow.stream`) for a lossless Arrow IPC stream — see
+`docs/notes/2026-07-06-columnar-results.md`. Browse the schema over the same
+endpoint: `SELECT table_name FROM information_schema.tables`.
 
 - `crates/ukiel-core` — shared types (ids, parts, commit ops).
 - `crates/ukiel-catalog` — Postgres-backed catalog: transactional part commits

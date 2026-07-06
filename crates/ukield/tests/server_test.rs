@@ -95,7 +95,7 @@ async fn full_stack_ingest_to_query_over_http() {
     for _ in 0..60 {
         let resp = client
             .post(format!("{base}/api/query"))
-            .json(&json!({"namespace_id": 7, "sql": "SELECT count(*) AS n FROM events"}))
+            .json(&json!({"namespace_id": 7, "sql": "SELECT count(*) AS n FROM events", "format": "rows"}))
             .send()
             .await
             .unwrap();

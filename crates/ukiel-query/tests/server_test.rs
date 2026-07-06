@@ -29,7 +29,7 @@ async fn http_query_returns_namespace_scoped_rows() {
 
     let resp = client
         .post(format!("{base}/api/query"))
-        .json(&json!({"namespace_id": 2, "sql": "SELECT payload FROM events ORDER BY ts"}))
+        .json(&json!({"namespace_id": 2, "sql": "SELECT payload FROM events ORDER BY ts", "format": "rows"}))
         .send()
         .await
         .unwrap();
@@ -64,7 +64,7 @@ async fn rows_format_carries_schema_with_timestamp_hint() {
     // Namespace 2 has rows b1 (ts 150) and b2 (ts 300).
     let resp = client
         .post(format!("{base}/api/query"))
-        .json(&json!({"namespace_id": 2, "sql": "SELECT ts, payload FROM events ORDER BY ts"}))
+        .json(&json!({"namespace_id": 2, "sql": "SELECT ts, payload FROM events ORDER BY ts", "format": "rows"}))
         .send()
         .await
         .unwrap();
@@ -89,7 +89,7 @@ async fn rows_format_carries_schema_with_timestamp_hint() {
     // A computed column drops the hint (correctly): ts + 1 is just int64.
     let resp = client
         .post(format!("{base}/api/query"))
-        .json(&json!({"namespace_id": 2, "sql": "SELECT ts + 1 AS bumped FROM events"}))
+        .json(&json!({"namespace_id": 2, "sql": "SELECT ts + 1 AS bumped FROM events", "format": "rows"}))
         .send()
         .await
         .unwrap();
@@ -192,4 +192,28 @@ async fn errors_are_json_regardless_of_format() {
     assert_eq!(resp.status(), 400);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(body["error"].is_string(), "error body must be JSON: {body}");
+}
+
+#[tokio::test]
+async fn default_format_is_columns() {
+    let (base, _h) = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    // No `format` field, no Accept header -> the default columnar shape.
+    let resp = client
+        .post(format!("{base}/api/query"))
+        .json(&json!({"namespace_id": 2, "sql": "SELECT ts, payload FROM events ORDER BY ts"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    assert_eq!(body["row_count"], 2);
+    assert_eq!(body["columns"]["ts"], json!([150, 300]));
+    assert_eq!(body["columns"]["payload"], json!(["b1", "b2"]));
+    assert!(
+        body.get("rows").is_none(),
+        "default is now columns, not rows: {body}"
+    );
 }
