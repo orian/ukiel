@@ -34,7 +34,7 @@ The catalog core is **tenancy-agnostic**. It knows two generic concepts: **names
 
 - **Hypertable** — physical table family: Arrow schema, partition spec (e.g. `(key_bucket, day)`), sort order (`tenant_id, ts`), declared packing key, placement policy (see below). Thousands exist, not millions.
 - **Logical table** — what a client sees: `(namespace_id, name) → hypertable + column mapping`. Per-table schema customization = column mapping over a wider hypertable schema, or a dedicated hypertable for heavy namespaces. 1M namespaces = cheap DB rows.
-- **Part** — one Parquet file: path, partition values, packing-key min/max (packed files span a key range, separated files exactly one key), row count, size, column stats, **level** (L0 fresh → L2 compacted), and GC state (`purged_at`).
+- **Part** — one Parquet file: path, partition values, packing-key min/max (packed files span a key range, separated files exactly one key), row count, size, column stats, **level** (0 = fresh ingest; ladder depth is compaction policy, not schema — plan 17), and GC state (`purged_at`).
 - **Commit** — atomic `ADD` / `REPLACE(old→new)` / `DELETE` of parts with optimistic concurrency: REPLACE fails if any input part is not live; loser retries on fresh state. This one rule resolves mutation-vs-compaction conflicts (README pt 9).
 - **Change feed** — per-hypertable ordered log of commit events. Background workers (compaction, MVs) are **durable cursors** (`worker_cursors`); the feed replays from any point because part rows are never deleted, only stamped purged. (README pt 6.)
 
@@ -87,7 +87,7 @@ Custom DataFusion `CatalogProvider`/`TableProvider`: resolve tenant's logical ta
 
 - Deletes/updates land immediately as **tombstone parts** (delete vectors keyed by row position or key); readers merge them (dimension tables are small — cheap).
 - Background **rewrite workers** fold tombstones into plain Parquet when resources allow (priority: tables with high tombstone ratio; GDPR deletes get deadlines).
-- **Compaction workers** merge L0→L1→L2, re-sorting by packing key; heavy keys naturally separate into dedicated files.
+- **Compaction workers** climb a fanout-driven level ladder (plan 17): a *run* = one commit's key-disjoint output set (derived from `created_by_commit`, no extra schema); `fanout` runs at a level merge into one run a level up, and cold partitions finalize into a single key-disjoint run. Under size-targeted placement, heavy keys separate into dedicated files organically.
 - Both are just change-feed consumers issuing REPLACE commits; optimistic concurrency arbitrates.
 - V1: copy-on-write REPLACE + compaction only; tombstone read-merge stubbed behind the TableProvider interface.
 
@@ -96,10 +96,11 @@ Custom DataFusion `CatalogProvider`/`TableProvider`: resolve tenant's logical ta
 Per-customer data deletion (GDPR) and per-customer retention favor physical separation; the small-file problem at 1M tiny tenants favors packing. Resolution: **placement is a per-hypertable policy, not an architecture choice**, and the catalog supports both shapes natively (a separated file is just a part with `packing_key_min == packing_key_max`).
 
 - **L0 is always packed** — ingest at a 10–20s flush cadence cannot maintain a million open writers. L0 files are short-lived (minutes–hours until compaction).
-- **At rest (L1+), policy per hypertable** (`hypertables.placement`, engine default `packed`): `separated` — compaction splits every packing key into its own files (recommended for the SaaS deployment, where deletion/retention SLAs dominate); or `packed` — small keys share files, sorted by packing key so each key's rows occupy contiguous row groups.
+- **At rest (L1+), policy per hypertable** — one knob, `hypertables.target_file_bytes` (plan 17; engine default packed): `packed` (NULL) — each merge output is one file, sorted by packing key so each key's rows occupy contiguous row groups; `separated` (0) — compaction splits every packing key into its own files; **size-targeted** (N bytes) — merge outputs are cut at key boundaries into ~N-byte files, so small keys share files and a key bigger than N gets dedicated `min == max` files (never split mid-key). Size-targeted subsumes both extremes (packed = ∞, separated = 0) and is the recommended SaaS setting: heavy tenants separate *organically, in proportion to their size*, and their deletion/retention becomes metadata-only without paying the small-file cost for the long tail.
+- **Levels & runs** (plan 17): a *run* = one merge commit's key-disjoint output set (derived from `created_by_commit` — each L0 file is its own run). When a partition holds enough runs at a level they merge into one run a level up (~log_fanout(flushes) depth, emergent). The trigger is **two-tier** because the levels are asymmetric: a low `l0_fanout` (~4) for level 0 — L0 files span all tenants, so no key pruning applies and read amp is linear in their count, while the files are tiny and cheap to merge — and a higher `fanout` (~10) for L1+, where runs are internally key-disjoint (a query touches ≤ 1 file per run) but merges move real bytes (write amp ≈ ladder depth per byte). Same shape as RocksDB's L0-trigger vs level-multiplier split and lazy leveling's tier-young/level-last. A partition with no L0 arrivals for `finalize_after_secs` and >1 run is *finalized* into a single run one level above its max — the "level the last one" half. Terminal invariant: **a cold partition is one run** — all files pairwise key-disjoint. Read amp for one key: ≤ l0_fanout unpruned L0 files + fanout × depth pruned files hot, ~1 file per cold partition. Per-file key coverage *inverts* with depth: it widens only until accumulated bytes cross the size target, then narrows as capped files tile an ever-thinner key slice.
 - **Deletion of key k**: separated files → metadata-only DELETE commit (drop k's files); packed L0/L1 files overlapping k → REPLACE-rewrite without k's rows. Sorted packing makes rewrites cheap: untouched row groups are copied byte-wise, no decode. Worst-case rewrite scope = the hot window, not the lake.
 - **Retention**: policy per logical table (namespace). Separated + time-partitioned data → expiry is metadata-only drops of aged parts. Packed data → retention-aware compaction filters expired rows on every pass, plus a sweep worker that rewrites any file whose expired fraction crosses a threshold.
-- Cost of `separated` at rest: file count scales with active namespaces × partitions. Mitigation: size-based rolling (a small namespace's file spans many days until it reaches target size), so tiny namespaces produce few files, not one per day.
+- Cost of `separated` at rest: file count scales with active namespaces × partitions — which is why size-targeted placement (above) is preferred: only keys that fill a target-size file get dedicated ones.
 - All of this runs on the same change-feed + REPLACE machinery as compaction; deletion and retention workers are just more commit authors, arbitrated by optimistic concurrency.
 
 ### Storage lifecycle & GC
@@ -114,6 +115,21 @@ Writers upload objects **before** committing, and REPLACE tombstones catalog row
 
 Data movement is unified ClickHouse-style (`docs/notes/2026-07-06-pipelines.md`): tables have an **engine** — `parquet` (hypertable) or `kafka` (topic endpoint, no direct SELECT) — and a **pipeline** is a SQL query between two tables, executed batch-at-a-time through DataFusion. The four combinations: kafka→parquet = ingest (replaces route config; the transform, filtering, and partition derivation live in the SELECT), parquet→parquet = aggregation MV (change-feed cursor scoped to new parts), parquet→kafka = egress/CDC, kafka→kafka = out of scope. Delivery is a per-pipeline property: inbound stays exactly-once (catalog-anchored offsets, unchanged); outbound offers `at_most_once` / `at_least_once` (default) / `exactly_once` (Kafka transactional producer with a cursor record in the same transaction). Tenant and system pipelines share the machinery; per-row "MV" use cases belong to materialized columns (`docs/notes/2026-07-06-materialized-columns.md`), pipelines to transforms and genuine aggregations. Plan 8 implements the catalog entities plus the kafka→parquet and parquet→parquet variants; egress follows.
 
+## Limits & guardrails (capacity model)
+
+ClickHouse's parts/partition limits exist because parts are *physical residents* (directories, in-memory part objects on every replica, Keeper entries). Ukiel's parts are catalog rows plus S3 objects — query nodes hold no part registry and nothing lists directories — so the analogous limits surface later, as **catalog query cost and background sweep cost**:
+
+- **Live parts per hypertable** — the parts-per-table analog. Every query plans via `live_parts` (B-tree on `(hypertable, key_min, key_max)`); range *containment* examines every live row with `min ≤ k`, so planning is O(live parts per hypertable) worst case. Comfortable to ~10⁴–10⁵ live parts. Held down structurally by the level ladder + finalization (plan 17); extended by catalog stats pruning (plan 12 makes the scan time-selective), retention, partition coalescing (below), a GiST/`int8range` index if containment scans bite first, and finally catalog sharding.
+- **Partitions per hypertable** — no structural limit: a partition is a JSONB tag, not a directory. The real costs are (a) the ≥1-file-per-partition floor, (b) the finalization sweep (plan 18 moves its aggregation into SQL instead of fetching every live part), and (c) ingest fan-out: a backfill spanning D days emits D L0 files per flush. A hard per-flush partition cap is deliberately impossible — a flush's Kafka offset range covers *all* rows consumed, so exactly-once forbids flushing some days and deferring others; plan 18 adds a spread warning instead.
+- **Total catalog rows** — the genuinely unbounded quantity: part and commit rows are never deleted (the change feed replays forever). **Acknowledged gap:** the feed eventually needs a horizon so purged rows can be pruned; until then the ceiling is Postgres capacity, then catalog DB sharding by hypertable (schema is shard-ready).
+- **Commit rate** — one transaction per flush/merge; a single Postgres sustains low thousands of commits/s; sharding beyond.
+- **Hypertables** — thousands by design; background iteration is event-gated, logical tables are millions of cheap rows.
+- **Object store** — no LIST on any hot path (GC `reconcile` is the rare O(objects) backstop); object *count* is unbounded but tiny files cost per-request money and per-file scan overhead.
+
+**Guardrails (plan 18, `2026-07-06-ukiel-guardrails.md`).** ClickHouse *enforces* its limits (delays, then rejects inserts under parts pressure); ukiel v1 trusted compaction to keep up. Plan 18 adds: **ingest backpressure** — the flusher checks the live L0 count of its target partitions and defers flushes past a slowdown threshold (halving flush rate ⇒ fewer, bigger L0 files — exactly the corrective), stopping past a stop threshold with a memory safety valve; safe because Kafka offsets only advance with flushes. Plus the **partition-spread warning** and the **SQL-side finalization candidates** query. The alarms standing in for hard limits live in the monitoring spec: live parts per level, backlog runs, backpressure deferrals, oldest unfinalized partition.
+
+Partition granularity itself is a maintenance knob, not a query commitment (planning prunes by key range + part stats, never partition equality). Day is right for the events workload — finalization latency, merge RAM (merges hold a group in memory until streaming merge lands), retention granularity. The per-partition file floor is answered by **partition coalescing** (future plan): rewrite aged day-partitions into month-partitions on the same REPLACE machinery — the time-axis analog of the plan-17 key-axis ladder. Fully dynamic layout (parts as key × time rectangles, no calendar boxes — possible precisely because partitions are tags) is deliberately deferred: it complicates ingest buffering and merge planning for marginal benefit over coalescing.
+
 ## Implementation status
 
 Executed plan-by-plan; the authoritative status table is
@@ -123,9 +139,15 @@ Executed plan-by-plan; the authoritative status table is
 bookkeeping), `ukiel-ingest` (Kafka → sorted ZSTD Parquet L0, exactly-once),
 `ukiel-query` (DataFusion providers, namespace isolation, HTTP SQL, NVMe
 read-through cache), `ukiel-compactor` (L0→L1 with placement policy, key
-deletion), `ukiel-gc` (reaper + orphan sweep), `ukiel-e2e` (scenario suite).
-Planned: `ukiel-expr` + column kinds (plan 7), engines + pipelines (plan 8,
-per `docs/notes/2026-07-06-pipelines.md`), upload intent (plan 9).
+deletion), `ukiel-gc` (reaper + orphan sweep), `ukiel-expr` (column kinds:
+`default`/`materialized`/`alias`, plan 7), `ukiel-e2e` (scenario suite).
+Written, not yet executed (roadmap's recommended order:
+9 → 11 → 17 → 18 → 12 → 14 → 13 → 15 → 16 → 8): upload intent (plan 9),
+read-performance tiers (plans 11–16), level hierarchy + size-targeted
+placement (plan 17), capacity guardrails (plan 18). Engines + pipelines
+(plan 8, per `docs/notes/2026-07-06-pipelines.md`) is not written — write it
+after plan 18, since pipelines replace the ingest routing code 18's
+backpressure lands in.
 
 Verification philosophy and the scenario catalog (S0–S8, invariants I1–I8)
 live in `docs/superpowers/specs/2026-07-05-ukiel-testing-design.md`; the e2e
@@ -139,8 +161,23 @@ exactly-once, compaction equivalence under racing ingest, and key deletion.
   principal supplies it.
 - **Statement timeout** — the GC tombstone grace assumes bounded query
   duration (issue 0002).
+- **Level ladder & size-targeted placement** — designed, plan written and
+  ready to execute (plan 17,
+  `docs/superpowers/plans/2026-07-06-ukiel-lsm-hierarchy.md`): fanout ladder
+  over runs, cold-partition finalization, `target_file_bytes` placement.
+  Supersedes the old "L1→L2 / size-based rolling" deferred item.
+- **Capacity guardrails** — designed (see "Limits & guardrails"), plan
+  written and ready to execute (plan 18,
+  `docs/superpowers/plans/2026-07-06-ukiel-guardrails.md`): ingest
+  backpressure, partition-spread warning, SQL-side finalization candidates.
 - Deferred, designed-for: distributed cache tier, tombstone merge-on-read,
   MV service productization, per-tenant quotas/billing, retention sweep,
-  L1→L2 / size-based rolling, Arrow Flight SQL, catalog DB sharding (schema
-  is shard-ready), `alter_hypertable_add_column` API (storage layer already
-  handles additive evolution via schema-adapting rewrites).
+  Arrow Flight SQL, catalog DB sharding (schema is shard-ready),
+  `alter_hypertable_add_column` API (storage layer already handles additive
+  evolution via schema-adapting rewrites), streaming merges (compaction
+  currently holds a whole merge group in RAM), stable split points across
+  merges, **partition coalescing** (rewrite aged day-partitions into
+  month-partitions — the answer to the per-partition file floor), **change
+  feed horizon + purged-row pruning** (part/commit rows currently grow
+  forever; the feed's replay-forever guarantee needs a bound before catalog
+  sharding is the only lever).

@@ -37,6 +37,8 @@ alert traces back to an invariant or an SLO.
 | `ingest_poison_messages_total{topic}` | counter | I6; a step change means a producer broke |
 | `ingest_commit_failures_total` | counter | commit errors (not conflicts — ADD doesn't conflict) |
 | `ingest_freshness_seconds{hypertable}` | gauge | now − max event ts of last flush: the user-facing freshness proxy (I3) |
+| `ingest_backpressure_deferrals_total{hypertable}` | counter | plan-18 guardrail: flushes deferred because live L0 count crossed the slowdown/stop thresholds — nonzero means compaction is behind and ingest is self-throttling (by design) |
+| `ingest_flush_partitions` | histogram | distinct partitions per flush; a backfill spanning many days shows here (the spread warning's metric twin — no hard cap exists because a flush's offset range covers all its rows) |
 
 ### Catalog (Postgres)
 
@@ -68,7 +70,8 @@ alert traces back to an invariant or an SLO.
 | `compactor_merges_total` / `compactor_parts_in_total` / `parts_out_total` | counter | throughput and effectiveness (in/out ratio) |
 | `compactor_conflicts_total` | counter | losing every race = starvation with a healthy-looking loop |
 | `compactor_pass_duration_seconds` | histogram | pass time approaching the poll interval = falling behind |
-| `compactor_backlog_groups` | gauge | partitions with ≥ `min_l0_files` L0 files — the direct "is compaction keeping up" signal |
+| `compactor_backlog_groups` | gauge | partitions with a level at/over its merge trigger (`l0_fanout` / `fanout` runs, plan 17) — the direct "is compaction keeping up" signal |
+| `compactor_unfinalized_partitions` / `compactor_oldest_unfinalized_age_seconds` | gauge | partitions past `finalize_after_secs` still holding >1 run — the plan-17 terminal invariant ("cold partition = one run") as a production signal; age growth = finalization starving |
 | `compactor_last_success_timestamp` | gauge | liveness that survives error-looping |
 
 ### GC
@@ -91,6 +94,8 @@ alert traces back to an invariant or an SLO.
 | FreshnessBreach | `ingest_freshness_seconds` > 60s for 5m, or consumer lag growing 15m | I3 / SLO |
 | FeedConsumerStalled | `catalog_feed_lag` growing for 15m | consumer health **and** GC fence — precedes disk growth |
 | CompactionStarved | `compactor_backlog_groups` growing 30m, or `last_success` > 3× poll interval | I4/I5 operationally; query latency follows L0 count |
+| IngestBackpressured | `ingest_backpressure_deferrals_total` increasing for 15m | the plan-18 guardrail is holding the line — freshness is being traded for part count; find out why compaction lags before the stop threshold turns it into staleness |
+| FinalizationStarved | `compactor_oldest_unfinalized_age_seconds` > 6× `finalize_after_secs` | cold partitions stuck pre-terminal: whale deletes need rewrites, per-key read amp stays at hot-partition levels |
 | GcStarved | `catalog_unpurged_tombstones` or `gc_pending_object_age` growing steadily | storage-cost leak |
 | ReconcileFoundOrphans | `gc_reconcile_orphans_total` increased at all | plan-9 write-protocol violation — a bug, page during business hours |
 | ConflictStorm | conflict rate > 20% of commits for 10m | optimistic-concurrency livelock |
