@@ -239,6 +239,10 @@ impl Stack {
             group_id: format!("ukiel-e2e-{}", self.nonce),
             flush_interval_ms,
             max_buffer_rows: 100_000,
+            // Scenario fixtures use 1970 epoch-ms timestamps; widen the past
+            // bound so the event-time rail (issue 0004) keeps them.
+            max_event_age_days: 30_000,
+            max_event_future_secs: 3600,
             tables: vec![TableRoute {
                 topic: table.topic.clone(),
                 hypertable: table.hypertable_name.clone(),

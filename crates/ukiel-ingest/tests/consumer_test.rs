@@ -91,6 +91,10 @@ async fn consumes_flushes_and_resumes_exactly_once() {
         group_id: "ukiel-test".into(),
         flush_interval_ms: 500,
         max_buffer_rows: 10_000,
+        // Fixtures use 1970 epoch-ms timestamps; widen the past bound so the
+        // event-time rail (issue 0004) doesn't skip them as ancient.
+        max_event_age_days: 30_000,
+        max_event_future_secs: 3600,
         tables: vec![TableRoute {
             topic: TOPIC.into(),
             hypertable: "events".into(),

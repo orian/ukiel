@@ -118,6 +118,11 @@ pub struct IngestSection {
     pub group_id: String,
     pub flush_interval_ms: u64,
     pub max_buffer_rows: usize,
+    /// Issue 0004: skip events older than this many days (raise for backfills).
+    pub max_event_age_days: u64,
+    /// Issue 0004: skip events from further in the future than this (unit-bug
+    /// detector / clock-skew allowance).
+    pub max_event_future_secs: u64,
 }
 
 impl Default for IngestSection {
@@ -127,6 +132,8 @@ impl Default for IngestSection {
             group_id: "ukield".to_string(),
             flush_interval_ms: 10_000,
             max_buffer_rows: 100_000,
+            max_event_age_days: 3650,
+            max_event_future_secs: 3600,
         }
     }
 }

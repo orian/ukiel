@@ -4717,6 +4717,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tracing",
  "ukiel-catalog",
  "ukiel-core",
  "ukiel-expr",

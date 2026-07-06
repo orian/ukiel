@@ -94,6 +94,8 @@ pub async fn run_with_bound_addr(
                     group_id: cfg.ingest.group_id.clone(),
                     flush_interval_ms: cfg.ingest.flush_interval_ms,
                     max_buffer_rows: cfg.ingest.max_buffer_rows,
+                    max_event_age_days: cfg.ingest.max_event_age_days,
+                    max_event_future_secs: cfg.ingest.max_event_future_secs,
                     tables: routes,
                 },
             );

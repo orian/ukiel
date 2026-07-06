@@ -20,6 +20,7 @@ tokio-util = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 testcontainers-modules = { workspace = true, features = ["kafka"] }

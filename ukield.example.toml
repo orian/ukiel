@@ -26,6 +26,8 @@ brokers = "127.0.0.1:9092"
 group_id = "ukield"
 flush_interval_ms = 2000 # demo-friendly freshness; production default 10000
 max_buffer_rows = 100000
+max_event_age_days = 3650    # skip events older than this (raise for backfills)
+max_event_future_secs = 3600 # skip events from the future (unit-bug detector)
 
 [compactor]
 poll_interval_ms = 5000

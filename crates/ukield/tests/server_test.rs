@@ -32,6 +32,8 @@ async fn full_stack_ingest_to_query_over_http() {
         group_id = "ukield-test"
         flush_interval_ms = 500
         max_buffer_rows = 10000
+        max_event_age_days = 30000
+
         [[tables]]
         name = "events"
         topic = "events"

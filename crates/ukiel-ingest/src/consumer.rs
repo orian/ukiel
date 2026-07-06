@@ -83,6 +83,15 @@ struct Buffers {
     total_rows: usize,
 }
 
+/// Issue 0004: bounds event time so bad producer timestamps can't mint junk
+/// partitions (or the old permanent "unknown" day). Pure for testability;
+/// saturating arithmetic keeps i64::MIN/MAX out of bounds by construction.
+pub(crate) fn event_time_in_bounds(ts_ms: i64, now_ms: i64, config: &IngestConfig) -> bool {
+    let max_age_ms = (config.max_event_age_days as i64).saturating_mul(24 * 3600 * 1000);
+    let max_future_ms = (config.max_event_future_secs as i64).saturating_mul(1000);
+    ts_ms >= now_ms.saturating_sub(max_age_ms) && ts_ms <= now_ms.saturating_add(max_future_ms)
+}
+
 impl RouteIngest {
     async fn run(&self, shutdown: CancellationToken) -> Result<(), IngestError> {
         let hypertable = self.catalog.get_hypertable(&self.route.hypertable).await?;
@@ -194,9 +203,18 @@ impl RouteIngest {
         if row.get(packing_key).and_then(|v| v.as_i64()).is_none() {
             return;
         }
-        let day = chrono::DateTime::from_timestamp_millis(ts)
-            .map(|d| d.date_naive().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+        // Out-of-bounds event time: skip like poison — the offset above has
+        // already advanced, the row is dropped visibly (warn), and no junk
+        // partition is minted (issue 0004).
+        if !event_time_in_bounds(ts, chrono::Utc::now().timestamp_millis(), &self.config) {
+            tracing::warn!(ts, "event time out of bounds; row skipped");
+            return;
+        }
+        let Some(day) =
+            chrono::DateTime::from_timestamp_millis(ts).map(|d| d.date_naive().to_string())
+        else {
+            return; // unreachable given the bounds check; never mint "unknown"
+        };
 
         buffers.rows_by_day.entry(day).or_default().push(row);
         buffers.total_rows += 1;
@@ -239,5 +257,42 @@ impl RouteIngest {
         // Offset-only flush (all rows were skipped): commit offsets with no parts.
         self.flusher.flush(hypertable, items, offsets).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal IngestConfig for pure-function tests (no Kafka/store touched).
+    fn cfg() -> IngestConfig {
+        IngestConfig {
+            brokers: String::new(),
+            group_id: String::new(),
+            flush_interval_ms: 1000,
+            max_buffer_rows: 1000,
+            max_event_age_days: 3650,
+            max_event_future_secs: 3600,
+            tables: vec![],
+        }
+    }
+
+    #[test]
+    fn event_time_bounds() {
+        let c = cfg(); // max_event_age_days: 3650, max_event_future_secs: 3600
+        let now_ms: i64 = 1_780_000_000_000; // fixed "now" for determinism
+
+        assert!(event_time_in_bounds(now_ms, now_ms, &c));
+        assert!(event_time_in_bounds(now_ms - 24 * 3600 * 1000, now_ms, &c)); // yesterday
+        assert!(event_time_in_bounds(now_ms + 3_599_000, now_ms, &c)); // 59m59s ahead
+
+        // Too far future: year-3000-style producer bugs.
+        assert!(!event_time_in_bounds(now_ms + 3_601_000, now_ms, &c));
+        // Too old: beyond the age window.
+        let age_ms = 3650i64 * 24 * 3600 * 1000;
+        assert!(!event_time_in_bounds(now_ms - age_ms - 1000, now_ms, &c));
+        // Unrepresentable timestamps are out of bounds by construction.
+        assert!(!event_time_in_bounds(i64::MAX, now_ms, &c));
+        assert!(!event_time_in_bounds(i64::MIN, now_ms, &c));
     }
 }
