@@ -4,15 +4,19 @@
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::execution::context::SQLOptions;
 use object_store::ObjectStore;
+use serde_json::json;
 use ukiel_catalog::PostgresCatalog;
 use ukiel_core::NamespaceId;
 
 use crate::context::session_for_namespace;
+use crate::results::{self, ARROW_STREAM_CONTENT_TYPE, ResultFormat};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -25,11 +29,10 @@ pub struct AppState {
 pub struct QueryRequest {
     pub namespace_id: i64,
     pub sql: String,
-}
-
-#[derive(serde::Serialize)]
-pub struct QueryResponse {
-    pub rows: serde_json::Value,
+    /// Result encoding; when absent, the `Accept` header decides (arrow stream
+    /// vs. default rows). An explicit value wins over `Accept`.
+    #[serde(default)]
+    pub format: Option<ResultFormat>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -43,10 +46,24 @@ fn bad_request<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
     (StatusCode::BAD_REQUEST, e.to_string())
 }
 
+/// Errors are always JSON (`{"error": "..."}`), regardless of the requested
+/// result format — a client never has to sniff whether an error body is Arrow.
 async fn run_query(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<QueryRequest>,
-) -> Result<Json<QueryResponse>, (StatusCode, String)> {
+) -> Response {
+    match run_query_inner(state, headers, req).await {
+        Ok(resp) => resp,
+        Err((status, msg)) => (status, Json(json!({ "error": msg }))).into_response(),
+    }
+}
+
+async fn run_query_inner(
+    state: AppState,
+    headers: HeaderMap,
+    req: QueryRequest,
+) -> Result<Response, (StatusCode, String)> {
     let ctx = session_for_namespace(
         &state.catalog,
         NamespaceId(req.namespace_id),
@@ -64,15 +81,40 @@ async fn run_query(
         .sql_with_options(&req.sql, options)
         .await
         .map_err(bad_request)?;
+
+    // Capture the result schema before `collect` consumes the frame; the
+    // collected batches carry the definitive runtime schema when non-empty.
+    let planned_schema: SchemaRef = df.schema().inner().clone();
     let batches = df.collect().await.map_err(bad_request)?;
+    let schema = batches
+        .first()
+        .map(|b| b.schema())
+        .unwrap_or(planned_schema);
 
-    let mut writer = datafusion::arrow::json::ArrayWriter::new(Vec::new());
-    for batch in &batches {
-        writer.write(batch).map_err(bad_request)?;
-    }
-    writer.finish().map_err(bad_request)?;
-    let rows: serde_json::Value =
-        serde_json::from_slice(&writer.into_inner()).unwrap_or_else(|_| serde_json::json!([]));
+    let format = req.format.unwrap_or_else(|| {
+        let accepts_arrow = headers
+            .get(header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.contains(ARROW_STREAM_CONTENT_TYPE))
+            .unwrap_or(false);
+        if accepts_arrow {
+            ResultFormat::Arrow
+        } else {
+            ResultFormat::Rows
+        }
+    });
 
-    Ok(Json(QueryResponse { rows }))
+    let resp = match format {
+        ResultFormat::Rows => {
+            Json(results::to_rows(&batches, &schema).map_err(bad_request)?).into_response()
+        }
+        ResultFormat::Columns => {
+            Json(results::to_columns(&batches, &schema).map_err(bad_request)?).into_response()
+        }
+        ResultFormat::Arrow => {
+            let bytes = results::to_arrow_ipc(&batches, &schema).map_err(bad_request)?;
+            ([(header::CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)], bytes).into_response()
+        }
+    };
+    Ok(resp)
 }

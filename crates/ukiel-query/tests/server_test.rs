@@ -55,3 +55,141 @@ async fn http_query_returns_namespace_scoped_rows() {
         .unwrap();
     assert_eq!(resp.status(), 400);
 }
+
+#[tokio::test]
+async fn rows_format_carries_schema_with_timestamp_hint() {
+    let (base, _h) = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    // Namespace 2 has rows b1 (ts 150) and b2 (ts 300).
+    let resp = client
+        .post(format!("{base}/api/query"))
+        .json(&json!({"namespace_id": 2, "sql": "SELECT ts, payload FROM events ORDER BY ts"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    // Legacy `rows` shape is preserved, now with a `schema` sibling that
+    // recovers `timestamp_ms` from the field metadata (through the provider
+    // projection + DataFusion planning).
+    assert_eq!(
+        body["rows"],
+        json!([{"ts": 150, "payload": "b1"}, {"ts": 300, "payload": "b2"}])
+    );
+    assert_eq!(
+        body["schema"],
+        json!([
+            {"name": "ts", "type": "timestamp_ms", "nullable": true},
+            {"name": "payload", "type": "utf8", "nullable": true}
+        ])
+    );
+
+    // A computed column drops the hint (correctly): ts + 1 is just int64.
+    let resp = client
+        .post(format!("{base}/api/query"))
+        .json(&json!({"namespace_id": 2, "sql": "SELECT ts + 1 AS bumped FROM events"}))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["schema"][0]["type"], "int64");
+}
+
+#[tokio::test]
+async fn columns_format_is_columnar() {
+    let (base, _h) = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/api/query"))
+        .json(&json!({
+            "namespace_id": 2,
+            "sql": "SELECT ts, payload FROM events ORDER BY ts",
+            "format": "columns"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    assert_eq!(body["row_count"], 2);
+    assert_eq!(body["columns"]["ts"], json!([150, 300]));
+    assert_eq!(body["columns"]["payload"], json!(["b1", "b2"]));
+    assert_eq!(body["schema"][0]["type"], "timestamp_ms");
+}
+
+#[tokio::test]
+async fn arrow_format_round_trips_via_field_and_header() {
+    use datafusion::arrow::ipc::reader::StreamReader;
+
+    let (base, _h) = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    // (a) explicit format field
+    let resp = client
+        .post(format!("{base}/api/query"))
+        .json(&json!({
+            "namespace_id": 2,
+            "sql": "SELECT ts, payload FROM events ORDER BY ts",
+            "format": "arrow"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/vnd.apache.arrow.stream")
+    );
+    let bytes = resp.bytes().await.unwrap();
+    let reader = StreamReader::try_new(std::io::Cursor::new(bytes), None).unwrap();
+    let batches: Vec<_> = reader.map(|b| b.unwrap()).collect();
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 2);
+    // Lossless: the IPC schema keeps the ukiel:type hint on `ts`.
+    let schema = batches[0].schema();
+    assert_eq!(
+        schema
+            .field(0)
+            .metadata()
+            .get("ukiel:type")
+            .map(String::as_str),
+        Some("timestamp_ms")
+    );
+
+    // (b) Accept header, no format field
+    let resp = client
+        .post(format!("{base}/api/query"))
+        .header("accept", "application/vnd.apache.arrow.stream")
+        .json(&json!({"namespace_id": 2, "sql": "SELECT payload FROM events"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/vnd.apache.arrow.stream")
+    );
+}
+
+#[tokio::test]
+async fn errors_are_json_regardless_of_format() {
+    let (base, _h) = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/api/query"))
+        .json(&json!({"namespace_id": 1, "sql": "SELEKT nope", "format": "arrow"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].is_string(), "error body must be JSON: {body}");
+}

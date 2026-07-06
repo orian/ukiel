@@ -7,6 +7,8 @@ pub enum QueryError {
     #[error(transparent)]
     DataFusion(#[from] datafusion::error::DataFusionError),
     #[error(transparent)]
+    Arrow(#[from] datafusion::arrow::error::ArrowError),
+    #[error(transparent)]
     Expr(#[from] ukiel_expr::ExprError),
     #[error("unknown table '{0}'")]
     UnknownTable(String),
