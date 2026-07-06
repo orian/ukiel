@@ -656,12 +656,16 @@ async fn reapable_parts_respect_grace_and_cursors() {
     let reapable = catalog.reapable_parts(ht, 0.0).await.unwrap();
     assert_eq!(reapable.len(), 1);
 
-    // Purging stamps the row: no longer reapable, but path stays known and
-    // the change feed still replays the original add.
+    // Purging stamps the row: no longer reapable. Its path drops out of
+    // all_part_paths (the object is already deleted), but the catalog row and
+    // the change feed still replay the original add.
     catalog.mark_purged(&[reapable[0].id]).await.unwrap();
     assert!(catalog.reapable_parts(ht, 0.0).await.unwrap().is_empty());
     let paths = catalog.all_part_paths(ht).await.unwrap();
-    assert!(paths.contains(&"old.parquet".to_string()));
+    assert!(
+        !paths.contains(&"old.parquet".to_string()),
+        "purged path is excluded from the known set"
+    );
     assert!(paths.contains(&"new.parquet".to_string()));
     let events = catalog.changes_since(ht, CommitId(0), 100).await.unwrap();
     assert_eq!(

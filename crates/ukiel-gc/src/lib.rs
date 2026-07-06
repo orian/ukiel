@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use futures::TryStreamExt;
 use object_store::ObjectStore;
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
@@ -31,6 +32,9 @@ pub struct GcConfig {
     pub orphan_grace_secs: i64,
     /// Loop tick for `run`.
     pub poll_interval_ms: u64,
+    /// Run the listing-based `reconcile` backstop every Nth `run` tick
+    /// (0 = never). Reconcile catches objects uploaded without an intent row.
+    pub reconcile_every_n_passes: u64,
 }
 
 impl Default for GcConfig {
@@ -39,6 +43,7 @@ impl Default for GcConfig {
             tombstone_grace_secs: 900.0,
             orphan_grace_secs: 3600,
             poll_interval_ms: 60_000,
+            reconcile_every_n_passes: 60,
         }
     }
 }
@@ -47,6 +52,7 @@ impl Default for GcConfig {
 pub struct GcStats {
     pub reaped_parts: usize,
     pub swept_orphans: usize,
+    pub reconciled_orphans: usize,
 }
 
 pub struct Gc {
@@ -120,17 +126,60 @@ impl Gc {
         Ok(())
     }
 
+    /// Defense-in-depth: lists objects under each hypertable's prefix and
+    /// deletes any older than the orphan grace that the catalog knows nothing
+    /// about — neither a non-purged part nor a pending intent. Costs one
+    /// object-store LIST per hypertable, so it runs rarely (see
+    /// `reconcile_every_n_passes`).
+    pub async fn reconcile_once(&self) -> Result<GcStats, GcError> {
+        let mut stats = GcStats::default();
+        for hypertable in self.catalog.list_hypertables().await? {
+            let mut known: std::collections::HashSet<String> = self
+                .catalog
+                .all_part_paths(hypertable.id)
+                .await?
+                .into_iter()
+                .collect();
+            known.extend(self.catalog.all_pending_paths(hypertable.id).await?);
+
+            let prefix = Path::from(format!("ht/{}", hypertable.id));
+            let objects: Vec<_> = self.store.list(Some(&prefix)).try_collect().await?;
+            let now = chrono::Utc::now();
+            for meta in objects {
+                if known.contains(meta.location.as_ref()) {
+                    continue;
+                }
+                if (now - meta.last_modified).num_seconds() >= self.config.orphan_grace_secs {
+                    match self.store.delete(&meta.location).await {
+                        Ok(()) | Err(object_store::Error::NotFound { .. }) => {
+                            stats.reconciled_orphans += 1;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+        }
+        Ok(stats)
+    }
+
     /// Ticks `run_once` until cancelled.
     pub async fn run(&self, shutdown: tokio_util::sync::CancellationToken) -> Result<(), GcError> {
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(
             self.config.poll_interval_ms,
         ));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut pass: u64 = 0;
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => return Ok(()),
                 _ = ticker.tick() => {
-                    let stats = self.run_once().await?;
+                    let mut stats = self.run_once().await?;
+                    pass += 1;
+                    if self.config.reconcile_every_n_passes > 0
+                        && pass.is_multiple_of(self.config.reconcile_every_n_passes)
+                    {
+                        stats.reconciled_orphans += self.reconcile_once().await?.reconciled_orphans;
+                    }
                     if stats != GcStats::default() {
                         tracing::info!(?stats, "gc pass");
                     }

@@ -89,6 +89,7 @@ fn gc(env: &Env, tombstone_grace_secs: f64, orphan_grace_secs: i64) -> Gc {
             tombstone_grace_secs,
             orphan_grace_secs,
             poll_interval_ms: 50,
+            ..GcConfig::default()
         },
     )
 }
@@ -250,4 +251,64 @@ async fn lagging_consumer_cursor_blocks_reaping() {
     let remaining = object_paths(&env.store).await;
     assert_eq!(remaining.len(), 1);
     assert!(remaining[0].ends_with("new.parquet"));
+}
+
+#[tokio::test]
+async fn reconcile_sweeps_untracked_objects_only() {
+    let env = setup().await;
+    // A committed object, a pending (registered, in-flight) object, and a
+    // truly-untracked object (uploaded with NO intent row — the failure mode
+    // reconcile exists to catch), plus one outside the hypertable prefix.
+    let committed = upload(&env, "committed").await;
+    env.catalog
+        .commit(
+            env.ht,
+            CommitOp::Add {
+                parts: vec![committed],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let pending_path = format!("ht/{}/L0/pending.parquet", env.ht);
+    env.catalog
+        .register_pending_objects(env.ht, std::slice::from_ref(&pending_path))
+        .await
+        .unwrap();
+    env.store
+        .put(&Path::from(pending_path), b"x".to_vec().into())
+        .await
+        .unwrap();
+
+    env.store
+        .put(
+            &Path::from(format!("ht/{}/L0/untracked.parquet", env.ht)),
+            b"x".to_vec().into(),
+        )
+        .await
+        .unwrap();
+    env.store
+        .put(&Path::from("unrelated/file"), b"keep".to_vec().into())
+        .await
+        .unwrap();
+
+    // Grace 0: only the untracked object is removed. Committed part, in-flight
+    // pending object, and out-of-prefix object all survive.
+    let gc = Gc::new(
+        env.catalog.clone(),
+        env.store.clone(),
+        GcConfig {
+            tombstone_grace_secs: 3600.0,
+            orphan_grace_secs: 0,
+            ..GcConfig::default()
+        },
+    );
+    let stats = gc.reconcile_once().await.unwrap();
+    assert_eq!(stats.reconciled_orphans, 1);
+    let remaining = object_paths(&env.store).await;
+    assert!(remaining.iter().any(|p| p.ends_with("committed.parquet")));
+    assert!(remaining.iter().any(|p| p.ends_with("pending.parquet")));
+    assert!(remaining.iter().any(|p| p == "unrelated/file"));
+    assert!(!remaining.iter().any(|p| p.ends_with("untracked.parquet")));
 }

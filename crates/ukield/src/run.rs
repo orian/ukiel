@@ -152,6 +152,7 @@ pub async fn run_with_bound_addr(
                 poll_interval_ms: cfg.gc.poll_interval_ms,
                 tombstone_grace_secs: cfg.gc.tombstone_grace_secs,
                 orphan_grace_secs: cfg.gc.orphan_grace_secs,
+                ..GcConfig::default()
             },
         );
         let token = shutdown.clone();

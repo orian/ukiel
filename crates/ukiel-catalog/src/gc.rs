@@ -45,15 +45,29 @@ impl PostgresCatalog {
         Ok(())
     }
 
-    /// Every object path the catalog has ever committed for this hypertable,
-    /// in any state (live, tombstoned, purged). The sweeper treats anything
-    /// under the hypertable's prefix that is NOT in this set as an orphan.
+    /// Every object path the catalog currently accounts for under this
+    /// hypertable: live and tombstoned-but-not-yet-purged parts. Purged parts
+    /// are excluded — their objects are already deleted, and excluding them
+    /// keeps this set bounded by real object count, not all-time history.
     pub async fn all_part_paths(
         &self,
         hypertable_id: HypertableId,
     ) -> Result<Vec<String>, CatalogError> {
+        Ok(sqlx::query_scalar(
+            "SELECT path FROM parts WHERE hypertable_id = $1 AND purged_at IS NULL",
+        )
+        .bind(hypertable_id.0)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Every path with an outstanding upload intent (in-flight or orphaned).
+    pub async fn all_pending_paths(
+        &self,
+        hypertable_id: HypertableId,
+    ) -> Result<Vec<String>, CatalogError> {
         Ok(
-            sqlx::query_scalar("SELECT path FROM parts WHERE hypertable_id = $1")
+            sqlx::query_scalar("SELECT path FROM pending_objects WHERE hypertable_id = $1")
                 .bind(hypertable_id.0)
                 .fetch_all(&self.pool)
                 .await?,
