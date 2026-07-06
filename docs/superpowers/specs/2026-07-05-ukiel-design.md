@@ -172,14 +172,16 @@ exactly-once, compaction equivalence under racing ingest, and key deletion.
 - **Auth on the query endpoint** — `namespace_id` is caller-supplied
   (issue 0001); do not expose to untrusted callers until an authenticated
   principal supplies it.
-- **Statement timeout** — the GC tombstone grace assumes bounded query
-  duration (issue 0002). Fix planned: plan 19
-  (`docs/superpowers/plans/2026-07-06-ukiel-safety-rails.md`).
-- **Concurrent ingest writers double-commit** (issue 0003) — the
-  `ingest_offsets` upsert is last-writer-wins and every worker assigns all
-  Kafka partitions, so two ingest processes on one topic silently duplicate
-  data. Plan 19 adds an offset CAS turning this into a loud error; true
-  horizontal ingest (partition-subset leases) remains future work.
+- **Statement timeout** — *resolved (plan 19, issue 0002)*: the query
+  endpoint wraps planning + execution in a `statement_timeout` (HTTP 408 on
+  expiry) and `ukield` refuses to start when a single process runs both the
+  query and gc roles with `statement_timeout_secs >= gc.tombstone_grace_secs`,
+  so the tombstone grace is a real guarantee.
+- **Concurrent ingest writers double-commit** — *resolved (plan 19, issue
+  0003)*: the `ingest_offsets` upsert is now a CAS (`WHERE next_offset <=
+  range.first`); a second writer on the same topic gets a loud
+  `CatalogError::OffsetRace` and the commit rolls back instead of duplicating
+  data. True horizontal ingest (partition-subset leases) remains future work.
 - **Unbounded event time** (issue 0004) — junk partitions from bad
   timestamps plus the permanent `"unknown"` day. Plan 19 bounds event time
   at ingest with **asymmetric** semantics: the future bound is hard

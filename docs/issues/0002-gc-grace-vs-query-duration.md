@@ -1,7 +1,7 @@
 # 0002 — GC tombstone grace is not enforced against query duration
 
 - **Severity:** Medium (correct failure, not corruption — but unbounded queries can break)
-- **Status:** Open — fix planned: plan 19 (`docs/superpowers/plans/2026-07-06-ukiel-safety-rails.md`), statement timeout + startup invariant check
+- **Status:** Resolved (plan 19) — `ukiel-query` wraps planning + execution in a `statement_timeout` (HTTP 408 on expiry); `ukield` refuses to start when the query and gc roles share a process and `query.statement_timeout_secs >= gc.tombstone_grace_secs`
 - **Components:** `crates/ukiel-gc`, `crates/ukiel-query`
 - **Found by:** design review, 2026-07-06
 

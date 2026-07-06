@@ -1,7 +1,7 @@
 # 0003 — Concurrent ingest workers double-commit (offset upsert is last-writer-wins)
 
 - **Severity:** High (silent data duplication — but only under misconfiguration)
-- **Status:** Open — fix planned: plan 19 (`docs/superpowers/plans/2026-07-06-ukiel-safety-rails.md`)
+- **Status:** Resolved (plan 19) — the `ingest_offsets` upsert in `commit_inner` is now a CAS (`... DO UPDATE ... WHERE ingest_offsets.next_offset <= range.first`); a duplicate writer gets zero rows affected → `CatalogError::OffsetRace`, rolling the whole commit back (no duplicate part). `<=` keeps compacted-topic offset gaps legal. (Partition-subset leases remain future work.)
 - **Components:** `crates/ukiel-catalog`, `crates/ukiel-ingest`
 - **Found by:** design review, 2026-07-06
 
