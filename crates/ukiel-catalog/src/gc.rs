@@ -59,4 +59,58 @@ impl PostgresCatalog {
                 .await?,
         )
     }
+
+    /// Records upload intent for `paths` (idempotent). Callers MUST do this
+    /// before uploading, so a crash between upload and commit leaves a
+    /// discoverable orphan.
+    pub async fn register_pending_objects(
+        &self,
+        hypertable_id: HypertableId,
+        paths: &[String],
+    ) -> Result<(), CatalogError> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT INTO pending_objects (hypertable_id, path)
+             SELECT $1, p FROM UNNEST($2::text[]) AS p
+             ON CONFLICT (path) DO NOTHING",
+        )
+        .bind(hypertable_id.0)
+        .bind(paths)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Pending-object paths older than `grace_seconds` whose commit never
+    /// landed — i.e. orphaned uploads. Ordered by path for deterministic tests.
+    pub async fn orphaned_pending_objects(
+        &self,
+        hypertable_id: HypertableId,
+        grace_seconds: f64,
+    ) -> Result<Vec<String>, CatalogError> {
+        Ok(sqlx::query_scalar(
+            "SELECT path FROM pending_objects
+             WHERE hypertable_id = $1
+               AND created_at <= now() - make_interval(secs => $2)
+             ORDER BY path",
+        )
+        .bind(hypertable_id.0)
+        .bind(grace_seconds)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Removes intent rows for the given paths (after their objects are gone).
+    pub async fn clear_pending_objects(&self, paths: &[String]) -> Result<(), CatalogError> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        sqlx::query("DELETE FROM pending_objects WHERE path = ANY($1)")
+            .bind(paths)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }

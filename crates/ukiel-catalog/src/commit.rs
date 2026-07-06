@@ -126,6 +126,13 @@ async fn insert_parts(
         .execute(&mut **tx)
         .await?;
     }
+    // A committed part's object is now catalog-tracked; drop its upload-intent
+    // row so the GC sweeper stops treating it as a potential orphan.
+    let paths: Vec<String> = parts.iter().map(|p| p.path.clone()).collect();
+    sqlx::query("DELETE FROM pending_objects WHERE path = ANY($1)")
+        .bind(&paths)
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 

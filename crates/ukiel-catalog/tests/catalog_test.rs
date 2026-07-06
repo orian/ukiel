@@ -670,3 +670,73 @@ async fn reapable_parts_respect_grace_and_cursors() {
         "purged part must still appear in feed replay"
     );
 }
+
+#[tokio::test]
+async fn pending_objects_track_orphans_and_clear_on_commit() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+
+    // A writer records intent for two objects it is about to upload.
+    catalog
+        .register_pending_objects(ht, &["a.parquet".to_string(), "b.parquet".to_string()])
+        .await
+        .unwrap();
+
+    // Both are orphan candidates at grace 0 (rows are in the past), none at a
+    // large grace (protects in-flight commits).
+    let orphans = catalog.orphaned_pending_objects(ht, 0.0).await.unwrap();
+    assert_eq!(
+        orphans,
+        vec!["a.parquet".to_string(), "b.parquet".to_string()]
+    );
+    assert!(
+        catalog
+            .orphaned_pending_objects(ht, 3600.0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Re-registering the same path is a no-op (idempotent retry).
+    catalog
+        .register_pending_objects(ht, &["a.parquet".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog
+            .orphaned_pending_objects(ht, 0.0)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Committing a part with path "a.parquet" clears its intent row.
+    catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![part_meta("a.parquet", 1, 10)],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog.orphaned_pending_objects(ht, 0.0).await.unwrap(),
+        vec!["b.parquet".to_string()]
+    );
+
+    // The sweeper clears the row after deleting the object.
+    catalog
+        .clear_pending_objects(&["b.parquet".to_string()])
+        .await
+        .unwrap();
+    assert!(
+        catalog
+            .orphaned_pending_objects(ht, 0.0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
