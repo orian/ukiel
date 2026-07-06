@@ -12,6 +12,7 @@ Spec: `docs/superpowers/specs/2026-07-05-ukiel-design.md`. V1 is split into sequ
 | 6 | `2026-07-06-ukiel-v1-gc.md` | `ukiel-gc`: reap tombstoned parts' objects (grace period + worker-cursor fence for lagging feed consumers), sweep never-committed orphans (age-gated), purge stamps keep catalog rows for feed replay | **Executed** |
 | 7 | `2026-07-06-ukiel-matcols.md` | ClickHouse-style column kinds: `default` / `materialized` (computed at ingest, recomputed on rewrites = organic backfill; new `ukiel-expr` crate, deterministic expressions only) / `alias` (query-time, provider projection). Includes schema-adapting compactor reads (additive evolution groundwork) | **Executed** |
 | 8 | ukiel-pipelines | Table engines + pipelines per `docs/notes/2026-07-06-pipelines.md`: `stream_tables` (engine=kafka) + `pipelines` catalog entities; kafka→parquet pipeline replaces `TableRoute`; parquet→parquet pipeline = aggregation MV (subsumes the spec's demo-MV V1 item). Egress (parquet→kafka, delivery ladder) follows in a later plan | Not written |
+| 10 | `2026-07-06-ukield-server.md` | `ukield`: single deployable binary — config-driven role wiring (ingest/query/compactor/gc), idempotent table bootstrap from TOML, graceful shutdown, `make play` quickstart. Independent of plans 8/9 | **Ready to execute** |
 
 Cross-plan constraints (repeat in every plan's Global Constraints):
 
