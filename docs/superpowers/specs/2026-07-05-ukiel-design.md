@@ -40,7 +40,7 @@ The catalog core is **tenancy-agnostic**. It knows two generic concepts: **names
 
 Query planning = one indexed catalog query (*live parts where partition ∈ P and packing-key range ∋ k*), never an object-store listing.
 
-Schema is owned by the hypertable row (JSON; see `docs/notes/schema-management.md`). Columns can be plain, `default`, `materialized`, or `alias` expressions (`docs/notes/materialized-columns.md`) — write-time expressions are recomputed on every rewrite, which doubles as organic backfill after additive schema changes.
+Schema is owned by the hypertable row (JSON; see `docs/notes/schema-management.md`). Columns can be plain, `default`, `materialized`, or `alias` expressions (`docs/notes/2026-07-06-materialized-columns.md`) — write-time expressions are recomputed on every rewrite, which doubles as organic backfill after additive schema changes.
 
 #### Hypertable vs logical table
 
@@ -106,9 +106,9 @@ Writers upload objects **before** committing, and REPLACE tombstones catalog row
 - **Orphan sweep**: objects whose commit never landed (crashed writers, lost REPLACE races). Discovery is a catalog query via **write-ahead upload intent** (`pending_objects`: writers register a path before uploading; the referencing commit clears it in the same transaction) — zero object-store `LIST` on the hot path. A rare `reconcile` listing pass is the backstop for objects uploaded without registration.
 - Grace periods make both safe against in-flight work; they are time-window guarantees (same trade-off as Iceberg snapshot expiration / Delta VACUUM), not reference counting.
 
-### MVs
+### Pipelines (ingest routing, MVs, egress)
 
-MV = durable change-feed cursor + SQL transform + target logical table. MV worker reads new parts, runs the transform through DataFusion scoped to those parts, appends results. Insert-only incremental in v1 semantics; REPLACE events trigger re-derivation of affected MV partitions (post-v1). Tenant and system MVs share the machinery. The cursor infrastructure (`worker_cursors`) is shared with the compactor and GC fencing; the demo MV worker is roadmap plan 8. Note: many per-row "MV" use cases are better served by materialized columns (`docs/notes/materialized-columns.md`), leaving MVs for genuine aggregations.
+Data movement is unified ClickHouse-style (`docs/notes/2026-07-06-pipelines.md`): tables have an **engine** — `parquet` (hypertable) or `kafka` (topic endpoint, no direct SELECT) — and a **pipeline** is a SQL query between two tables, executed batch-at-a-time through DataFusion. The four combinations: kafka→parquet = ingest (replaces route config; the transform, filtering, and partition derivation live in the SELECT), parquet→parquet = aggregation MV (change-feed cursor scoped to new parts), parquet→kafka = egress/CDC, kafka→kafka = out of scope. Delivery is a per-pipeline property: inbound stays exactly-once (catalog-anchored offsets, unchanged); outbound offers `at_most_once` / `at_least_once` (default) / `exactly_once` (Kafka transactional producer with a cursor record in the same transaction). Tenant and system pipelines share the machinery; per-row "MV" use cases belong to materialized columns (`docs/notes/2026-07-06-materialized-columns.md`), pipelines to transforms and genuine aggregations. Plan 8 implements the catalog entities plus the kafka→parquet and parquet→parquet variants; egress follows.
 
 ## Implementation status
 
@@ -120,8 +120,8 @@ bookkeeping), `ukiel-ingest` (Kafka → sorted ZSTD Parquet L0, exactly-once),
 `ukiel-query` (DataFusion providers, namespace isolation, HTTP SQL, NVMe
 read-through cache), `ukiel-compactor` (L0→L1 with placement policy, key
 deletion), `ukiel-gc` (reaper + orphan sweep), `ukiel-e2e` (scenario suite).
-Planned: `ukiel-expr` + column kinds (plan 7), demo MV (plan 8), upload
-intent (plan 9).
+Planned: `ukiel-expr` + column kinds (plan 7), engines + pipelines (plan 8,
+per `docs/notes/2026-07-06-pipelines.md`), upload intent (plan 9).
 
 Verification philosophy and the scenario catalog (S0–S8, invariants I1–I8)
 live in `docs/superpowers/specs/2026-07-05-ukiel-testing-design.md`; the e2e

@@ -72,7 +72,7 @@ shape it:
    optimistic concurrency — same machinery as compaction. Deliberately last.
 
 Column kinds (`default` / `materialized` / `alias` expressions) are documented
-in [materialized-columns.md](materialized-columns.md). Note that compactor
+in [2026-07-06-materialized-columns.md](2026-07-06-materialized-columns.md). Note that compactor
 reads are schema-adapting (old files contribute NULLs for later-added
 columns) and rewrites recompute write-time expressions — additive evolution
 plus organic backfill already works at the storage layer; only the

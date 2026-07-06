@@ -1151,7 +1151,7 @@ git commit -m "feat: alias columns computed at query time in the table provider"
 ### Task 6: Full verification + design note + docs
 
 **Files:**
-- Create: `docs/notes/materialized-columns.md`
+- Create: `docs/notes/2026-07-06-materialized-columns.md`
 - Modify: `README.md`
 - Modify: `docs/notes/schema-management.md`
 - Modify: `docs/superpowers/plans/2026-07-05-ukiel-v1-roadmap.md`
@@ -1161,7 +1161,7 @@ git commit -m "feat: alias columns computed at query time in the table provider"
 Run: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && make test`
 Expected: all crates green (Docker running). Optionally run `make e2e` (plain schemas are untouched, but it's cheap insurance).
 
-- [ ] **Step 2: Write `docs/notes/materialized-columns.md`**
+- [ ] **Step 2: Write `docs/notes/2026-07-06-materialized-columns.md`**
 
 ```markdown
 # Materialized columns, defaults & aliases
@@ -1222,7 +1222,7 @@ In the "Evolution" section, after the constraint list, add:
 
 ```markdown
 Column kinds (`default` / `materialized` / `alias` expressions) are documented
-in [materialized-columns.md](materialized-columns.md). Note that compactor
+in [2026-07-06-materialized-columns.md](2026-07-06-materialized-columns.md). Note that compactor
 reads are schema-adapting (old files contribute NULLs for later-added
 columns) and rewrites recompute write-time expressions — additive evolution
 plus organic backfill already works at the storage layer; only the
@@ -1237,7 +1237,7 @@ README crate list, after `ukiel-gc` (or `ukiel-compactor` if GC hasn't merged ye
 - `crates/ukiel-expr` — deterministic SQL expression engine for column
   specs: `default` / `materialized` (computed at write + recomputed on
   rewrites = organic backfill) / `alias` (computed at query time). See
-  `docs/notes/materialized-columns.md`.
+  `docs/notes/2026-07-06-materialized-columns.md`.
 ```
 
 Roadmap: set plan 7's status to **Executed**.

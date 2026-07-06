@@ -11,7 +11,7 @@ Spec: `docs/superpowers/specs/2026-07-05-ukiel-design.md`. V1 is split into sequ
 | 5 | ukiel-v1-e2e | `crates/ukiel-e2e` per the testing design doc (`specs/2026-07-05-ukiel-testing-design.md`): docker-compose stack, model-based oracle harness, scenarios S1–S5, then S6–S7 once plan 4 lands | **Executed** — compose stack + `Stack` harness + all scenarios: S0 smoke, S1 multi-tenant, S2 crash/resume, S3 freshness, S4 poison, S5 scale (1k tenants), S6 compaction-equivalence, S7 key-deletion. All `#[ignore]`d; `make e2e` runs them |
 | 6 | `2026-07-06-ukiel-v1-gc.md` | `ukiel-gc`: reap tombstoned parts' objects (grace period + worker-cursor fence for lagging feed consumers), sweep never-committed orphans (age-gated), purge stamps keep catalog rows for feed replay | **Executed** |
 | 7 | `2026-07-06-ukiel-matcols.md` | ClickHouse-style column kinds: `default` / `materialized` (computed at ingest, recomputed on rewrites = organic backfill; new `ukiel-expr` crate, deterministic expressions only) / `alias` (query-time, provider projection). Includes schema-adapting compactor reads (additive evolution groundwork) | **Executed** |
-| 8 | ukiel-v1-mv | Demo system MV (spec V1 item): change-feed cursor (from plan 4's `worker_cursors`) + SQL transform via DataFusion + append to a target logical table | Not written |
+| 8 | ukiel-pipelines | Table engines + pipelines per `docs/notes/2026-07-06-pipelines.md`: `stream_tables` (engine=kafka) + `pipelines` catalog entities; kafka→parquet pipeline replaces `TableRoute`; parquet→parquet pipeline = aggregation MV (subsumes the spec's demo-MV V1 item). Egress (parquet→kafka, delivery ladder) follows in a later plan | Not written |
 
 Cross-plan constraints (repeat in every plan's Global Constraints):
 
