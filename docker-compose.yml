@@ -38,7 +38,12 @@ services:
 
   minio:
     image: minio/minio
-    command: server /data --console-address ":9001"
+    # Create the `ukiel` bucket by pre-making its data directory (MinIO in
+    # filesystem mode treats a top-level dir under the data path as a bucket),
+    # then start the server. This avoids a separate one-shot init container,
+    # which `docker compose up --wait` can spuriously treat as a failed wait
+    # target when it exits before the long-running services report healthy.
+    entrypoint: sh -c 'mkdir -p /data/ukiel && exec minio server /data --console-address ":9001"'
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
@@ -53,17 +58,3 @@ services:
       interval: 3s
       timeout: 5s
       retries: 30
-
-  # One-shot: create the `ukiel` bucket, then exit 0. `--wait` treats a
-  # completed dependency as satisfied.
-  minio-init:
-    image: minio/mc
-    depends_on:
-      minio:
-        condition: service_healthy
-    entrypoint: >
-      sh -c "
-      mc alias set local http://minio:9000 minioadmin minioadmin &&
-      mc mb -p local/ukiel &&
-      echo 'bucket ukiel ready'
-      "
