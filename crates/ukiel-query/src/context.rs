@@ -31,7 +31,12 @@ pub async fn session_for_namespace(
         .map(|t| t.name)
         .collect();
 
-    let config = SessionConfig::new().with_default_catalog_and_schema("ukiel", "public");
+    // Enable `information_schema` so clients can introspect tables/columns over
+    // the SQL endpoint (`SELECT ... FROM information_schema.tables`), scoped to
+    // this namespace's registered schema provider.
+    let config = SessionConfig::new()
+        .with_default_catalog_and_schema("ukiel", "public")
+        .with_information_schema(true);
     let ctx = SessionContext::new_with_config(config);
     ctx.register_object_store(store_url, store);
 

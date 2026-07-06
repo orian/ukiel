@@ -426,3 +426,46 @@ async fn alias_columns_compute_at_query_time() {
         .unwrap();
     assert_eq!(all_i64(&batches, "ts"), vec![1]);
 }
+
+#[tokio::test]
+async fn information_schema_lists_namespace_tables_and_columns() {
+    let h = setup().await;
+    let store_url = url::Url::parse(STORE_URL).unwrap();
+    let ctx = ukiel_query::context::session_for_namespace(
+        &h.catalog,
+        NamespaceId(1),
+        h.store.clone(),
+        &store_url,
+    )
+    .await
+    .unwrap();
+
+    // Tables are introspectable over SQL (this is what an HTTP client would run).
+    let batches = ctx
+        .sql(
+            "SELECT table_name FROM information_schema.tables \
+              WHERE table_schema = 'public' ORDER BY table_name",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(all_strings(&batches, "table_name"), vec!["events"]);
+
+    // Columns too (name + type), via the provider's query schema.
+    let batches = ctx
+        .sql(
+            "SELECT column_name FROM information_schema.columns \
+              WHERE table_name = 'events' ORDER BY ordinal_position",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        all_strings(&batches, "column_name"),
+        vec!["tenant_id", "ts", "payload"]
+    );
+}
