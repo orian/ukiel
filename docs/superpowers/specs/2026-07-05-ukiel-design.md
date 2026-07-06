@@ -182,12 +182,13 @@ exactly-once, compaction equivalence under racing ingest, and key deletion.
   range.first`); a second writer on the same topic gets a loud
   `CatalogError::OffsetRace` and the commit rolls back instead of duplicating
   data. True horizontal ingest (partition-subset leases) remains future work.
-- **Unbounded event time** (issue 0004) — junk partitions from bad
-  timestamps plus the permanent `"unknown"` day. Plan 19 bounds event time
-  at ingest with **asymmetric** semantics: the future bound is hard
-  (garbage by definition), the past bound is a server default overridable
-  per table (`0` = unbounded) so customer migrations carrying decades-old
-  history are never silently dropped (see "Backfills & migrations").
+- **Unbounded event time** — *resolved (plan 19, issue 0004)*: ingest bounds
+  event time in `buffer_message` with **asymmetric** semantics — the future
+  bound is hard (garbage by definition), the past bound is a server default
+  (`max_event_age_days`) overridable per table (`0` = unbounded) so customer
+  migrations carrying decades-old history are never silently dropped (see
+  "Backfills & migrations"). Out-of-window rows are skipped like poison and the
+  permanent `"unknown"` day is gone.
 - **Level ladder & size-targeted placement** — designed, plan written and
   ready to execute (plan 17,
   `docs/superpowers/plans/2026-07-06-ukiel-lsm-hierarchy.md`): fanout ladder

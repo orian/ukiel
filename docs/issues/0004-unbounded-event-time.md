@@ -1,7 +1,7 @@
 # 0004 — Event time is unbounded: junk partitions and the "unknown" day
 
 - **Severity:** Low–Medium (data hygiene / partition pollution, no corruption)
-- **Status:** Open — fix planned: plan 19 (`docs/superpowers/plans/2026-07-06-ukiel-safety-rails.md`)
+- **Status:** Resolved (plan 19) — ingest applies an asymmetric event-time bound in `buffer_message` (`event_time_in_bounds`): out-of-window rows are skipped like poison (offsets still advance), the `"unknown"` day fallback is removed. Defaults: `max_event_age_days = 3650` (per-table overridable; `0` = unbounded for backfills), `max_event_future_secs = 3600`.
 - **Components:** `crates/ukiel-ingest`
 - **Found by:** design review, 2026-07-06
 
