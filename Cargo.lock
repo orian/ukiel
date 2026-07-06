@@ -4703,6 +4703,7 @@ name = "ukiel-ingest"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "bytes",
  "chrono",
  "futures",

@@ -27,23 +27,39 @@ impl Flusher {
     }
 
     /// Uploads every item, then commits all parts + offsets atomically.
-    /// If the commit fails, uploaded objects are orphaned in the store —
-    /// harmless (never referenced) and cleaned up by a later GC worker.
+    /// Every part's path is registered as upload intent BEFORE any upload, so a
+    /// crash between upload and commit leaves a discoverable orphan for GC
+    /// (never an untracked object). If the commit fails, uploaded objects are
+    /// orphaned in the store — harmless (never referenced) and reaped by GC.
     pub async fn flush(
         &self,
         hypertable: &Hypertable,
         items: Vec<FlushItem>,
         offsets: Vec<OffsetRange>,
     ) -> Result<CommitResult, IngestError> {
-        let mut parts = Vec::with_capacity(items.len());
-        for item in items {
-            let path_str = format!("ht/{}/L0/{}.parquet", hypertable.id, uuid::Uuid::new_v4());
+        // Assign every part's path up front and record upload intent BEFORE any
+        // upload, so a crash between upload and commit leaves a discoverable
+        // orphan for GC (never an untracked object).
+        let prepared: Vec<(String, FlushItem)> = items
+            .into_iter()
+            .map(|item| {
+                let path = format!("ht/{}/L0/{}.parquet", hypertable.id, uuid::Uuid::new_v4());
+                (path, item)
+            })
+            .collect();
+        let paths: Vec<String> = prepared.iter().map(|(p, _)| p.clone()).collect();
+        self.catalog
+            .register_pending_objects(hypertable.id, &paths)
+            .await?;
+
+        let mut parts = Vec::with_capacity(prepared.len());
+        for (path, item) in prepared {
             let size_bytes = item.part.bytes.len() as i64;
             self.store
-                .put(&Path::from(path_str.clone()), item.part.bytes.into())
+                .put(&Path::from(path.clone()), item.part.bytes.into())
                 .await?;
             parts.push(PartMeta {
-                path: path_str,
+                path,
                 partition_values: item.partition_values,
                 packing_key_min: item.part.key_min,
                 packing_key_max: item.part.key_max,
