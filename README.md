@@ -1,6 +1,12 @@
 Ukiel is a lake. Here, a data lake. In real world it's a lake in Olsztyn, Poland.
 
-The idea:
+# Genesis
+
+This is an experiment based on:
+
+1. My 1.5 year of running PB 
+
+# The idea:
 
 1. Using Apache DataFusion as query engine.
 2. Use Parquet as on disk data format.
@@ -41,7 +47,7 @@ plans: `docs/superpowers/plans/`, concept notes: `docs/notes/`
 - `crates/ukiel-expr` — deterministic SQL expression engine for column
   specs: `default` / `materialized` (computed at write + recomputed on
   rewrites = organic backfill) / `alias` (computed at query time). See
-  `docs/notes/materialized-columns.md`.
+  `docs/notes/2026-07-06-materialized-columns.md`.
 - `crates/ukiel-gc` — object garbage collection: reaps tombstoned parts'
   objects after a grace period (fenced by worker cursors so lagging feed
   consumers are safe) and sweeps never-committed orphans left by crashed or
