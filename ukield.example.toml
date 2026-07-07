@@ -18,6 +18,8 @@ allow_http = true
 
 [query]
 listen = "127.0.0.1:8080"
+# Also serves GET /metrics (Prometheus) and GET /readyz on this listener.
+# A process without the query role emits metrics but has no endpoint (P2).
 cache_dir = "" # non-empty = local read-through cache directory
 statement_timeout_secs = 300 # must be < gc.tombstone_grace_secs (issue 0002)
 

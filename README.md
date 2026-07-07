@@ -102,7 +102,11 @@ endpoint: `SELECT table_name FROM information_schema.tables`.
   and scenario catalog: `docs/superpowers/specs/2026-07-05-ukiel-testing-design.md`.
 - `crates/ukield` — the all-in-one server binary: ingest + query + compactor
   + GC in one process (per-role deployment via `roles = [...]`), idempotent
-  table bootstrap from TOML config, graceful shutdown.
+  table bootstrap from TOML config, graceful shutdown. Exposes `GET /metrics`
+  (Prometheus) and `GET /readyz` (catalog + object-store reachability) on the
+  query listener. **P1 limitation:** a process running *without* the query role
+  emits metrics but has no listener to serve them — a standalone metrics port
+  is monitoring phase P2.
 
 Tests: `cargo test` (integration tests spin up Postgres/Kafka via
 testcontainers — Docker must be running). End-to-end: `make e2e`.

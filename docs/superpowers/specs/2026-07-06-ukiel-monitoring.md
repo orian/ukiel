@@ -132,10 +132,19 @@ of query nodes; workers don't need readiness (they self-heal by replanning).
 
 ## Implementation phases
 
-- **P1 (roadmap row 20, `ukiel-metrics-p1`):** `metrics` facade in the five worker crates —
-  the stats structs already returned by `run_once`/flush paths become
-  counters/histograms at their call sites; Prometheus exporter + `/metrics`
-  + `/readyz` in `ukield`; cache/metadata-cache counters exposed.
+- **P1 (roadmap row 20, `ukiel-metrics-p1`) — DONE:** `metrics` facade in the
+  worker crates — the stats structs already returned by `run_once`/flush paths
+  became counters/histograms at their call sites; `metrics-exporter-prometheus`
+  + `/metrics` + `/readyz` in `ukield` (histograms use explicit buckets; a 5s
+  `run_upkeep` tick drains them); file-cache hit/miss counters. **Freshness was
+  pulled into P1** as the timestamp gauge `ingest_last_flush_event_ts_seconds`
+  (the consumer already holds each row's `ts`, so no collector was needed).
+  Deferred (noted per-metric): `catalog_commit_conflicts_total{worker}`, the
+  metadata-cache tier of `cache_*` (plan 13), `query_parts_scanned/pruned` +
+  `query_objectstore_requests_total` (plan 11), `ingest_backpressure_deferrals_total`
+  (plan 18), `compactor_backlog_groups`/`*_unfinalized_*` (plan 17),
+  `ukield_worker_restarts_total` (needs a restart supervisor), and a standalone
+  `/metrics` listener for query-role-less processes.
 - **P2:** the periodic collector gauges that need queries (live-part counts,
   feed lag, pending/tombstone backlogs, Kafka high-watermark lag) — a small
   ticker task in `ukield` reusing existing catalog APIs.
