@@ -20,6 +20,7 @@ url = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
+metrics = { workspace = true }
 
 [dev-dependencies]
 ukiel-ingest = { workspace = true }

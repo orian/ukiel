@@ -10,6 +10,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::execution::context::SQLOptions;
+use metrics::{counter, histogram};
 use object_store::ObjectStore;
 use serde_json::json;
 use ukiel_catalog::PostgresCatalog;
@@ -50,6 +51,27 @@ fn bad_request<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
     (StatusCode::BAD_REQUEST, e.to_string())
 }
 
+/// Coarse query shape for the `class` label — never the SQL text (metrics P1).
+pub(crate) fn query_class(sql: &str) -> &'static str {
+    let lower = sql.to_ascii_lowercase();
+    const AGG: [&str; 5] = ["count(", "sum(", "avg(", "min(", "max("];
+    if lower.contains("information_schema") {
+        "introspection"
+    } else if lower.contains(" group by ") || AGG.iter().any(|t| lower.contains(t)) {
+        "aggregate"
+    } else {
+        "select"
+    }
+}
+
+fn format_label(format: &ResultFormat) -> &'static str {
+    match format {
+        ResultFormat::Rows => "rows",
+        ResultFormat::Columns => "columns",
+        ResultFormat::Arrow => "arrow",
+    }
+}
+
 /// Errors are always JSON (`{"error": "..."}`), regardless of the requested
 /// result format — a client never has to sniff whether an error body is Arrow.
 async fn run_query(
@@ -59,7 +81,13 @@ async fn run_query(
 ) -> Response {
     match run_query_inner(state, headers, req).await {
         Ok(resp) => resp,
-        Err((status, msg)) => (status, Json(json!({ "error": msg }))).into_response(),
+        Err((status, msg)) => {
+            // Success requests are counted in run_query_inner once the format is
+            // known; errors count here with an "unknown" format (metrics P1).
+            counter!("query_requests_total", "format" => "unknown", "status" => "error")
+                .increment(1);
+            (status, Json(json!({ "error": msg }))).into_response()
+        }
     }
 }
 
@@ -71,6 +99,7 @@ async fn run_query_inner(
     // Issue 0002: planning + execution run under one statement timeout, so a
     // query can never outlive the GC tombstone grace and read reaped objects.
     // Result formatting stays outside — it's cheap and already has the data.
+    let started = std::time::Instant::now();
     let timeout = state.statement_timeout;
     let (planned_schema, batches): (SchemaRef, Vec<_>) = tokio::time::timeout(timeout, async {
         let ctx = session_for_namespace(
@@ -81,6 +110,7 @@ async fn run_query_inner(
         )
         .await
         .map_err(bad_request)?;
+        counter!("query_sessions_built_total").increment(1);
 
         let options = SQLOptions::new()
             .with_allow_ddl(false)
@@ -99,12 +129,14 @@ async fn run_query_inner(
     })
     .await
     .map_err(|_| {
+        counter!("query_timeouts_total").increment(1);
         (
             StatusCode::REQUEST_TIMEOUT,
             format!("query exceeded statement timeout ({}s)", timeout.as_secs()),
         )
     })??;
 
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     let schema = batches
         .first()
         .map(|b| b.schema())
@@ -125,6 +157,7 @@ async fn run_query_inner(
         }
     });
 
+    let fmt_label = format_label(&format);
     let resp = match format {
         ResultFormat::Rows => {
             Json(results::to_rows(&batches, &schema).map_err(bad_request)?).into_response()
@@ -137,5 +170,32 @@ async fn run_query_inner(
             ([(header::CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)], bytes).into_response()
         }
     };
+
+    // Success metrics emitted only once the response is fully built, so a
+    // formatting failure counts as an error (in `run_query`), not a double
+    // count (metrics P1).
+    histogram!("query_duration_seconds", "class" => query_class(&req.sql))
+        .record(started.elapsed().as_secs_f64());
+    histogram!("query_rows_returned").record(total_rows as f64);
+    counter!("query_requests_total", "format" => fmt_label, "status" => "ok").increment(1);
     Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::query_class;
+
+    #[test]
+    fn query_class_coarse_shapes() {
+        assert_eq!(query_class("SELECT * FROM events"), "select");
+        assert_eq!(
+            query_class("select count(*) from events group by tenant_id"),
+            "aggregate"
+        );
+        assert_eq!(query_class("SELECT sum(amount) FROM events"), "aggregate");
+        assert_eq!(
+            query_class("SELECT table_name FROM information_schema.tables"),
+            "introspection"
+        );
+    }
 }

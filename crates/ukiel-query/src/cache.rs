@@ -37,8 +37,10 @@ impl CachingObjectStore {
     async fn ensure_cached(&self, location: &Path) -> Result<PathBuf> {
         let path = self.cache_path(location);
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            metrics::counter!("cache_hits_total", "tier" => "file").increment(1);
             return Ok(path);
         }
+        metrics::counter!("cache_misses_total", "tier" => "file").increment(1);
         let bytes = self.inner.get(location).await?.bytes().await?;
         let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
         tokio::fs::write(&tmp, &bytes).await.map_err(io_err)?;

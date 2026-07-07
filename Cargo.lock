@@ -4858,6 +4858,7 @@ dependencies = [
  "chrono",
  "datafusion",
  "futures",
+ "metrics",
  "object_store",
  "reqwest",
  "serde",
