@@ -163,28 +163,27 @@ impl Compactor {
     pub async fn finalize_once(&self) -> Result<usize, CompactorError> {
         let mut finalized = 0;
         for hypertable in self.catalog.list_hypertables().await? {
-            let live = self.catalog.live_parts(hypertable.id, None).await?;
-            let mut partitions: HashMap<String, Vec<Part>> = HashMap::new();
-            for part in live {
-                partitions
-                    .entry(part.meta.partition_values.to_string())
-                    .or_default()
-                    .push(part);
-            }
-            for (_, parts) in partitions {
-                let runs: HashSet<i64> = parts.iter().map(|p| p.created_by_commit.0).collect();
-                if runs.len() < 2 {
-                    continue; // already one key-disjoint run: final
-                }
+            // Aggregated in SQL: only partitions with >1 live run come back,
+            // as bare partition values — no part rows cross the wire here.
+            for partition in self.catalog.finalize_candidates(hypertable.id).await? {
                 let quiet = self
                     .catalog
                     .partition_l0_quiet_since(
                         hypertable.id,
-                        &parts[0].meta.partition_values,
+                        &partition,
                         self.config.finalize_after_secs as f64,
                     )
                     .await?;
                 if !quiet {
+                    continue;
+                }
+                let parts = self
+                    .catalog
+                    .live_partition_parts(hypertable.id, &partition)
+                    .await?;
+                // Raced since the candidate query: recheck before merging.
+                let runs: HashSet<i64> = parts.iter().map(|p| p.created_by_commit.0).collect();
+                if runs.len() < 2 {
                     continue;
                 }
                 let top = parts.iter().map(|p| p.meta.level).max().unwrap_or(0);
