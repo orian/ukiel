@@ -91,9 +91,9 @@ impl TableProvider for UkielTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         // Catalog-pruned file list: only parts whose packing-key range
@@ -137,7 +137,49 @@ impl TableProvider for UkielTableProvider {
         scan_projection.dedup();
         let scanned_schema = Arc::new(self.physical_schema.project(&scan_projection)?);
 
-        let source = Arc::new(ParquetSource::new(self.physical_schema.clone()));
+        // Pushdown predicate for the Parquet reader: isolation AND every user
+        // filter that converts cleanly. Built against the FILE schema
+        // (physical_schema) — pushdown may reference unprojected columns.
+        // Best-effort by design: anything skipped is re-applied by DataFusion
+        // above (Inexact), and the FilterExec below remains the security
+        // boundary regardless.
+        let file_isolation = binary(
+            col(&self.hypertable.packing_key, &self.physical_schema)?,
+            Operator::Eq,
+            lit(ScalarValue::Int64(Some(self.packing_key_value))),
+            &self.physical_schema,
+        )?;
+        let physical_names: std::collections::HashSet<&str> = self
+            .physical_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        let df_schema =
+            datafusion::common::DFSchema::try_from(self.physical_schema.as_ref().clone())?;
+        let mut pushdown = file_isolation;
+        for filter in filters {
+            let refs = filter.column_refs();
+            if !refs
+                .iter()
+                .all(|c| physical_names.contains(c.name.as_str()))
+            {
+                continue; // references an alias or unknown column: not pushable
+            }
+            match state.create_physical_expr(filter.clone(), &df_schema) {
+                Ok(expr) => {
+                    pushdown = binary(pushdown, Operator::And, expr, &self.physical_schema)?;
+                }
+                Err(_) => continue, // unconvertible filter: DataFusion re-applies it
+            }
+        }
+
+        let source = Arc::new(
+            ParquetSource::new(self.physical_schema.clone())
+                .with_predicate(pushdown)
+                .with_pushdown_filters(true)
+                .with_reorder_filters(true),
+        );
         let config = FileScanConfigBuilder::new(self.store_url.clone(), source)
             .with_file_group(FileGroup::new(files))
             .with_projection_indices(Some(scan_projection))?

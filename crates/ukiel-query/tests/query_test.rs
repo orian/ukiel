@@ -532,3 +532,122 @@ async fn narrow_projection_and_alias_on_unprojected_column() {
         .unwrap();
     assert_eq!(all_i64(&batches, "n"), vec![2]);
 }
+
+#[tokio::test]
+async fn pushdown_prunes_row_groups_in_packed_files() {
+    use datafusion::arrow::array::{Int64Array, StringArray};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use object_store::ObjectStoreExt;
+    use parquet::arrow::ArrowWriter;
+    use parquet::basic::{Compression, ZstdLevel};
+    use parquet::file::properties::WriterProperties;
+
+    let h = setup().await;
+    // Two tenants, 4 rows each, one row group each.
+    let schema = std::sync::Arc::new(
+        ukiel_core::arrow_schema_from_json(&json!({"fields": [
+            {"name": "tenant_id", "type": "int64"},
+            {"name": "ts", "type": "timestamp_ms"},
+            {"name": "payload", "type": "utf8"}
+        ]}))
+        .unwrap(),
+    );
+    let ht = h
+        .catalog
+        .create_hypertable(
+            "rg",
+            &json!({"fields": [
+                {"name": "tenant_id", "type": "int64"},
+                {"name": "ts", "type": "timestamp_ms"},
+                {"name": "payload", "type": "utf8"}
+            ]}),
+            &json!({"columns": []}),
+            &["tenant_id".to_string(), "ts".to_string()],
+            "tenant_id",
+        )
+        .await
+        .unwrap();
+    h.catalog
+        .create_logical_table(NamespaceId(1), "rg", ht)
+        .await
+        .unwrap();
+
+    let tenants = Int64Array::from(vec![1, 1, 1, 1, 2, 2, 2, 2]);
+    let ts = Int64Array::from(vec![1, 2, 3, 4, 1, 2, 3, 4]);
+    let payload = StringArray::from(vec!["a", "b", "c", "d", "e", "f", "g", "h"]);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            std::sync::Arc::new(tenants),
+            std::sync::Arc::new(ts),
+            std::sync::Arc::new(payload),
+        ],
+    )
+    .unwrap();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .set_max_row_group_row_count(Some(4))
+        .build();
+    let mut bytes = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let path = format!("ht/{ht}/L1/two-groups.parquet");
+    let size = bytes.len() as i64;
+    h.store
+        .put(&Path::from(path.clone()), bytes.into())
+        .await
+        .unwrap();
+    h.catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![PartMeta {
+                    path,
+                    partition_values: json!({}),
+                    packing_key_min: 1,
+                    packing_key_max: 2,
+                    row_count: 8,
+                    size_bytes: size,
+                    level: 1,
+                    column_stats: None,
+                }],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let store_url = url::Url::parse(STORE_URL).unwrap();
+    let ctx = session_for_namespace(&h.catalog, NamespaceId(1), h.store.clone(), &store_url)
+        .await
+        .unwrap();
+
+    // Correctness: namespace 1 sees exactly its 4 rows.
+    let batches = ctx
+        .sql("SELECT payload FROM rg ORDER BY ts")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(all_strings(&batches, "payload"), vec!["a", "b", "c", "d"]);
+
+    // Pruning: tenant 2's row group is skipped by statistics.
+    let batches = ctx
+        .sql("EXPLAIN ANALYZE SELECT count(*) FROM rg")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let analyzed = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string();
+    // This DataFusion version reports "N total → M matched"; 2 groups, 1
+    // matched means tenant 2's row group was pruned by statistics.
+    assert!(
+        analyzed.contains("row_groups_pruned_statistics=2 total → 1 matched"),
+        "expected one row group pruned; explain analyze was:\n{analyzed}"
+    );
+}
