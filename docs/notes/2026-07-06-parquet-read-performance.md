@@ -10,7 +10,12 @@ only ZSTD (no row-group sizing, no bloom filters, no declared sort), and
 
 Ordered by expected impact. Status updated as plans land.
 
-## Tier 1 — make DataFusion do what it already can *(plan 11)*
+## Tier 1 — make DataFusion do what it already can *(plan 11 — executed)*
+
+Status: #0 (harness), #1 (predicate pushdown), #2 (projection pushdown) shipped
+and measured. #3 partial: writer `sorting_columns` + declared scan ordering
+shipped, but sort elimination is blocked on DataFusion 54 (see the follow-up
+below). The reusable perf harness lives at `crates/ukiel-query/tests/perf_smoke.rs`.
 
 | # | Change | Why it wins |
 |---|---|---|
@@ -98,6 +103,12 @@ to record another fixture in its own rows.
 
 | Scenario | Baseline | After plan 11 | After stats pruning |
 |---|---|---|---|
-| `wide/selective_count`: 1 tenant of 100 in packed file, `count(*)` | 16.0 ms | | |
-| `wide/narrow_projection`: 1 of 8 columns | 13.6 ms | | |
-| `wide/order_by_limit`: `ORDER BY ts LIMIT 100` | 16.1 ms | | |
+| `wide/selective_count`: 1 tenant of 100 in packed file, `count(*)` | 16.0 ms | 13.4 ms | |
+| `wide/narrow_projection`: 1 of 8 columns | 13.6 ms | 8.9 ms | |
+| `wide/order_by_limit`: `ORDER BY ts LIMIT 100` | 16.1 ms | 11.0 ms | |
+
+Plan 11 wins on the micro fixture: row-group pruning + predicate pushdown
+(`selective_count`), column pruning (`narrow_projection`, the largest relative
+drop), and pushdown/limit (`order_by_limit`). `order_by_limit` still plans a
+`SortExec` — see the sort-elimination follow-up above; the gain here is from
+pruning + projection, not sort elimination.
