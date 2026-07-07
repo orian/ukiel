@@ -27,3 +27,4 @@ ukiel-ingest = { workspace = true }
 testcontainers-modules = { workspace = true }
 tempfile = { workspace = true }
 reqwest = { workspace = true }
+parquet = { workspace = true }

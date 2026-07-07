@@ -4940,6 +4940,7 @@ dependencies = [
  "futures",
  "metrics",
  "object_store",
+ "parquet",
  "reqwest",
  "serde",
  "serde_json",

@@ -78,8 +78,13 @@ Perf smoke numbers get appended here after each plan.
 tiers beyond this micro harness, and results discipline:
 `docs/superpowers/specs/2026-07-06-ukiel-performance-testing.md`.)
 
+Dataset: `wide` (100 tenants × 1000 rows, one packed L1 file, one row group
+per tenant, 8 utf8 columns); median of 10, warm, single process. The harness
+(`tests/perf_smoke.rs`) is dataset-parametric — add a `Dataset` to `datasets()`
+to record another fixture in its own rows.
+
 | Scenario | Baseline | After plan 11 | After stats pruning |
 |---|---|---|---|
-| selective: 1 tenant of 100 in packed file, `count(*)` | _TBD_ | | |
-| narrow projection: 1 of 8 columns | _TBD_ | | |
-| `ORDER BY ts LIMIT 100` | _TBD_ | | |
+| `wide/selective_count`: 1 tenant of 100 in packed file, `count(*)` | 16.0 ms | | |
+| `wide/narrow_projection`: 1 of 8 columns | 13.6 ms | | |
+| `wide/order_by_limit`: `ORDER BY ts LIMIT 100` | 16.1 ms | | |
