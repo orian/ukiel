@@ -104,14 +104,17 @@ async fn compaction_preserves_results_while_ingest_continues() {
         );
     }
 
-    // Compaction actually happened: L1 files exist and the single-partition L0
-    // pile collapsed (drain merges any group of >= 2, leaving at most a lone
-    // trailing L0 that never found a pair).
-    let l1 = stack.count_parts_at_level(table.hypertable_id, 1).await;
+    // Compaction actually happened: the L0 pile collapsed into merged output
+    // above level 0. The resting level is emergent under the fanout ladder
+    // (plan 17) — a hot partition climbs L0 -> L1 -> L2 -> … as passes cascade,
+    // so we assert on "merged output exists", not on a specific level.
+    let total = stack.live_part_count(table.hypertable_id, None).await;
     let l0_after = stack.count_parts_at_level(table.hypertable_id, 0).await;
+    let merged_above_l0 = total - l0_after;
     assert!(
-        l1 >= 1,
-        "compaction should have produced at least one L1 file"
+        merged_above_l0 >= 1,
+        "compaction should have produced at least one merged (L1+) file; \
+         levels: total={total}, l0={l0_after}"
     );
     assert!(
         l0_after <= 1,
