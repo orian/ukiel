@@ -77,6 +77,9 @@ impl Gc {
             self.reap(&hypertable, &mut stats).await?;
             self.sweep(&hypertable, &mut stats).await?;
         }
+        // Metrics P1: normal-operation counters.
+        metrics::counter!("gc_reaped_parts_total").increment(stats.reaped_parts as u64);
+        metrics::counter!("gc_swept_orphans_total").increment(stats.swept_orphans as u64);
         Ok(stats)
     }
 
@@ -159,6 +162,9 @@ impl Gc {
                 }
             }
         }
+        // Metrics P1: should stay ~zero forever — nonzero means a writer
+        // uploaded without registering intent (plan-9 invariant violated).
+        metrics::counter!("gc_reconcile_orphans_total").increment(stats.reconciled_orphans as u64);
         Ok(stats)
     }
 

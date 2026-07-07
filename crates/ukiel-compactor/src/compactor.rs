@@ -14,6 +14,15 @@ use ukiel_core::{CommitOp, Hypertable, Part, PartMeta, Placement};
 use crate::CompactorError;
 use crate::rewrite;
 
+/// Seconds since the Unix epoch for liveness gauges (metrics P1). The
+/// workflow-script `Date` ban does not apply to crate runtime code.
+fn unix_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
 #[derive(Debug, Clone)]
 pub struct CompactorConfig {
     /// Cursor identity in `worker_cursors`.
@@ -86,11 +95,29 @@ impl Compactor {
 
     /// One idempotent pass over every hypertable.
     pub async fn run_once(&self) -> Result<CompactionStats, CompactorError> {
+        let started = std::time::Instant::now();
         let mut stats = CompactionStats::default();
+        let mut result = Ok(());
         for hypertable in self.catalog.list_hypertables().await? {
-            self.compact_hypertable(&hypertable, &mut stats).await?;
+            if let Err(e) = self.compact_hypertable(&hypertable, &mut stats).await {
+                result = Err(e);
+                break;
+            }
         }
-        Ok(stats)
+
+        // Metrics P1: pass-level throughput/latency and a liveness timestamp
+        // that survives error-looping (only bumped on a clean pass).
+        metrics::histogram!("compactor_pass_duration_seconds")
+            .record(started.elapsed().as_secs_f64());
+        metrics::counter!("compactor_merges_total").increment(stats.merged_groups as u64);
+        metrics::counter!("compactor_parts_in_total").increment(stats.parts_in as u64);
+        metrics::counter!("compactor_parts_out_total").increment(stats.parts_out as u64);
+        metrics::counter!("compactor_conflicts_total").increment(stats.conflicts as u64);
+        if result.is_ok() {
+            metrics::gauge!("compactor_last_success_timestamp").set(unix_secs());
+        }
+
+        result.map(|()| stats)
     }
 
     async fn compact_hypertable(

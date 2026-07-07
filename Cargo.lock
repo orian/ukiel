@@ -4746,6 +4746,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
+ "metrics",
  "object_store",
  "parquet",
  "serde_json",
@@ -4810,6 +4811,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "futures",
+ "metrics",
  "object_store",
  "serde_json",
  "testcontainers-modules",
