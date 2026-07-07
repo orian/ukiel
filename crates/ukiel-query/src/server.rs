@@ -11,7 +11,7 @@ use axum::{Json, Router};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::execution::context::SQLOptions;
 use metrics::{counter, histogram};
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use serde_json::json;
 use ukiel_catalog::PostgresCatalog;
 use ukiel_core::NamespaceId;
@@ -44,7 +44,32 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/query", post(run_query))
         .route("/healthz", get(|| async { "ok" }))
+        .route("/readyz", get(readyz))
         .with_state(state)
+}
+
+/// Readiness for load-balancer rotation of query nodes: the catalog answers a
+/// `SELECT 1` and the object store is reachable. `NotFound` on the sentinel is
+/// still "reachable" (auth + network OK); only a transport error fails.
+async fn readyz(State(state): State<AppState>) -> Response {
+    if let Err(e) = state.catalog.ping().await {
+        return not_ready(format!("catalog: {e}"));
+    }
+    let sentinel = object_store::path::Path::from("__ukiel_readyz_sentinel");
+    match state.store.head(&sentinel).await {
+        Ok(_) | Err(object_store::Error::NotFound { .. }) => {
+            (StatusCode::OK, "ready").into_response()
+        }
+        Err(e) => not_ready(format!("object_store: {e}")),
+    }
+}
+
+fn not_ready(msg: String) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": msg })),
+    )
+        .into_response()
 }
 
 fn bad_request<E: std::fmt::Display>(e: E) -> (StatusCode, String) {

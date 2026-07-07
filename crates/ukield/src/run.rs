@@ -19,6 +19,23 @@ use ukiel_query::server::{AppState, router};
 
 use crate::config::{ObjectStoreConfig, Role, UkieldConfig};
 
+/// Sets `ukield_worker_up{role}` to 1 while alive and 0 on drop — so any exit
+/// path (clean, error, or cancellation) flips the gauge (metrics P1).
+struct WorkerUp(&'static str);
+
+impl WorkerUp {
+    fn new(role: &'static str) -> Self {
+        metrics::gauge!("ukield_worker_up", "role" => role).set(1.0);
+        WorkerUp(role)
+    }
+}
+
+impl Drop for WorkerUp {
+    fn drop(&mut self) {
+        metrics::gauge!("ukield_worker_up", "role" => self.0).set(0.0);
+    }
+}
+
 pub fn build_store(cfg: &ObjectStoreConfig) -> anyhow::Result<(Arc<dyn ObjectStore>, url::Url)> {
     match cfg.kind.as_str() {
         "memory" => Ok((Arc::new(InMemory::new()), url::Url::parse("mem://ukiel/")?)),
@@ -51,6 +68,10 @@ pub async fn run_with_bound_addr(
     bound: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
 ) -> anyhow::Result<()> {
     crate::config::validate(&cfg)?;
+
+    // Install the process-wide Prometheus recorder before any worker emits;
+    // idempotent so repeated calls (tests) don't double-install (metrics P1).
+    let prom = crate::metrics::handle();
 
     let catalog = PostgresCatalog::connect(&cfg.catalog.url)
         .await
@@ -101,6 +122,7 @@ pub async fn run_with_bound_addr(
             );
             let token = shutdown.clone();
             tasks.spawn(async move {
+                let _up = WorkerUp::new("ingest");
                 worker.run(token).await.context("ingest worker")?;
                 Ok("ingest")
             });
@@ -122,9 +144,11 @@ pub async fn run_with_bound_addr(
         if let Some(tx) = bound {
             let _ = tx.send(addr);
         }
+        let served = crate::metrics::route(router(state), prom.clone());
         let token = shutdown.clone();
         tasks.spawn(async move {
-            axum::serve(listener, router(state))
+            let _up = WorkerUp::new("query");
+            axum::serve(listener, served)
                 .with_graceful_shutdown(async move { token.cancelled().await })
                 .await
                 .context("query server")?;
@@ -144,6 +168,7 @@ pub async fn run_with_bound_addr(
         );
         let token = shutdown.clone();
         tasks.spawn(async move {
+            let _up = WorkerUp::new("compactor");
             compactor.run(token).await.context("compactor")?;
             Ok("compactor")
         });
@@ -162,8 +187,26 @@ pub async fn run_with_bound_addr(
         );
         let token = shutdown.clone();
         tasks.spawn(async move {
+            let _up = WorkerUp::new("gc");
             gc.run(token).await.context("gc")?;
             Ok("gc")
+        });
+    }
+
+    // Drain histogram buffers between scrapes; without upkeep they grow
+    // unboundedly (metrics P1). Runs regardless of the query role.
+    {
+        let prom = prom.clone();
+        let token = shutdown.clone();
+        tasks.spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => return Ok("metrics-upkeep"),
+                    _ = tick.tick() => prom.run_upkeep(),
+                }
+            }
         });
     }
 

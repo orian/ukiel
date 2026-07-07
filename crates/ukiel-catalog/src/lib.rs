@@ -40,4 +40,11 @@ impl PostgresCatalog {
     pub fn pool_for_tests(&self) -> &sqlx::PgPool {
         &self.pool
     }
+
+    /// Liveness probe for `/readyz`: a trivial `SELECT 1` proving the pool can
+    /// reach Postgres.
+    pub async fn ping(&self) -> Result<(), CatalogError> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
 }

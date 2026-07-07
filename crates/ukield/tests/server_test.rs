@@ -111,6 +111,34 @@ async fn full_stack_ingest_to_query_over_http() {
     }
     assert_eq!(rows, 5, "all produced rows must become queryable");
 
+    // Readiness probe: catalog + object store reachable.
+    let ready = client.get(format!("{base}/readyz")).send().await.unwrap();
+    assert_eq!(ready.status(), 200);
+
+    // Prometheus endpoint: the produce+query round trip has exercised every
+    // async emission site (metrics P1) — this is their end-to-end proof.
+    let metrics = client.get(format!("{base}/metrics")).send().await.unwrap();
+    assert_eq!(metrics.status(), 200);
+    let body = metrics.text().await.unwrap();
+    for family in [
+        "ingest_flush_duration_seconds",
+        "ingest_last_flush_event_ts_seconds",
+        "ingest_rows_total",
+        "catalog_commit_duration_seconds",
+        "query_requests_total",
+        "ukield_worker_up",
+    ] {
+        assert!(
+            body.contains(family),
+            "missing metric family {family}:\n{body}"
+        );
+    }
+    // Duration histograms render as buckets (aggregatable), not summary quantiles.
+    assert!(
+        body.contains("ingest_flush_duration_seconds_bucket"),
+        "duration metric must use buckets, not summary quantiles"
+    );
+
     // Graceful shutdown: cancel and the run future returns Ok.
     shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(30), server)
