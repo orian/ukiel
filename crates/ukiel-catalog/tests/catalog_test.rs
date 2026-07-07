@@ -800,3 +800,88 @@ async fn pending_objects_track_orphans_and_clear_on_commit() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn placement_round_trips_all_variants() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+
+    for placement in [
+        ukiel_core::Placement::SizeTargeted(268_435_456),
+        ukiel_core::Placement::Separated,
+        ukiel_core::Placement::Packed,
+    ] {
+        catalog.set_placement(ht, placement).await.unwrap();
+        let hypertable = catalog.get_hypertable_by_id(ht).await.unwrap();
+        assert_eq!(hypertable.placement, placement);
+    }
+}
+
+/// One `CommitOp::Add` of a single L0 part in the given partition.
+async fn add_l0_part(
+    catalog: &ukiel_catalog::PostgresCatalog,
+    ht: HypertableId,
+    partition: &serde_json::Value,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![PartMeta {
+                    path: format!("l0-{n}.parquet"),
+                    partition_values: partition.clone(),
+                    packing_key_min: 1,
+                    packing_key_max: 1,
+                    row_count: 1,
+                    size_bytes: 1,
+                    level: 0,
+                    column_stats: None,
+                }],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn partition_l0_quiet_since_tracks_l0_commits() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let partition = json!({ "day": "2026-07-01" });
+
+    // No L0 parts ever: quiet at any window.
+    assert!(
+        catalog
+            .partition_l0_quiet_since(ht, &partition, 3600.0)
+            .await
+            .unwrap()
+    );
+
+    add_l0_part(&catalog, ht, &partition).await;
+
+    // Fresh L0: not quiet for a 1h window, quiet for a 0s window.
+    assert!(
+        !catalog
+            .partition_l0_quiet_since(ht, &partition, 3600.0)
+            .await
+            .unwrap()
+    );
+    assert!(
+        catalog
+            .partition_l0_quiet_since(ht, &partition, 0.0)
+            .await
+            .unwrap()
+    );
+
+    // A different partition is unaffected.
+    assert!(
+        catalog
+            .partition_l0_quiet_since(ht, &json!({ "day": "2026-07-02" }), 3600.0)
+            .await
+            .unwrap()
+    );
+}

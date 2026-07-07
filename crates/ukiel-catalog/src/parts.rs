@@ -61,4 +61,29 @@ impl PostgresCatalog {
             .await?;
         Ok(rows.into_iter().map(Part::from).collect())
     }
+
+    /// True iff no L0 part was committed to this partition within the last
+    /// `quiet_secs` (rows are never deleted, so tombstoned/purged L0 parts
+    /// still count as arrivals). Drives cold-partition finalization.
+    pub async fn partition_l0_quiet_since(
+        &self,
+        hypertable_id: HypertableId,
+        partition_values: &serde_json::Value,
+        quiet_secs: f64,
+    ) -> Result<bool, CatalogError> {
+        let quiet: bool = sqlx::query_scalar(
+            "SELECT coalesce(
+                 max(c.created_at) < now() - make_interval(secs => $3),
+                 true)
+             FROM parts p JOIN commits c ON c.id = p.created_by_commit
+             WHERE p.hypertable_id = $1 AND p.partition_values = $2
+               AND p.level = 0",
+        )
+        .bind(hypertable_id.0)
+        .bind(partition_values)
+        .bind(quiet_secs)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(quiet)
+    }
 }

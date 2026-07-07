@@ -3,6 +3,18 @@ use ukiel_core::{Hypertable, HypertableId, LogicalTable, LogicalTableId, Namespa
 
 use crate::{CatalogError, PostgresCatalog};
 
+fn hypertable_from_row(row: &sqlx::postgres::PgRow) -> Hypertable {
+    Hypertable {
+        id: HypertableId(row.get("id")),
+        name: row.get("name"),
+        table_schema: row.get("table_schema"),
+        partition_spec: row.get("partition_spec"),
+        sort_key: row.get("sort_key"),
+        packing_key: row.get("packing_key"),
+        placement: Placement::from_db(row.get("target_file_bytes")),
+    }
+}
+
 impl PostgresCatalog {
     pub async fn create_hypertable(
         &self,
@@ -28,7 +40,7 @@ impl PostgresCatalog {
 
     pub async fn get_hypertable(&self, name: &str) -> Result<Hypertable, CatalogError> {
         let row = sqlx::query(
-            "SELECT id, name, table_schema, partition_spec, sort_key, packing_key, placement
+            "SELECT id, name, table_schema, partition_spec, sort_key, packing_key, target_file_bytes
              FROM hypertables WHERE name = $1",
         )
         .bind(name)
@@ -36,18 +48,7 @@ impl PostgresCatalog {
         .await?
         .ok_or_else(|| CatalogError::NotFound(format!("hypertable '{name}'")))?;
 
-        Ok(Hypertable {
-            id: HypertableId(row.get("id")),
-            name: row.get("name"),
-            table_schema: row.get("table_schema"),
-            partition_spec: row.get("partition_spec"),
-            sort_key: row.get("sort_key"),
-            packing_key: row.get("packing_key"),
-            placement: match row.get::<String, _>("placement").as_str() {
-                "separated" => Placement::Separated,
-                _ => Placement::Packed,
-            },
-        })
+        Ok(hypertable_from_row(&row))
     }
 
     pub async fn create_logical_table(
@@ -98,7 +99,7 @@ impl PostgresCatalog {
 
     pub async fn get_hypertable_by_id(&self, id: HypertableId) -> Result<Hypertable, CatalogError> {
         let row = sqlx::query(
-            "SELECT id, name, table_schema, partition_spec, sort_key, packing_key, placement
+            "SELECT id, name, table_schema, partition_spec, sort_key, packing_key, target_file_bytes
              FROM hypertables WHERE id = $1",
         )
         .bind(id.0)
@@ -106,18 +107,7 @@ impl PostgresCatalog {
         .await?
         .ok_or_else(|| CatalogError::NotFound(format!("hypertable id {id}")))?;
 
-        Ok(Hypertable {
-            id: HypertableId(row.get("id")),
-            name: row.get("name"),
-            table_schema: row.get("table_schema"),
-            partition_spec: row.get("partition_spec"),
-            sort_key: row.get("sort_key"),
-            packing_key: row.get("packing_key"),
-            placement: match row.get::<String, _>("placement").as_str() {
-                "separated" => Placement::Separated,
-                _ => Placement::Packed,
-            },
-        })
+        Ok(hypertable_from_row(&row))
     }
 
     pub async fn list_logical_tables(
@@ -149,8 +139,8 @@ impl PostgresCatalog {
         id: HypertableId,
         placement: Placement,
     ) -> Result<(), CatalogError> {
-        sqlx::query("UPDATE hypertables SET placement = $1 WHERE id = $2")
-            .bind(placement.as_str())
+        sqlx::query("UPDATE hypertables SET target_file_bytes = $1 WHERE id = $2")
+            .bind(placement.to_db())
             .bind(id.0)
             .execute(&self.pool)
             .await?;
@@ -159,25 +149,11 @@ impl PostgresCatalog {
 
     pub async fn list_hypertables(&self) -> Result<Vec<Hypertable>, CatalogError> {
         let rows = sqlx::query(
-            "SELECT id, name, table_schema, partition_spec, sort_key, packing_key, placement
+            "SELECT id, name, table_schema, partition_spec, sort_key, packing_key, target_file_bytes
              FROM hypertables ORDER BY id",
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| Hypertable {
-                id: HypertableId(row.get("id")),
-                name: row.get("name"),
-                table_schema: row.get("table_schema"),
-                partition_spec: row.get("partition_spec"),
-                sort_key: row.get("sort_key"),
-                packing_key: row.get("packing_key"),
-                placement: match row.get::<String, _>("placement").as_str() {
-                    "separated" => Placement::Separated,
-                    _ => Placement::Packed,
-                },
-            })
-            .collect())
+        Ok(rows.iter().map(hypertable_from_row).collect())
     }
 }
