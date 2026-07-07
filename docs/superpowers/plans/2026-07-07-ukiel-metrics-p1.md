@@ -6,7 +6,7 @@
 
 **Architecture:** Library crates emit through the `metrics` facade (`counter!`/`gauge!`/`histogram!`); with no recorder installed the macros are near-free no-ops, so tests and embedders pay nothing (monitoring spec "Stack"). Only `ukield` installs a recorder — `metrics-exporter-prometheus` — exactly once per process (an idempotent `OnceLock` handle so repeated `run_with_bound_addr` calls across integration tests don't double-install the global recorder). The `/metrics` route (no `AppState` needed) is added by `ukield` when it builds the router; `/readyz` (catalog `SELECT 1` + object-store reachability) lives in `ukiel-query`'s `router()` because it needs `AppState`. Label discipline from the spec: `hypertable`/`topic`/`kind`/`format`/`class`/`role` are bounded and fine; **namespace is never a label**.
 
-**Tech Stack:** `metrics` 0.24 facade (workspace dep), `metrics-exporter-prometheus` 0.16 (ukield only), `metrics-util` 0.19 (dev-dep, `DebuggingRecorder` for emission assertions). axum 0.8, tokio, sqlx/Postgres. Pin the compatible trio together — bump all three if any needs a newer minor.
+**Tech Stack:** `metrics` 0.24 facade (workspace dep), `metrics-exporter-prometheus` 0.16 (ukield only), `metrics-util` 0.19 (dev-dep, `DebuggingRecorder` for pure-helper assertions). axum 0.8, tokio, sqlx/Postgres. Pin the compatible trio together — bump all three if any needs a newer minor. Exporter operational choices are explicit: `*_duration_seconds` histograms get real Prometheus buckets (`set_buckets_for_metric`) so they aggregate across nodes — the exporter's default quantile summaries cannot be aggregated — and `run.rs` runs a periodic `PrometheusHandle::run_upkeep()` tick so histogram buffers drain between scrapes.
 
 **Prerequisites:** Plans 1–7, 9, 10, 19 executed (current `main`). Plan 18 (backpressure) and plan 17 (LSM) are **not** landed, so their metrics (`ingest_backpressure_deferrals_total`, `compactor_backlog_groups`, `compactor_unfinalized_partitions`) are out of scope — they land with those plans. Plan 11 (scan pushdown) and 13 (metadata cache) aren't landed, so `query_parts_scanned/pruned`, `query_objectstore_requests_total`, and the metadata-cache tier of `cache_*` are deferred to those plans (noted at each site).
 
@@ -14,7 +14,7 @@
 
 - Rust edition 2024, toolchain ≥ 1.96.
 - Library crates depend on `metrics` only (the facade). **Never** add `metrics-exporter-prometheus` to a library crate — the binary owns the recorder.
-- Emission is unit-tested with `metrics_util::debugging::DebuggingRecorder` installed as a *local* recorder (`metrics::with_local_recorder`) so tests don't touch global process state and can run in parallel. Pure classifiers (`query_class`) are tested directly.
+- **Emission-test rule:** `metrics::with_local_recorder` is *synchronous* — you cannot `.await` inside it, so async emission paths are never unit-tested with local recorders. Pure sync helpers (`query_class`, bookkeeping like the max-event-ts tracker) get direct or `DebuggingRecorder` unit tests; every async emission site is proven exactly once, end-to-end, by Task 5's `/metrics` assertions. Do not write a local-recorder test around an async call — it cannot compile into something that fails meaningfully.
 - Component tests via `make test` (Docker required); pure/facade unit tests pass without Docker (`cargo test -p <crate> --lib`).
 - Label cardinality: allowed labels are `hypertable`, `topic`, `partition`, `kind`, `worker`, `format`, `status`, `class`, `op`, `role`, `tier`. **Never** label by `namespace_id` or raw SQL text.
 - Commit messages: conventional style, no Claude/AI attribution.
@@ -33,6 +33,7 @@ Emitted at call sites this plan touches. Deferred rows list the plan that lands 
 | `ingest_poison_messages_total` | counter | `topic` | `buffer_message` skip sites |
 | `ingest_out_of_bounds_total` | counter | `hypertable` | `buffer_message` bounds skip (0004) |
 | `ingest_commit_failures_total` | counter | — | `Flusher::flush` error path |
+| `ingest_last_flush_event_ts_seconds` | gauge | `hypertable` | consumer flush — max event ts of the flushed rows, unix secs. **Pulled into P1**: the consumer already holds every row's `ts` (no catalog query needed), and FreshnessBreach is the spec's top alert. Timestamp form on purpose: `time() − gauge` keeps aging when ingest hangs; a computed freshness gauge freezes at a healthy value in exactly that failure |
 | `catalog_commit_duration_seconds` | histogram | `kind` | `commit_inner` |
 | `query_requests_total` | counter | `format`,`status` | `run_query` |
 | `query_duration_seconds` | histogram | `class` | `run_query_inner` |
@@ -54,7 +55,8 @@ Emitted at call sites this plan touches. Deferred rows list the plan that lands 
 | metadata-cache tier of `cache_*` | — | — | plan 13 |
 | `ingest_backpressure_deferrals_total` | — | — | plan 18 |
 | `compactor_backlog_groups`, `*_unfinalized_*` | — | — | plan 17 |
-| periodic gauges (`*_lag`, `*live_parts`, `pending_objects`, `freshness_seconds`, `pool_connections`, cache-dir disk) | — | — | **P2** collector |
+| periodic gauges (`*_lag`, `*live_parts`, `pending_objects`, `pool_connections`, cache-dir disk) | — | — | **P2** collector (freshness is NOT here — see `ingest_last_flush_event_ts_seconds` above) |
+| standalone `/metrics` listener for processes without the query role | — | — | **P2** — P1 accepts and documents the limitation (Task 6): the recorder installs but nothing serves it |
 | `ukield_worker_restarts_total` | — | — | needs a restart supervisor (today first failure cancels all); P2 |
 
 ---
@@ -68,15 +70,17 @@ Emitted at call sites this plan touches. Deferred rows list the plan that lands 
 - Test: `crates/ukiel-ingest/src/consumer.rs` (`mod tests`)
 
 **Interfaces:**
-- Produces: the seven `ingest_*` metrics from the inventory. `Flusher::flush` times the whole encode+upload+commit span and records rows/bytes/partitions + `ingest_rows_total{hypertable}` on success, `ingest_commit_failures_total` on error. `buffer_message` increments `ingest_poison_messages_total{topic}` at every skip that isn't a bounds skip, and `ingest_out_of_bounds_total{hypertable}` at the 0004 bounds skip.
+- Produces: the eight `ingest_*` metrics from the inventory. `Flusher::flush` times the whole encode+upload+commit span and records rows/bytes/partitions + `ingest_rows_total{hypertable}` on success, `ingest_commit_failures_total` on error. `buffer_message` increments `ingest_poison_messages_total{topic}` at every skip that isn't a bounds skip, and `ingest_out_of_bounds_total{hypertable}` at the 0004 bounds skip. `Buffers` gains `max_event_ts_ms: Option<i64>` (updated as rows are accepted); after a successful flush that contained rows, the consumer emits `ingest_last_flush_event_ts_seconds{hypertable}` and resets the tracker — offset-only flushes leave the gauge untouched.
 
 - [ ] **Step 1: Add deps.** In `[workspace.dependencies]`: `metrics = "0.24"` and `metrics-util = "0.19"`. In `crates/ukiel-ingest/Cargo.toml` add `metrics = { workspace = true }` to `[dependencies]` and `metrics-util = { workspace = true }` to `[dev-dependencies]`.
 
-- [ ] **Step 2: Failing test.** In `consumer.rs` `mod tests`, add a helper that installs a `DebuggingRecorder`, runs a closure, and returns its `Snapshotter` counters; then assert the bounds path emits `ingest_out_of_bounds_total`. `buffer_message` takes `&self`, so build a `RouteIngest` is heavy — instead extract the counter increment so it is observable: keep `event_time_in_bounds` pure (already is) and assert emission through a thin `record_out_of_bounds(hypertable)` helper, OR test emission at the ingest component level. Simplest deterministic unit: assert the pure classifier/labels; put the end-to-end emission proof in the ukield `/metrics` component test (Task 5). Write one `DebuggingRecorder` test around a small pure `record_skip`/label helper if extracted; otherwise mark ingest emission as covered by Task 5 and skip a redundant unit test here. (Do not fake a test that can't fail.)
+- [ ] **Step 2: Tests (per the emission-test rule).** No local-recorder test around `buffer_message`/`flush` — they are async-adjacent `&self` paths; their emission proof is Task 5's `/metrics` assertions. What IS unit-tested here: the `max_event_ts_ms` bookkeeping as a plain sync test in `consumer.rs` `mod tests` — feed the tracker three timestamps (out of order), assert it holds the max; assert the reset-on-flush contract by driving the field directly.
 
 - [ ] **Step 3: Instrument `Flusher::flush`.** Wrap the body: capture `std::time::Instant::now()`, count `rows`/`bytes`/`partitions` from `items` before the move, and on the `Ok` path emit `histogram!("ingest_flush_duration_seconds").record(elapsed.as_secs_f64())`, `histogram!("ingest_flush_rows").record(rows as f64)`, `histogram!("ingest_flush_bytes").record(bytes as f64)`, `histogram!("ingest_flush_partitions").record(partitions as f64)`, `counter!("ingest_rows_total", "hypertable" => hypertable.name.clone()).increment(rows)`. On the `Err` path emit `counter!("ingest_commit_failures_total").increment(1)`. An empty (offset-only) flush records a zero-row flush — fine.
 
 - [ ] **Step 4: Instrument `buffer_message`.** At the unparseable-payload / missing-ts / missing-packing-key `return`s: `counter!("ingest_poison_messages_total", "topic" => self.route.topic.clone()).increment(1)`. At the 0004 bounds-skip `return`: `counter!("ingest_out_of_bounds_total", "hypertable" => self.route.hypertable.clone()).increment(1)` (route carries the hypertable name). Keep the existing `tracing::warn!`.
+
+- [ ] **Step 4b: Freshness gauge.** In `buffer_message`, after a row is accepted into `rows_by_day`: `buffers.max_event_ts_ms = Some(buffers.max_event_ts_ms.map_or(ts, |m| m.max(ts)))`. In `RouteIngest::flush`, after `flusher.flush` succeeds and if the flush contained at least one row: `gauge!("ingest_last_flush_event_ts_seconds", "hypertable" => self.route.hypertable.clone()).set(max_ts_ms as f64 / 1000.0)`, then reset the tracker to `None`. Timestamp form on purpose (see inventory): the alert computes `time() − gauge`, which keeps growing when ingest hangs.
 
 - [ ] **Step 5: Verify, lint, commit.** `cargo test -p ukiel-ingest -- --test-threads=2`. Then fmt+clippy.
   `git commit -m "feat: metrics facade + ingest flush/poison/out-of-bounds metrics (metrics P1)"`
@@ -90,7 +94,7 @@ Emitted at call sites this plan touches. Deferred rows list the plan that lands 
 **Interfaces:** `commit_inner` records `catalog_commit_duration_seconds{kind}` for the whole transaction (both success and rollback paths — a slow conflict still costs latency). `kind` = `op.kind()` (the existing `&'static str`).
 
 - [ ] **Step 1:** Add `metrics = { workspace = true }` (dep) and `metrics-util` (dev-dep) to `crates/ukiel-catalog/Cargo.toml`.
-- [ ] **Step 2 (test):** With a local `DebuggingRecorder`, run a real commit against the testcontainer catalog (this is a component test — put it in `tests/catalog_test.rs`, install the recorder around a `commit`) and assert the `catalog_commit_duration_seconds` histogram has ≥1 sample with label `kind=add`. (If wiring a local recorder across the async commit is awkward, assert the family appears in the ukield `/metrics` output in Task 5 instead and note it here.)
+- [ ] **Step 2 (test):** Per the emission-test rule: none here — the commit is async, so a local-recorder test cannot wrap it. The emission proof is Task 5's `/metrics` assertion, which requires the `catalog_commit_duration_seconds` family to appear after a produce+query round trip.
 - [ ] **Step 3:** In `commit_inner`, capture `Instant::now()` at entry; compute `kind = op.kind()` before `op` is moved into the `match`; on both the early `Conflict`/`OffsetRace` returns and the success return, `histogram!("catalog_commit_duration_seconds", "kind" => kind).record(started.elapsed().as_secs_f64())`. Use a small guard closure or record at each exit — prefer an explicit `record` before each `return`/`Ok` (no Drop guard, to keep it obvious).
 - [ ] **Step 4:** Verify, fmt, clippy, commit `"feat: catalog commit-duration histogram (metrics P1)"`.
 
@@ -146,20 +150,30 @@ Emitted at call sites this plan touches. Deferred rows list the plan that lands 
 - `PostgresCatalog::ping(&self) -> Result<(), CatalogError>` running `SELECT 1`.
 - Each worker task sets `gauge!("ukield_worker_up", "role" => role).set(1.0)` on spawn and `.set(0.0)` on exit.
 
-- [ ] **Step 1 (failing test):** In `crates/ukield/tests/server_test.rs`, extend the full-stack test (or add one) to `GET /metrics` and assert 200 + body contains `ingest_flush_duration_seconds` and `query_requests_total` after a produce+query; and `GET /readyz` → 200. Fails (routes 404).
+- [ ] **Step 1 (failing test):** In `crates/ukield/tests/server_test.rs`, extend the full-stack test (or add one) to `GET /metrics` and assert 200 + body contains `ingest_flush_duration_seconds`, `ingest_last_flush_event_ts_seconds`, `catalog_commit_duration_seconds`, and `query_requests_total` after a produce+query — this single assertion is the emission proof for every async site in Tasks 1–4 (the emission-test rule). Also assert `ingest_flush_duration_seconds` renders with `_bucket` lines (buckets, not summary quantiles). `GET /readyz` → 200. Fails (routes 404).
 - [ ] **Step 2:** `crates/ukield/src/metrics.rs`:
   ```rust
   use std::sync::OnceLock;
-  use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+  use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
   static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
   /// Installs the Prometheus recorder once per process; returns the render
   /// handle. Idempotent so repeated `run_with_bound_addr` (tests) is safe.
+  /// Duration histograms get explicit buckets: the exporter's default
+  /// quantile summaries cannot be aggregated across query nodes.
   pub fn handle() -> PrometheusHandle {
       HANDLE
           .get_or_init(|| {
               PrometheusBuilder::new()
+                  .set_buckets_for_metric(
+                      Matcher::Suffix("_duration_seconds".to_string()),
+                      &[
+                          0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25,
+                          0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+                      ],
+                  )
+                  .expect("duration buckets")
                   .install_recorder()
                   .expect("install prometheus recorder")
           })
@@ -169,7 +183,7 @@ Emitted at call sites this plan touches. Deferred rows list the plan that lands 
   Add `pub mod metrics;` to `crates/ukield/src/lib.rs`.
 - [ ] **Step 3:** `PostgresCatalog::ping`: `sqlx::query("SELECT 1").execute(&self.pool).await?; Ok(())`.
 - [ ] **Step 4:** `ukiel-query::router` gains `.route("/readyz", get(readyz))`; `readyz(State(state))` runs `state.catalog.ping()` and `state.store.head(&Path::from("__ukiel_readyz_sentinel"))` treating `Ok`/`NotFound` as ready, returns `(StatusCode::OK, "ready")` or `(StatusCode::SERVICE_UNAVAILABLE, Json{error})`.
-- [ ] **Step 5:** `run.rs`: call `let prom = crate::metrics::handle();` early (installs recorder before workers emit). Build the served router as `crate::metrics::route(router(state), prom)` where a small helper adds `.route("/metrics", get(move || { let h = prom.clone(); async move { h.render() } }))`. Wrap each `tasks.spawn(...)` body to set `ukield_worker_up{role}` to 1 at start and 0 before returning (a scope-guard or explicit set on all exit paths).
+- [ ] **Step 5:** `run.rs`: call `let prom = crate::metrics::handle();` early (installs recorder before workers emit), then spawn the upkeep tick — a 5s `tokio::time::interval` loop calling `prom.run_upkeep()` (drains histogram buffers between scrapes; without it they grow unboundedly), cancelled by the shutdown token like the workers. Build the served router as `crate::metrics::route(router(state), prom)` where a small helper adds `.route("/metrics", get(move || { let h = prom.clone(); async move { h.render() } }))`. Wrap each `tasks.spawn(...)` body to set `ukield_worker_up{role}` to 1 at start and 0 before returning (a scope-guard or explicit set on all exit paths). **Role-split limitation, accepted for P1:** when the query role is absent there is no listener — the recorder still installs and workers still emit, but nothing serves `/metrics`; documented in Task 6, standalone listener rowed for P2.
 - [ ] **Step 6:** Verify `cargo test -p ukiel-catalog -p ukiel-query -p ukield -- --test-threads=2`, fmt, clippy, commit `"feat: ukield prometheus /metrics, /readyz, worker_up gauge (metrics P1)"`.
 
 ---
@@ -179,7 +193,7 @@ Emitted at call sites this plan touches. Deferred rows list the plan that lands 
 **Files:** `README.md`, `docs/superpowers/specs/2026-07-06-ukiel-monitoring.md`, `docs/superpowers/plans/2026-07-05-ukiel-v1-roadmap.md`, `ukield.example.toml` (note `/metrics` + `/readyz` on the query listener).
 
 - [ ] **Step 1:** `cargo fmt --check && cargo clippy --all-targets -- -D warnings && make test`.
-- [ ] **Step 2:** Monitoring spec: mark P1 done in "Implementation phases"; annotate which inventory rows shipped vs. remain P2. README `## Development`: note `ukield` exposes `GET /metrics` (Prometheus) and `GET /readyz` on the query listener.
+- [ ] **Step 2:** Monitoring spec: mark P1 done in "Implementation phases"; annotate which inventory rows shipped vs. remain P2. README `## Development`: note `ukield` exposes `GET /metrics` (Prometheus) and `GET /readyz` on the query listener — **and state the P1 limitation plainly: a process running without the query role exposes no `/metrics`** (standalone metrics listener is P2). Add the same one-liner to the monitoring spec's Stack section if plan-20 review hasn't already placed it there.
 - [ ] **Step 3:** Roadmap row 20 → **Executed** (one line on what shipped); drop 20 from the remaining-order line (`11 → 17 → 18 → …`). Update the "executed so far" list.
 - [ ] **Step 4:** Commit `"docs: metrics P1 shipped — /metrics, /readyz, worker-crate counters; roadmap row 20 executed"`.
 
@@ -187,8 +201,9 @@ Emitted at call sites this plan touches. Deferred rows list the plan that lands 
 
 ## Self-review notes
 
-- **Scope guard:** every metric in the spec that needs a *query* to compute (lag, live-part counts, backlog, freshness, pool, cache-dir disk) is P2 and appears in the deferred table with its owning phase/plan — P1 is strictly call-site emission + exporter + readyz. This keeps the plan independent of plans 11/13/17/18.
-- **No test pays for metrics:** library crates depend only on the `metrics` facade (no recorder). Unit tests that assert emission install a *local* `DebuggingRecorder` (`metrics::with_local_recorder`) so global state stays clean and tests run in parallel; the process-wide exporter is installed only by `ukield`, guarded by a `OnceLock` so the ukield integration binary can call `run_with_bound_addr` in multiple tests without a double-install panic.
+- **Scope guard:** every metric in the spec that needs a *query* to compute (lag, live-part counts, backlog, pool, cache-dir disk) is P2 and appears in the deferred table with its owning phase/plan — P1 is strictly call-site emission + exporter + readyz, independent of plans 11/13/17/18. **Freshness is the deliberate exception**: it looked like P2 but the consumer already holds every row's `ts`, so it ships in P1 as the timestamp gauge `ingest_last_flush_event_ts_seconds` — FreshnessBreach is the spec's top alert and must not stay dark until an unscheduled P2, and the timestamp form keeps aging when ingest hangs (a computed freshness gauge freezes healthy in exactly that failure).
+- **No test pays for metrics:** library crates depend only on the `metrics` facade (no recorder). `with_local_recorder` is sync-only, so async emission is proven exactly once by Task 5's `/metrics` end-to-end assertions; unit tests cover only pure sync helpers. The process-wide exporter is installed only by `ukield`, guarded by a `OnceLock` so the ukield integration binary can call `run_with_bound_addr` in multiple tests without a double-install panic.
+- **Exporter ops:** `*_duration_seconds` families use explicit buckets (summaries can't be aggregated across the stateless query nodes) and `run_upkeep` ticks every 5s (histogram draining). A process without the query role exposes no `/metrics` in P1 — documented in Task 6, standalone listener rowed for P2.
 - **Label discipline:** no `namespace_id` label anywhere; `format`/`status`/`class`/`kind`/`role`/`topic`/`hypertable` are all bounded. `query_class` is a pure fn with a direct unit test.
 - **Conflict counting:** `catalog_commit_conflicts_total{worker}` is deferred (worker identity isn't visible in `commit_inner`); the operational signal is preserved by `compactor_conflicts_total` at the worker call site.
 - **Liveness gauge honesty:** `ukield_worker_up` is implemented; `ukield_worker_restarts_total` is deferred because there is no restart supervisor yet (first failure cancels the JoinSet) — emitting a counter that can only ever read 0 would be misleading.

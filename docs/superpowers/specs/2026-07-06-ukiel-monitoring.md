@@ -13,7 +13,9 @@ alert traces back to an invariant or an SLO.
   `metrics-exporter-prometheus` on the existing HTTP server (`GET /metrics`
   on the query listener; `ukield` installs the recorder once per process).
   Library crates emit; only the binary wires an exporter — tests and embedders
-  pay nothing.
+  pay nothing. P1 limitation: a process running without the query role has no
+  listener and exposes no `/metrics` (recorder installs, nothing serves it);
+  a standalone metrics listener is P2.
 - **Logs:** `tracing` (already in use — worker loops log stats structs);
   structured fields, no prose parsing. Every commit logs its `commit_id`,
   hypertable, kind, and part counts — the catalog is the system of record,
@@ -37,7 +39,7 @@ alert traces back to an invariant or an SLO.
 | `ingest_poison_messages_total{topic}` | counter | I6; a step change means a producer broke |
 | `ingest_out_of_bounds_total{hypertable}` | counter | event-time bound skips (plan 19 / issue 0004) — dropping is by design but never silent; a spike on a *migration* table means its per-table bound override is missing |
 | `ingest_commit_failures_total` | counter | commit errors (not conflicts — ADD doesn't conflict) |
-| `ingest_freshness_seconds{hypertable}` | gauge | now − max event ts of last flush: the user-facing freshness proxy (I3) |
+| `ingest_last_flush_event_ts_seconds{hypertable}` | gauge | max event ts of the last non-empty flush (unix secs); freshness = `time() −` this. Timestamp form on purpose: it keeps aging when ingest hangs, where a computed freshness gauge would freeze at a healthy value — the exact failure the alert exists for (I3) |
 | `ingest_backpressure_deferrals_total{hypertable}` | counter | plan-18 guardrail: flushes deferred because live L0 count crossed the slowdown/stop thresholds — nonzero means compaction is behind and ingest is self-throttling (by design) |
 | `ingest_flush_partitions` | histogram | distinct partitions per flush; a backfill spanning many days shows here (the spread warning's metric twin — no hard cap exists because a flush's offset range covers all its rows) |
 
@@ -93,7 +95,7 @@ alert traces back to an invariant or an SLO.
 
 | Alert | Condition (tune thresholds in deployment) | Invariant / risk |
 |---|---|---|
-| FreshnessBreach | `ingest_freshness_seconds` > 60s for 5m, or consumer lag growing 15m | I3 / SLO |
+| FreshnessBreach | `time() - ingest_last_flush_event_ts_seconds` > 60 for 5m, or consumer lag growing 15m | I3 / SLO |
 | FeedConsumerStalled | `catalog_feed_lag` growing for 15m | consumer health **and** GC fence — precedes disk growth |
 | CompactionStarved | `compactor_backlog_groups` growing 30m, or `last_success` > 3× poll interval | I4/I5 operationally; query latency follows L0 count |
 | IngestBackpressured | `ingest_backpressure_deferrals_total` increasing for 15m | the plan-18 guardrail is holding the line — freshness is being traded for part count; find out why compaction lags before the stop threshold turns it into staleness |
