@@ -85,11 +85,41 @@ struct Buffers {
     /// Max event ts (ms) of rows accepted since the last flush; drives the
     /// `ingest_last_flush_event_ts_seconds` freshness gauge (metrics P1).
     max_event_ts_ms: Option<i64>,
+    /// Consecutive flush ticks deferred by backpressure (plan 18).
+    deferred_flushes: u32,
 }
 
 /// Running max of accepted event timestamps (metrics P1 freshness tracker).
 fn track_event_ts(current: Option<i64>, ts: i64) -> i64 {
     current.map_or(ts, |m| m.max(ts))
+}
+
+/// Backpressure verdict for one flush tick (plan 18). Pure so it is
+/// testable without Kafka or Postgres.
+#[derive(Debug)]
+pub(crate) enum FlushDecision {
+    Flush,
+    Defer,
+}
+
+pub(crate) fn flush_decision(
+    max_live_l0: i64,
+    deferred: u32,
+    total_rows: usize,
+    config: &IngestConfig,
+) -> FlushDecision {
+    // Memory valve: never hold more than 2x the buffer cap, whatever the
+    // catalog says — a full stop must degrade to big flushes, not OOM.
+    if total_rows >= config.max_buffer_rows.saturating_mul(2) {
+        return FlushDecision::Flush;
+    }
+    if max_live_l0 >= config.l0_stop_parts as i64 {
+        return FlushDecision::Defer;
+    }
+    if max_live_l0 >= config.l0_slowdown_parts as i64 && deferred == 0 {
+        return FlushDecision::Defer; // every other tick in the slowdown band
+    }
+    FlushDecision::Flush
 }
 
 /// Issue 0004: bounds event time so bad producer timestamps can't mint junk
@@ -114,11 +144,13 @@ impl RouteIngest {
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    self.flush(&hypertable, &mut buffers).await?;
+                    // Shutdown bypasses backpressure: a clean stop must not
+                    // strand buffered rows (they would replay on restart).
+                    self.flush(&hypertable, &mut buffers, true).await?;
                     return Ok(());
                 }
                 _ = ticker.tick() => {
-                    self.flush(&hypertable, &mut buffers).await?;
+                    self.flush(&hypertable, &mut buffers, false).await?;
                 }
                 msg = consumer.recv() => {
                     let msg = msg?;
@@ -130,7 +162,7 @@ impl RouteIngest {
                         msg.offset(),
                     );
                     if buffers.total_rows >= self.config.max_buffer_rows {
-                        self.flush(&hypertable, &mut buffers).await?;
+                        self.flush(&hypertable, &mut buffers, false).await?;
                     }
                 }
             }
@@ -246,10 +278,38 @@ impl RouteIngest {
         &self,
         hypertable: &Hypertable,
         buffers: &mut Buffers,
+        force: bool,
     ) -> Result<(), IngestError> {
         if buffers.ranges.is_empty() {
             return Ok(());
         }
+        if !force && !buffers.rows_by_day.is_empty() {
+            // Backpressure: probe live-L0 pressure on the partitions this
+            // flush would touch. Deferring is exactly-once-safe — offsets
+            // only advance with a flush.
+            let mut max_live = 0i64;
+            for day in buffers.rows_by_day.keys() {
+                let pv = serde_json::json!({ "day": day });
+                max_live = max_live.max(self.catalog.live_l0_parts(hypertable.id, &pv).await?);
+            }
+            if let FlushDecision::Defer = flush_decision(
+                max_live,
+                buffers.deferred_flushes,
+                buffers.total_rows,
+                &self.config,
+            ) {
+                buffers.deferred_flushes += 1;
+                tracing::warn!(
+                    hypertable = %hypertable.name,
+                    max_live_l0 = max_live,
+                    deferred = buffers.deferred_flushes,
+                    buffered_rows = buffers.total_rows,
+                    "backpressure: flush deferred (compaction behind)"
+                );
+                return Ok(());
+            }
+        }
+        buffers.deferred_flushes = 0;
         let cols = ukiel_core::TableColumns::parse(&hypertable.table_schema)?;
         let mut items = Vec::new();
         for (day, rows) in buffers.rows_by_day.drain() {
@@ -301,10 +361,58 @@ mod tests {
             group_id: String::new(),
             flush_interval_ms: 1000,
             max_buffer_rows: 1000,
+            l0_slowdown_parts: 30,
+            l0_stop_parts: 200,
             max_event_age_days: 3650,
             max_event_future_secs: 3600,
             tables: vec![],
         }
+    }
+
+    #[test]
+    fn flush_decision_thresholds() {
+        // Use explicit round thresholds so the bands read clearly.
+        let c = IngestConfig {
+            max_buffer_rows: 100_000,
+            l0_slowdown_parts: 30,
+            l0_stop_parts: 200,
+            ..cfg()
+        };
+        // Healthy: always flush.
+        assert!(matches!(flush_decision(0, 0, 10, &c), FlushDecision::Flush));
+        assert!(matches!(
+            flush_decision(29, 5, 10, &c),
+            FlushDecision::Flush
+        ));
+
+        // Slowdown band: defer, then flush (every other tick).
+        assert!(matches!(
+            flush_decision(30, 0, 10, &c),
+            FlushDecision::Defer
+        ));
+        assert!(matches!(
+            flush_decision(30, 1, 10, &c),
+            FlushDecision::Flush
+        ));
+        assert!(matches!(
+            flush_decision(199, 0, 10, &c),
+            FlushDecision::Defer
+        ));
+        assert!(matches!(
+            flush_decision(199, 1, 10, &c),
+            FlushDecision::Flush
+        ));
+
+        // Stop band: defer regardless of how long we've deferred...
+        assert!(matches!(
+            flush_decision(200, 7, 10, &c),
+            FlushDecision::Defer
+        ));
+        // ...until the memory valve (2x max_buffer_rows) forces a flush.
+        assert!(matches!(
+            flush_decision(200, 7, 200_000, &c),
+            FlushDecision::Flush
+        ));
     }
 
     #[test]

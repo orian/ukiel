@@ -239,6 +239,8 @@ impl Stack {
             group_id: format!("ukiel-e2e-{}", self.nonce),
             flush_interval_ms,
             max_buffer_rows: 100_000,
+            l0_slowdown_parts: 30,
+            l0_stop_parts: 200,
             // Scenario fixtures use 1970 epoch-ms timestamps; widen the past
             // bound so the event-time rail (issue 0004) keeps them.
             max_event_age_days: 30_000,
