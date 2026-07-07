@@ -56,6 +56,10 @@ failure semantics:
   (design doc "Backfills & migrations"); once plan 8 lands, a backfill is
   its own kafka→parquet pipeline with its own bounds — per-stream, not
   per-server.
+- **The bounds are boundary policy, not an engine concept** (design doc:
+  time-agnostic core): the config knobs are pre-pipelines scaffolding, and
+  plan 8 deletes them in favor of ordinary per-pipeline predicates — they
+  must not be ported or grown into API.
 - Backfills writing into cold partitions is by design: finalized partitions
   reopen (the quiet-check fails, the ladder resumes) and re-finalize when
   the backfill completes; the plan-18 spread warning firing during a

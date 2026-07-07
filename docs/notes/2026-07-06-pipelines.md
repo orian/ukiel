@@ -42,9 +42,15 @@ PIPELINE ingest_events FROM kafka_events TO events AS
 ```
 
 The `ts_column` route config and hardcoded day-partition derivation dissolve
-into the SELECT. The pipeline output must contain the target's packing-key
-and sort columns; validated at pipeline creation (SQL compiles against the
-source schema, deterministic functions only — same `ukiel-expr` rules).
+into the SELECT — and so does boundary validation: the plan-19 event-time
+bounds (`max_event_age_days` / future bound, interim route-level knobs)
+become ordinary per-pipeline predicates here and the knobs are deleted, not
+ported. That is what keeps the engine core time-agnostic (design doc,
+"Catalog data model"): a migration backfill is just a pipeline with a
+different predicate, not a config exception. The pipeline output must
+contain the target's packing-key and sort columns; validated at pipeline
+creation (SQL compiles against the source schema, deterministic functions
+only — same `ukiel-expr` rules).
 
 ### Division of labor vs materialized columns
 
