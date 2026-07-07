@@ -38,6 +38,25 @@ impl PostgresCatalog {
         idempotency_key: Option<&str>,
         offsets: &[OffsetRange],
     ) -> Result<CommitResult, CatalogError> {
+        // Time the whole transaction — success, conflict, or offset-race all
+        // cost latency (metrics P1). `kind` captured before `op` is moved.
+        let kind = op.kind();
+        let started = std::time::Instant::now();
+        let result = self
+            .commit_txn(hypertable_id, op, idempotency_key, offsets)
+            .await;
+        metrics::histogram!("catalog_commit_duration_seconds", "kind" => kind)
+            .record(started.elapsed().as_secs_f64());
+        result
+    }
+
+    async fn commit_txn(
+        &self,
+        hypertable_id: HypertableId,
+        op: CommitOp,
+        idempotency_key: Option<&str>,
+        offsets: &[OffsetRange],
+    ) -> Result<CommitResult, CatalogError> {
         let mut tx = self.pool.begin().await?;
 
         let inserted: Option<i64> = sqlx::query_scalar(

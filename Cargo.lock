@@ -4729,6 +4729,7 @@ name = "ukiel-catalog"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "metrics",
  "serde_json",
  "sqlx",
  "testcontainers-modules",
