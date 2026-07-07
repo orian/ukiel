@@ -310,6 +310,13 @@ impl RouteIngest {
             }
         }
         buffers.deferred_flushes = 0;
+        if buffers.rows_by_day.len() > self.config.warn_partitions_per_flush {
+            tracing::warn!(
+                hypertable = %hypertable.name,
+                partitions = buffers.rows_by_day.len(),
+                "flush spans many partitions (backfill?) — L0 file fan-out"
+            );
+        }
         let cols = ukiel_core::TableColumns::parse(&hypertable.table_schema)?;
         let mut items = Vec::new();
         for (day, rows) in buffers.rows_by_day.drain() {
@@ -363,6 +370,7 @@ mod tests {
             max_buffer_rows: 1000,
             l0_slowdown_parts: 30,
             l0_stop_parts: 200,
+            warn_partitions_per_flush: 64,
             max_event_age_days: 3650,
             max_event_future_secs: 3600,
             tables: vec![],

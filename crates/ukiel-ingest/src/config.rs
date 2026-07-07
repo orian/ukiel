@@ -14,6 +14,11 @@ pub struct IngestConfig {
     /// the memory valve (2x max_buffer_rows) forces one.
     #[serde(default = "default_l0_stop_parts")]
     pub l0_stop_parts: usize,
+    /// Warn when one flush spans more than this many partitions (backfill
+    /// detector). No hard cap: offsets cover all consumed rows, so a flush
+    /// cannot be split by partition without breaking exactly-once.
+    #[serde(default = "default_warn_partitions_per_flush")]
+    pub warn_partitions_per_flush: usize,
     /// Reject (skip like poison) events older than this many days (issue 0004).
     /// Raise temporarily for historical backfills; `0` = unbounded past.
     #[serde(default = "default_max_event_age_days")]
@@ -31,6 +36,10 @@ fn default_l0_slowdown_parts() -> usize {
 
 fn default_l0_stop_parts() -> usize {
     200
+}
+
+fn default_warn_partitions_per_flush() -> usize {
+    64
 }
 
 fn default_max_event_age_days() -> u64 {

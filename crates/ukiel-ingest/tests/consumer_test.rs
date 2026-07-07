@@ -93,6 +93,7 @@ async fn consumes_flushes_and_resumes_exactly_once() {
         max_buffer_rows: 10_000,
         l0_slowdown_parts: 30,
         l0_stop_parts: 200,
+        warn_partitions_per_flush: 64,
         // Fixtures use 1970 epoch-ms timestamps; widen the past bound so the
         // event-time rail (issue 0004) doesn't skip them as ancient.
         max_event_age_days: 30_000,
@@ -220,6 +221,7 @@ async fn backpressure_defers_flushes_until_pressure_clears() {
         max_buffer_rows: 10_000,
         l0_slowdown_parts: 3,
         l0_stop_parts: 3, // 3 seeds -> stop band -> defer every tick
+        warn_partitions_per_flush: 64,
         max_event_age_days: 30_000,
         max_event_future_secs: 3600,
         tables: vec![TableRoute {
