@@ -103,6 +103,10 @@ impl Compactor {
             self.config.poll_interval_ms,
         ));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut finalize_ticker = tokio::time::interval(std::time::Duration::from_millis(
+            self.config.finalize_poll_interval_ms,
+        ));
+        finalize_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => return Ok(()),
@@ -110,6 +114,12 @@ impl Compactor {
                     let stats = self.run_once().await?;
                     if stats.merged_groups > 0 || stats.conflicts > 0 {
                         tracing::info!(?stats, "compaction pass");
+                    }
+                }
+                _ = finalize_ticker.tick() => {
+                    let partitions = self.finalize_once().await?;
+                    if partitions > 0 {
+                        tracing::info!(partitions, "finalized cold partitions");
                     }
                 }
             }
@@ -141,6 +151,52 @@ impl Compactor {
         }
 
         result.map(|()| stats)
+    }
+
+    /// One finalization sweep: every partition with no L0 arrivals for
+    /// `finalize_after_secs` and more than one live run is folded into a
+    /// single run one level above its current maximum. After it, all of the
+    /// partition's files are pairwise key-disjoint: one file chain per key,
+    /// exact range pruning, metadata-only deletion for dedicated keys.
+    /// Not gated on the change feed — a cold partition emits no events.
+    /// Returns the number of partitions finalized.
+    pub async fn finalize_once(&self) -> Result<usize, CompactorError> {
+        let mut finalized = 0;
+        for hypertable in self.catalog.list_hypertables().await? {
+            let live = self.catalog.live_parts(hypertable.id, None).await?;
+            let mut partitions: HashMap<String, Vec<Part>> = HashMap::new();
+            for part in live {
+                partitions
+                    .entry(part.meta.partition_values.to_string())
+                    .or_default()
+                    .push(part);
+            }
+            for (_, parts) in partitions {
+                let runs: HashSet<i64> = parts.iter().map(|p| p.created_by_commit.0).collect();
+                if runs.len() < 2 {
+                    continue; // already one key-disjoint run: final
+                }
+                let quiet = self
+                    .catalog
+                    .partition_l0_quiet_since(
+                        hypertable.id,
+                        &parts[0].meta.partition_values,
+                        self.config.finalize_after_secs as f64,
+                    )
+                    .await?;
+                if !quiet {
+                    continue;
+                }
+                let top = parts.iter().map(|p| p.meta.level).max().unwrap_or(0);
+                match self.merge_parts(&hypertable, &parts, top + 1).await {
+                    Ok(_) => finalized += 1,
+                    // Raced by a merge/deletion: replan next sweep.
+                    Err(CompactorError::Catalog(CatalogError::Conflict { .. })) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(finalized)
     }
 
     async fn compact_hypertable(

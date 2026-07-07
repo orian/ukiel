@@ -716,3 +716,57 @@ async fn l0_and_upper_levels_use_their_own_fanout() {
     assert_eq!(parts.len(), 1);
     assert_eq!(parts[0].meta.level, 2);
 }
+
+#[tokio::test]
+async fn cold_partitions_finalize_into_a_single_run() {
+    let env = setup().await;
+    let compactor = Compactor::new(
+        env.catalog.clone(),
+        env.store.clone(),
+        CompactorConfig {
+            l0_fanout: 100, // the normal ladder never triggers
+            fanout: 100,
+            finalize_after_secs: 0, // everything is instantly cold
+            ..CompactorConfig::default()
+        },
+    );
+
+    add_l0(
+        &env,
+        "2026-07-01",
+        vec![json!({"tenant_id": 1, "ts": 10, "payload": "a"})],
+    )
+    .await;
+    add_l0(
+        &env,
+        "2026-07-01",
+        vec![json!({"tenant_id": 2, "ts": 20, "payload": "b"})],
+    )
+    .await;
+    add_l0(
+        &env,
+        "2026-07-01",
+        vec![json!({"tenant_id": 3, "ts": 30, "payload": "c"})],
+    )
+    .await;
+
+    // Below fanout: the merge pass does nothing.
+    let stats = compactor.run_once().await.unwrap();
+    assert_eq!(stats.merged_groups, 0);
+
+    // Finalization folds the cold partition into a single run.
+    assert_eq!(compactor.finalize_once().await.unwrap(), 1);
+    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
+    assert_eq!(parts.len(), 1, "one packed run: {parts:?}");
+    assert_eq!(parts[0].meta.level, 1); // max input level 0 + 1
+    assert_eq!(
+        live_payloads(&env).await,
+        ["a", "b", "c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<HashSet<_>>()
+    );
+
+    // A single run is final: the sweep is idempotent.
+    assert_eq!(compactor.finalize_once().await.unwrap(), 0);
+}
