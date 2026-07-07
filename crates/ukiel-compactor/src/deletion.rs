@@ -61,7 +61,7 @@ pub async fn delete_key(
             continue; // range overlapped but every row was the key's
         }
         let (key_min, key_max) = rewrite::key_range(&kept, &hypertable.packing_key)?;
-        let bytes = rewrite::batch_to_parquet(&kept)?;
+        let bytes = rewrite::batch_to_parquet(&kept, &hypertable.sort_key)?;
         let path = format!(
             "ht/{}/L{}/{}.parquet",
             hypertable.id,

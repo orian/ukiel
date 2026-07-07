@@ -17,6 +17,19 @@ Ordered by expected impact. Status updated as plans land.
 | 1 | Push predicates into `ParquetSource` (`with_predicate`, `pushdown_filters`, `reorder_filters`, page index on) | Row-group pruning + page pruning + late materialization. A tenant owning 1% of a packed file decodes ~1% instead of 100%. The `FilterExec` stays above as the isolation backstop — pushdown is a performance layer, never the security boundary. |
 | 2 | Project at the scan (`projection ∪ {packing key} ∪ alias-referenced columns`), drop the key in the final projection | Today `SELECT payload` decodes every column. Win ∝ schema width. |
 | 3 | Declare output ordering: one `FileGroup` per file + `with_output_ordering((packing_key, ts))`; write `sorting_columns` into Parquet metadata | `ORDER BY ts` stops sorting (with `key = const`, `(key, ts)` collapses to `(ts)` via equivalence); streaming operators kick in; per-file parallelism improves. |
+
+> **Sort-elimination follow-up (plan 11, partial).** The writers now stamp
+> `sorting_columns` and the provider declares the file's `(packing_key, ts)`
+> output ordering over one-file-per-group, but on DataFusion 54 `ORDER BY ts`
+> still plans a `SortExec`: change #1's predicate pushdown rebuilds the scan and
+> clears the declared ordering, and DataFusion won't use the isolation
+> predicate's `packing_key = const` guarantee to collapse `(packing_key, ts)` to
+> `(ts)` after projection drops the constant column. Declaring `(ts)` alone is
+> unsound (a packed file is not globally ts-sorted) and gets stripped by stats
+> validation. The metadata is correct and forward-looking; eliminating the sort
+> needs pushdown and declared ordering to coexist (a DataFusion-side fix or a
+> version bump). Pruning (#1) is the larger win and is kept. Tracked in
+> `order_by_sort_key_results_stay_correct_and_ordered`.
 | 0 | Perf smoke harness first (`tests/perf_smoke.rs`, `#[ignore]`, prints medians) | Every subsequent claim gets a number. Baseline before any change. |
 
 ## Tier 2 — catalog-side indices (our unfair advantage)

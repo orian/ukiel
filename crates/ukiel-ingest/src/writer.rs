@@ -30,7 +30,7 @@ pub fn rows_to_parquet(
     rows: Vec<serde_json::Value>,
 ) -> Result<EncodedPart, IngestError> {
     let batch = decode_rows(schema, packing_key, ts_column, rows)?;
-    finish_batch(batch, packing_key)
+    finish_batch(batch, packing_key, ts_column)
 }
 
 /// Column-spec-aware encoding: decode against the physical schema (materialized
@@ -45,7 +45,7 @@ pub fn encode_rows(
     let physical = cols.physical_schema();
     let batch = decode_rows(&physical, packing_key, ts_column, rows)?;
     let batch = ukiel_expr::apply_defaults_and_materialized(batch, cols)?;
-    finish_batch(batch, packing_key)
+    finish_batch(batch, packing_key, ts_column)
 }
 
 /// Validates the packing key + ts are present as i64, sorts rows by them, and
@@ -80,14 +80,27 @@ fn decode_rows(
     decoder.flush()?.ok_or(IngestError::EmptyFlush)
 }
 
-/// Computes the packing-key range from the batch and writes ZSTD Parquet.
-fn finish_batch(batch: RecordBatch, packing_key: &str) -> Result<EncodedPart, IngestError> {
+/// Computes the packing-key range from the batch and writes ZSTD Parquet,
+/// declaring `(packing key, ts)` as the file's sorting columns — the exact
+/// order `decode_rows` sorts by, so readers can trust the declared ordering.
+fn finish_batch(
+    batch: RecordBatch,
+    packing_key: &str,
+    ts_column: &str,
+) -> Result<EncodedPart, IngestError> {
     let key_idx = batch
         .schema()
         .index_of(packing_key)
         .map_err(|_| IngestError::MissingColumn {
             row: 0,
             column: packing_key.to_string(),
+        })?;
+    let ts_idx = batch
+        .schema()
+        .index_of(ts_column)
+        .map_err(|_| IngestError::MissingColumn {
+            row: 0,
+            column: ts_column.to_string(),
         })?;
     let keys = batch
         .column(key_idx)
@@ -100,8 +113,21 @@ fn finish_batch(batch: RecordBatch, packing_key: &str) -> Result<EncodedPart, In
     let key_min = arrow::compute::min(keys).ok_or(IngestError::EmptyFlush)?;
     let key_max = arrow::compute::max(keys).ok_or(IngestError::EmptyFlush)?;
 
+    let sorting = vec![
+        parquet::file::metadata::SortingColumn {
+            column_idx: key_idx as i32,
+            descending: false,
+            nulls_first: false,
+        },
+        parquet::file::metadata::SortingColumn {
+            column_idx: ts_idx as i32,
+            descending: false,
+            nulls_first: false,
+        },
+    ];
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .set_sorting_columns(Some(sorting))
         .build();
     let mut bytes = Vec::new();
     let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), Some(props))?;

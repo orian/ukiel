@@ -16,8 +16,8 @@ use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
-use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{binary, col, lit};
+use datafusion::physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::limit::GlobalLimitExec;
@@ -180,10 +180,36 @@ impl TableProvider for UkielTableProvider {
                 .with_pushdown_filters(true)
                 .with_reorder_filters(true),
         );
-        let config = FileScanConfigBuilder::new(self.store_url.clone(), source)
-            .with_file_group(FileGroup::new(files))
-            .with_projection_indices(Some(scan_projection))?
-            .build();
+        // One group per file: each file is internally sorted, but files may
+        // overlap in key ranges — concatenating them into one group would
+        // falsely claim a total order. Separate groups also parallelize.
+        let file_groups: Vec<FileGroup> =
+            files.into_iter().map(|f| FileGroup::new(vec![f])).collect();
+
+        // Declared ordering: the file's true physical order, the longest prefix
+        // of the sort key present in the scan. Built against the file schema —
+        // DataFusion validates the declared ordering against the unprojected
+        // table schema (and each file's min/max stats), then maps it through the
+        // scan projection. Declaring the *full* `(packing_key, ts, …)` order is
+        // the only sound choice: a packed file is NOT ts-sorted on its own (ts
+        // resets per key), so a `[ts]`-only claim would be rejected by
+        // stats validation. Sort elimination for `ORDER BY ts` would need the
+        // isolation predicate's `packing_key = const` equivalence to collapse
+        // `(packing_key, ts)` to `(ts)`; see the note in `order_by_sort_key_*`.
+        let mut sort_exprs: Vec<PhysicalSortExpr> = Vec::new();
+        for name in &self.hypertable.sort_key {
+            match col(name, &self.physical_schema) {
+                Ok(expr) => sort_exprs.push(PhysicalSortExpr::new_default(expr)),
+                Err(_) => break, // column not in the file: ordering prefix ends
+            }
+        }
+        let mut builder = FileScanConfigBuilder::new(self.store_url.clone(), source)
+            .with_file_groups(file_groups)
+            .with_projection_indices(Some(scan_projection))?;
+        if let Some(ordering) = LexOrdering::new(sort_exprs) {
+            builder = builder.with_output_ordering(vec![ordering]);
+        }
+        let config = builder.build();
         let scan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
 
         // Mandatory namespace isolation, before projection can drop the column.

@@ -213,7 +213,7 @@ impl Compactor {
             .await?;
 
         for ((key_min, key_max, batch), path) in outputs.iter().zip(paths) {
-            let bytes = rewrite::batch_to_parquet(batch)?;
+            let bytes = rewrite::batch_to_parquet(batch, &hypertable.sort_key)?;
             let size_bytes = bytes.len() as i64;
             self.store
                 .put(&Path::from(path.clone()), bytes.into())

@@ -104,10 +104,25 @@ pub fn key_range(batch: &RecordBatch, packing_key: &str) -> Result<(i64, i64), C
     Ok((min, max))
 }
 
-/// ZSTD Parquet bytes for one batch.
-pub fn batch_to_parquet(batch: &RecordBatch) -> Result<Vec<u8>, CompactorError> {
+/// ZSTD Parquet bytes for one batch, declaring `sort_key` (whichever names are
+/// present in the batch, in order) as the file's sorting columns so readers can
+/// trust the declared ordering. The batch is assumed already sorted by them.
+pub fn batch_to_parquet(
+    batch: &RecordBatch,
+    sort_key: &[String],
+) -> Result<Vec<u8>, CompactorError> {
+    let sorting: Vec<parquet::file::metadata::SortingColumn> = sort_key
+        .iter()
+        .filter_map(|name| batch.schema().index_of(name).ok())
+        .map(|idx| parquet::file::metadata::SortingColumn {
+            column_idx: idx as i32,
+            descending: false,
+            nulls_first: false,
+        })
+        .collect();
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .set_sorting_columns(Some(sorting))
         .build();
     let mut bytes = Vec::new();
     let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), Some(props))?;
@@ -220,7 +235,8 @@ mod tests {
         assert_eq!(splits[2].1.num_rows(), 2);
 
         // Encode a slice and read it back.
-        let bytes = batch_to_parquet(&splits[2].1).unwrap();
+        let bytes =
+            batch_to_parquet(&splits[2].1, &["tenant_id".to_string(), "ts".to_string()]).unwrap();
         let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
             .unwrap()
             .build()

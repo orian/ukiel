@@ -651,3 +651,46 @@ async fn pushdown_prunes_row_groups_in_packed_files() {
         "expected one row group pruned; explain analyze was:\n{analyzed}"
     );
 }
+
+#[tokio::test]
+async fn order_by_sort_key_results_stay_correct_and_ordered() {
+    let h = setup().await;
+    let ctx = ctx_with_provider(&h, 1).await;
+
+    // Correctness is the load-bearing assertion: ORDER BY ts returns this
+    // namespace's rows in ts order, whether or not the plan sorts.
+    let batches = ctx
+        .sql("SELECT payload FROM events ORDER BY ts")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(all_strings(&batches, "payload"), vec!["a1", "a2"]);
+
+    // TODO(follow-up): sort elimination does not fire in DataFusion 54. The
+    // writers declare `sorting_columns` and the provider declares the file's
+    // `(packing_key, ts)` output ordering, but Task 3's predicate pushdown
+    // rebuilds the scan and clears the declared ordering, so `EnforceSorting`
+    // still inserts a `SortExec` for `ORDER BY ts`. Eliminating it needs the
+    // isolation predicate's `packing_key = const` equivalence to survive
+    // pushdown and collapse `(packing_key, ts)` to `(ts)` — a DataFusion-side
+    // capability. The declared ordering is sound metadata regardless; it pays
+    // off once pushdown and ordering coexist. Tracked in the perf note.
+    let batches = ctx
+        .sql("EXPLAIN SELECT ts FROM events ORDER BY ts")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let plan = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string();
+    // The scan still declares its ordering as an optimizer hint even though the
+    // sort is not yet eliminated (sound direction to build on).
+    assert!(
+        plan.contains("sort_order_for_reorder"),
+        "expected the scan to carry a declared ordering hint; plan was:\n{plan}"
+    );
+}
