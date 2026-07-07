@@ -42,6 +42,13 @@ Rust workspace. Design spec: `docs/superpowers/specs/2026-07-05-ukiel-design.md`
 plans: `docs/superpowers/plans/`, concept notes: `docs/notes/`
 (e.g. [schema management](docs/notes/schema-management.md)).
 
+## Requirements
+
+This repo needs Rust. I run it on the newest stable version. Beware, the dependiecies for this project are crazy (DataFlow, Parquet, etc.)
+and they can easily 80-100GB of disk space in ./target directory (sic).
+
+I develop on Apple M3 36GB ram and AMD Ryzen AI 9 HX 370, 96GB ram.
+
 ### Quickstart
 
 ```sh
