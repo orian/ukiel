@@ -35,8 +35,9 @@ pub async fn apply(catalog: &PostgresCatalog, tables: &[TableConfig]) -> anyhow:
                     )
                     .await
                     .with_context(|| format!("creating hypertable '{}'", table.name))?;
-                if table.placement.as_deref() == Some("separated") {
-                    catalog.set_placement(id, Placement::Separated).await?;
+                let placement = placement_from(table)?;
+                if placement != Placement::Packed {
+                    catalog.set_placement(id, placement).await?;
                 }
                 tracing::info!(table = %table.name, id = %id, "created hypertable");
                 catalog.get_hypertable(&table.name).await?
@@ -64,4 +65,21 @@ pub async fn apply(catalog: &PostgresCatalog, tables: &[TableConfig]) -> anyhow:
         }
     }
     Ok(())
+}
+
+/// Resolves the configured placement. `placement` (legacy strings) and
+/// `target_file_mb` are mutually exclusive.
+fn placement_from(table: &TableConfig) -> anyhow::Result<Placement> {
+    match (table.placement.as_deref(), table.target_file_mb) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "table '{}': placement and target_file_mb are mutually exclusive",
+            table.name
+        ),
+        (_, Some(mb)) => Ok(Placement::SizeTargeted(mb as i64 * 1024 * 1024)),
+        (Some("separated"), None) => Ok(Placement::Separated),
+        (Some("packed"), None) | (None, None) => Ok(Placement::Packed),
+        (Some(other), None) => {
+            anyhow::bail!("table '{}': unknown placement '{other}'", table.name)
+        }
+    }
 }

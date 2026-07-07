@@ -33,7 +33,9 @@ max_event_future_secs = 3600 # skip events from the future (unit-bug detector)
 
 [compactor]
 poll_interval_ms = 5000
-min_l0_files = 2
+l0_fanout = 2            # L0 merge trigger (demo; prod ~4) — L0 files are unpruned by key
+fanout = 2               # L1+ run-count trigger (demo; prod ~10) — runs are key-disjoint
+finalize_after_secs = 60 # fold quiet partitions into one run (demo; prod ~3600)
 
 [gc]
 poll_interval_ms = 60000
@@ -50,6 +52,9 @@ packing_key = "tenant_id"
 sort_key = ["tenant_id", "ts"]
 partition_columns = ["day"]
 namespaces = [1, 2, 3]
+# Placement at rest: default packed; `placement = "separated"` gives every
+# tenant dedicated files; `target_file_mb = 256` packs small tenants into
+# ~256 MB files while big tenants separate organically.
 
 [[tables.columns]]
 name = "tenant_id"

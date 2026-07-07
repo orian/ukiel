@@ -162,7 +162,10 @@ pub async fn run_with_bound_addr(
             store.clone(),
             CompactorConfig {
                 poll_interval_ms: cfg.compactor.poll_interval_ms,
-                min_l0_files: cfg.compactor.min_l0_files,
+                l0_fanout: cfg.compactor.l0_fanout,
+                fanout: cfg.compactor.fanout,
+                finalize_after_secs: cfg.compactor.finalize_after_secs,
+                finalize_poll_interval_ms: cfg.compactor.finalize_poll_interval_ms,
                 ..CompactorConfig::default()
             },
         );

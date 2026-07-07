@@ -29,6 +29,73 @@ const CONFIG: &str = r#"
     type = "utf8"
 "#;
 
+/// A single-table config with the given extra `[[tables]]` line(s) spliced in.
+fn table_config(name: &str, extra: &str) -> UkieldConfig {
+    let cfg = format!(
+        r#"
+        [catalog]
+        url = "unused"
+        [object_store]
+        [[tables]]
+        name = "{name}"
+        ts_column = "ts"
+        packing_key = "tenant_id"
+        sort_key = ["tenant_id", "ts"]
+        partition_columns = ["day"]
+        {extra}
+        namespaces = [1]
+        [[tables.columns]]
+        name = "tenant_id"
+        type = "int64"
+        [[tables.columns]]
+        name = "ts"
+        type = "timestamp_ms"
+        [[tables.columns]]
+        name = "payload"
+        type = "utf8"
+    "#
+    );
+    toml::from_str(&cfg).unwrap()
+}
+
+async fn fresh_catalog() -> (
+    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
+    PostgresCatalog,
+) {
+    let pg = Postgres::default().start().await.expect("postgres");
+    let port = pg.get_host_port_ipv4(5432).await.unwrap();
+    let catalog = PostgresCatalog::connect(&format!(
+        "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
+    ))
+    .await
+    .unwrap();
+    catalog.migrate().await.unwrap();
+    (pg, catalog)
+}
+
+#[tokio::test]
+async fn bootstrap_sets_size_targeted_placement_from_target_file_mb() {
+    let (_pg, catalog) = fresh_catalog().await;
+    let cfg = table_config("events_sized", "target_file_mb = 256");
+
+    bootstrap::apply(&catalog, &cfg.tables).await.unwrap();
+
+    let ht = catalog.get_hypertable("events_sized").await.unwrap();
+    assert_eq!(ht.placement, Placement::SizeTargeted(256 * 1024 * 1024));
+}
+
+#[tokio::test]
+async fn bootstrap_rejects_placement_and_target_file_mb_together() {
+    let (_pg, catalog) = fresh_catalog().await;
+    let cfg = table_config(
+        "events_conflict",
+        "placement = \"separated\"\n        target_file_mb = 256",
+    );
+
+    let err = bootstrap::apply(&catalog, &cfg.tables).await.unwrap_err();
+    assert!(err.to_string().contains("mutually exclusive"), "{err}");
+}
+
 #[tokio::test]
 async fn bootstrap_is_idempotent() {
     let pg = Postgres::default().start().await.expect("postgres");

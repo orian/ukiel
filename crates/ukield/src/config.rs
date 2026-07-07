@@ -142,14 +142,30 @@ impl Default for IngestSection {
 #[serde(default)]
 pub struct CompactorSection {
     pub poll_interval_ms: u64,
-    pub min_l0_files: usize,
+    /// L0 merge trigger. L0 files are unpruned by key (every query reads
+    /// all of them): keep low.
+    pub l0_fanout: usize,
+    /// Run-count merge trigger for L1 and above. Runs are key-disjoint
+    /// (<= 1 file per query each), merges move real bytes: keep higher.
+    pub fanout: usize,
+    /// Fold a partition into a single run once it has had no L0 arrivals
+    /// for this long.
+    pub finalize_after_secs: u64,
+    /// Cadence of the finalization sweep.
+    pub finalize_poll_interval_ms: u64,
 }
 
 impl Default for CompactorSection {
     fn default() -> Self {
         Self {
             poll_interval_ms: 5_000,
-            min_l0_files: 2,
+            // Production shape (unlike the test-compat library defaults):
+            // eager L0, lazy L1+ — bounds L0 read amp at 4 while total
+            // write amp stays ~depth = log10(runs).
+            l0_fanout: 4,
+            fanout: 10,
+            finalize_after_secs: 3_600,
+            finalize_poll_interval_ms: 60_000,
         }
     }
 }
@@ -189,6 +205,12 @@ pub struct TableConfig {
     /// "packed" (default) or "separated".
     #[serde(default)]
     pub placement: Option<String>,
+    /// Size-targeted placement: compaction cuts merge outputs at key
+    /// boundaries into files of roughly this many megabytes; keys bigger
+    /// than the target get dedicated files. Mutually exclusive with
+    /// `placement`.
+    #[serde(default)]
+    pub target_file_mb: Option<u64>,
     /// Namespaces that get a logical table named `name`.
     pub namespaces: Vec<i64>,
     pub columns: Vec<ColumnConfig>,
