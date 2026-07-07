@@ -504,3 +504,31 @@ async fn information_schema_lists_namespace_tables_and_columns() {
         vec!["tenant_id", "ts", "payload"]
     );
 }
+
+#[tokio::test]
+async fn narrow_projection_and_alias_on_unprojected_column() {
+    let h = setup().await;
+    let ctx = ctx_with_provider(&h, 1).await;
+
+    // Narrow projection: only 'payload' requested; packing key is scanned
+    // for isolation but not returned. Results identical to before.
+    let batches = ctx
+        .sql("SELECT payload FROM events ORDER BY ts")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(all_strings(&batches, "payload"), vec!["a1", "a2"]);
+    assert_eq!(batches[0].num_columns(), 1);
+
+    // count(*): empty projection still isolates correctly.
+    let batches = ctx
+        .sql("SELECT count(*) AS n FROM events")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(all_i64(&batches, "n"), vec![2]);
+}

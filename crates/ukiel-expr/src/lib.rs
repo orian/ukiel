@@ -39,6 +39,21 @@ impl CompiledExpr {
     }
 }
 
+/// The column names a SQL expression references (for projection planning).
+pub fn column_refs(sql: &str, schema: &Schema) -> Result<Vec<String>, ExprError> {
+    let ctx = SessionContext::new();
+    let df_schema = DFSchema::try_from(schema.clone())?;
+    let logical = ctx.parse_sql_expr(sql, &df_schema)?;
+    let mut names: Vec<String> = logical
+        .column_refs()
+        .into_iter()
+        .map(|c| c.name.clone())
+        .collect();
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
 pub fn compile(sql: &str, schema: &Schema, target: &DataType) -> Result<CompiledExpr, ExprError> {
     let ctx = SessionContext::new();
     let df_schema = DFSchema::try_from(schema.clone())?;
@@ -166,6 +181,13 @@ mod tests {
         let arr = evaluate(&e, &batch).unwrap();
         let arr = arr.as_any().downcast_ref::<Float64Array>().unwrap();
         assert_eq!(arr.values().as_ref(), &[2.0, 3.0]);
+    }
+
+    #[test]
+    fn reports_referenced_columns() {
+        let cols = TableColumns::parse(&rich_schema_json()).unwrap();
+        let refs = column_refs("amount * 2.0 + tenant_id", &cols.physical_schema()).unwrap();
+        assert_eq!(refs, vec!["amount", "tenant_id"]);
     }
 
     #[test]

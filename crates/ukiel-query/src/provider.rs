@@ -108,29 +108,56 @@ impl TableProvider for UkielTableProvider {
             .map(|p| PartitionedFile::new(p.meta.path.clone(), p.meta.size_bytes as u64))
             .collect();
 
-        let source = Arc::new(ParquetSource::new(self.physical_schema.clone()));
-        let config = FileScanConfigBuilder::new(self.store_url.clone(), source)
-            .with_file_group(FileGroup::new(files))
-            .build();
-        let scan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
-
-        // Mandatory namespace isolation, before projection can drop the column.
-        let predicate = binary(
-            col(&self.hypertable.packing_key, &self.physical_schema)?,
-            Operator::Eq,
-            lit(ScalarValue::Int64(Some(self.packing_key_value))),
-            &self.physical_schema,
-        )?;
-        let filtered: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(predicate, scan)?);
-
-        // Projection maps each requested query-schema column to either a
-        // physical column or the alias's compiled expression. Runs even for
-        // SELECT * so alias columns exist in the output. `TableColumns.specs`
-        // is index-aligned with `query_schema` (every spec, in order).
+        // Requested query-schema indices (SELECT * when DataFusion sends none).
         let indices: Vec<usize> = match projection {
             Some(p) => p.clone(),
             None => (0..self.query_schema.fields().len()).collect(),
         };
+
+        // Physical columns the scan must read: requested physical columns,
+        // columns referenced by requested alias expressions, and the packing
+        // key (the isolation filter needs it even when projected away).
+        let mut needed: Vec<String> = vec![self.hypertable.packing_key.clone()];
+        for &i in &indices {
+            let spec = &self.columns.specs[i];
+            match &spec.kind {
+                ukiel_core::ColumnKind::Alias(sql) => {
+                    let refs = ukiel_expr::column_refs(sql, &self.physical_schema)
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    needed.extend(refs);
+                }
+                _ => needed.push(spec.name.clone()),
+            }
+        }
+        let mut scan_projection: Vec<usize> = needed
+            .iter()
+            .map(|name| self.physical_schema.index_of(name))
+            .collect::<Result<Vec<_>, _>>()?;
+        scan_projection.sort_unstable();
+        scan_projection.dedup();
+        let scanned_schema = Arc::new(self.physical_schema.project(&scan_projection)?);
+
+        let source = Arc::new(ParquetSource::new(self.physical_schema.clone()));
+        let config = FileScanConfigBuilder::new(self.store_url.clone(), source)
+            .with_file_group(FileGroup::new(files))
+            .with_projection_indices(Some(scan_projection))?
+            .build();
+        let scan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
+
+        // Mandatory namespace isolation, before projection can drop the column.
+        // Built against the scanned (projected) schema.
+        let predicate = binary(
+            col(&self.hypertable.packing_key, &scanned_schema)?,
+            Operator::Eq,
+            lit(ScalarValue::Int64(Some(self.packing_key_value))),
+            &scanned_schema,
+        )?;
+        let filtered: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(predicate, scan)?);
+
+        // Final projection maps requested query-schema columns onto the scanned
+        // schema (alias-referenced columns are present by construction). Runs
+        // even for SELECT * so alias columns exist in the output.
+        // `TableColumns.specs` is index-aligned with `query_schema`.
         let exprs = indices
             .iter()
             .map(|&i| {
@@ -138,12 +165,11 @@ impl TableProvider for UkielTableProvider {
                 let spec = &self.columns.specs[i];
                 let expr: Arc<dyn PhysicalExpr> = match &spec.kind {
                     ukiel_core::ColumnKind::Alias(sql) => {
-                        let compiled =
-                            ukiel_expr::compile(sql, &self.physical_schema, &spec.data_type)
-                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                        let compiled = ukiel_expr::compile(sql, &scanned_schema, &spec.data_type)
+                            .map_err(|e| DataFusionError::External(Box::new(e)))?;
                         compiled.into_physical()
                     }
-                    _ => col(field.name(), &self.physical_schema)?,
+                    _ => col(field.name(), &scanned_schema)?,
                 };
                 Ok((expr, field.name().clone()))
             })
