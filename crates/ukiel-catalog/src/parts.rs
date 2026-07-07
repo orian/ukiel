@@ -86,4 +86,64 @@ impl PostgresCatalog {
         .await?;
         Ok(quiet)
     }
+
+    /// Live L0 parts in one partition. Each L0 part is one ingest commit,
+    /// so this is also the partition's L0 run count — the ingest
+    /// backpressure input (plan 18).
+    pub async fn live_l0_parts(
+        &self,
+        hypertable_id: HypertableId,
+        partition_values: &serde_json::Value,
+    ) -> Result<i64, CatalogError> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM parts
+             WHERE hypertable_id = $1 AND deleted_by_commit IS NULL
+               AND partition_values = $2 AND level = 0",
+        )
+        .bind(hypertable_id.0)
+        .bind(partition_values)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
+    /// Partitions holding more than one live run (distinct commits) —
+    /// finalization candidates, aggregated in Postgres so the sweep never
+    /// ships every live part row to the worker.
+    pub async fn finalize_candidates(
+        &self,
+        hypertable_id: HypertableId,
+    ) -> Result<Vec<serde_json::Value>, CatalogError> {
+        let rows: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT partition_values FROM parts
+             WHERE hypertable_id = $1 AND deleted_by_commit IS NULL
+             GROUP BY partition_values
+             HAVING count(DISTINCT created_by_commit) >= 2
+             ORDER BY partition_values::text",
+        )
+        .bind(hypertable_id.0)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Live parts of one partition (what a finalization merge consumes).
+    pub async fn live_partition_parts(
+        &self,
+        hypertable_id: HypertableId,
+        partition_values: &serde_json::Value,
+    ) -> Result<Vec<Part>, CatalogError> {
+        let sql = format!(
+            "SELECT {PART_COLUMNS} FROM parts
+             WHERE hypertable_id = $1 AND deleted_by_commit IS NULL
+               AND partition_values = $2
+             ORDER BY id"
+        );
+        let rows: Vec<PartRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(hypertable_id.0)
+            .bind(partition_values)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(Part::from).collect())
+    }
 }

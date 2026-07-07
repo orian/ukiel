@@ -885,3 +885,59 @@ async fn partition_l0_quiet_since_tracks_l0_commits() {
             .unwrap()
     );
 }
+
+#[tokio::test]
+async fn capacity_probes_count_l0_runs_and_candidates() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let day1 = json!({ "day": "2026-07-01" });
+    let day2 = json!({ "day": "2026-07-02" });
+
+    // Empty: no pressure, no candidates.
+    assert_eq!(catalog.live_l0_parts(ht, &day1).await.unwrap(), 0);
+    assert!(catalog.finalize_candidates(ht).await.unwrap().is_empty());
+
+    // Two L0 commits on day1, one on day2.
+    add_l0_part(&catalog, ht, &day1).await;
+    add_l0_part(&catalog, ht, &day1).await;
+    add_l0_part(&catalog, ht, &day2).await;
+
+    assert_eq!(catalog.live_l0_parts(ht, &day1).await.unwrap(), 2);
+    assert_eq!(catalog.live_l0_parts(ht, &day2).await.unwrap(), 1);
+
+    // Only day1 has >= 2 live runs.
+    let candidates = catalog.finalize_candidates(ht).await.unwrap();
+    assert_eq!(candidates, vec![day1.clone()]);
+
+    // live_partition_parts scopes to one partition.
+    let parts = catalog.live_partition_parts(ht, &day1).await.unwrap();
+    assert_eq!(parts.len(), 2);
+    assert!(parts.iter().all(|p| p.meta.partition_values == day1));
+
+    // Tombstoned parts stop counting everywhere: REPLACE day1's two parts
+    // into one L1 part, then recheck.
+    let new = PartMeta {
+        path: "day1-merged.parquet".to_string(),
+        partition_values: day1.clone(),
+        packing_key_min: 1,
+        packing_key_max: 1,
+        row_count: 2,
+        size_bytes: 2,
+        level: 1,
+        column_stats: None,
+    };
+    catalog
+        .commit(
+            ht,
+            CommitOp::Replace {
+                old: parts.iter().map(|p| p.id).collect(),
+                new: vec![new],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog.live_l0_parts(ht, &day1).await.unwrap(), 0);
+    // day1 now has a single run (the L1 merge); day2 still has one L0 run.
+    assert!(catalog.finalize_candidates(ht).await.unwrap().is_empty());
+}
