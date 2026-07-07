@@ -118,6 +118,14 @@ pub struct IngestSection {
     pub group_id: String,
     pub flush_interval_ms: u64,
     pub max_buffer_rows: usize,
+    /// Backpressure (plan 18): halve flush rate at this live-L0 count.
+    pub l0_slowdown_parts: usize,
+    /// Backpressure (plan 18): stop flushing at this live-L0 count (memory
+    /// valve at 2x max_buffer_rows).
+    pub l0_stop_parts: usize,
+    /// Warn when one flush spans more than this many partitions (backfill
+    /// fan-out detector; no hard cap).
+    pub warn_partitions_per_flush: usize,
     /// Issue 0004: skip events older than this many days (raise for backfills).
     pub max_event_age_days: u64,
     /// Issue 0004: skip events from further in the future than this (unit-bug
@@ -132,6 +140,9 @@ impl Default for IngestSection {
             group_id: "ukield".to_string(),
             flush_interval_ms: 10_000,
             max_buffer_rows: 100_000,
+            l0_slowdown_parts: 30,
+            l0_stop_parts: 200,
+            warn_partitions_per_flush: 64,
             max_event_age_days: 3650,
             max_event_future_secs: 3600,
         }

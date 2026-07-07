@@ -28,6 +28,9 @@ brokers = "127.0.0.1:9092"
 group_id = "ukield"
 flush_interval_ms = 2000 # demo-friendly freshness; production default 10000
 max_buffer_rows = 100000
+l0_slowdown_parts = 30        # halve flush rate when a partition holds this many live L0 files
+l0_stop_parts = 200           # stop flushing (memory valve at 2x max_buffer_rows)
+warn_partitions_per_flush = 64 # backfill fan-out warning threshold
 max_event_age_days = 3650    # skip events older than this (raise for backfills)
 max_event_future_secs = 3600 # skip events from the future (unit-bug detector)
 

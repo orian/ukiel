@@ -132,7 +132,7 @@ ClickHouse's parts/partition limits exist because parts are *physical residents*
 - **Hypertables** — thousands by design; background iteration is event-gated, logical tables are millions of cheap rows.
 - **Object store** — no LIST on any hot path (GC `reconcile` is the rare O(objects) backstop); object *count* is unbounded but tiny files cost per-request money and per-file scan overhead.
 
-**Guardrails (plan 18, `2026-07-06-ukiel-guardrails.md`).** ClickHouse *enforces* its limits (delays, then rejects inserts under parts pressure); ukiel v1 trusted compaction to keep up. Plan 18 adds: **ingest backpressure** — the flusher checks the live L0 count of its target partitions and defers flushes past a slowdown threshold (halving flush rate ⇒ fewer, bigger L0 files — exactly the corrective), stopping past a stop threshold with a memory safety valve; safe because Kafka offsets only advance with flushes. Plus the **partition-spread warning** and the **SQL-side finalization candidates** query. The alarms standing in for hard limits live in the monitoring spec: live parts per level, backlog runs, backpressure deferrals, oldest unfinalized partition.
+**Guardrails (plan 18, `2026-07-06-ukiel-guardrails.md` — implemented).** ClickHouse *enforces* its limits (delays, then rejects inserts under parts pressure); ukiel v1 trusted compaction to keep up. Plan 18 adds: **ingest backpressure** — the flusher checks the live L0 count of its target partitions and defers flushes past a slowdown threshold (halving flush rate ⇒ fewer, bigger L0 files — exactly the corrective), stopping past a stop threshold with a memory safety valve; safe because Kafka offsets only advance with flushes. Plus the **partition-spread warning** and the **SQL-side finalization candidates** query. The alarms standing in for hard limits live in the monitoring spec: live parts per level, backlog runs, backpressure deferrals, oldest unfinalized partition.
 
 Partition granularity itself is a maintenance knob, not a query commitment (planning prunes by key range + part stats, never partition equality). Day is right for the events workload — finalization latency, merge RAM (merges hold a group in memory until streaming merge lands), retention granularity. The per-partition file floor is answered by **partition coalescing** (future plan): rewrite aged fine partitions into coarse ones on the same REPLACE machinery — the time-axis analog of the plan-17 key-axis ladder. Per the time-agnostic-core invariant, the worker never parses partition values: the hypertable declares a **coarsening mapping** (an expression from fine to coarse partition values — `day → month` being one deployment's choice), and coalescing just applies it, exactly as compaction applies the declared packing key without knowing it means "tenant". Fully dynamic layout (parts as key × time rectangles, no calendar boxes — possible precisely because partitions are tags) is deliberately deferred: it complicates ingest buffering and merge planning for marginal benefit over coalescing.
 
@@ -197,10 +197,10 @@ exactly-once, compaction equivalence under racing ingest, and key deletion.
   `docs/notes/2026-07-06-lsm-hierarchy.md`)*: fanout ladder over runs,
   cold-partition finalization, `target_file_bytes` placement. Superseded the
   old "L1→L2 / size-based rolling" deferred item.
-- **Capacity guardrails** — designed (see "Limits & guardrails"), plan
-  written and ready to execute (plan 18,
-  `docs/superpowers/plans/2026-07-06-ukiel-guardrails.md`): ingest
-  backpressure, partition-spread warning, SQL-side finalization candidates.
+- **Capacity guardrails** — *implemented (plan 18,
+  `docs/superpowers/plans/2026-07-06-ukiel-guardrails.md`)*: ingest
+  backpressure with memory valve, partition-spread warning, SQL-side
+  finalization candidates (see "Limits & guardrails").
 - Deferred, designed-for: distributed cache tier, tombstone merge-on-read,
   MV service productization, per-tenant quotas/billing, retention sweep,
   Arrow Flight SQL, catalog DB sharding (schema is shard-ready),
