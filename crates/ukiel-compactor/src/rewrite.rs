@@ -13,7 +13,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
-use ukiel_core::Part;
+use ukiel_core::{Part, Placement};
 
 use crate::CompactorError;
 
@@ -102,6 +102,55 @@ pub fn key_range(batch: &RecordBatch, packing_key: &str) -> Result<(i64, i64), C
     let max = arrow::compute::max(keys)
         .ok_or_else(|| CompactorError::MissingColumn(packing_key.to_string()))?;
     Ok((min, max))
+}
+
+/// Plans merge output chunks per the placement policy, over a batch already
+/// sorted with `packing_key` as the primary sort column. Chunks are
+/// contiguous slices in key order, so every output set is key-disjoint —
+/// one merge's outputs form one "run". `bytes_per_row` is the caller's
+/// encoded-size estimate (input parts' size/rows), used to hit
+/// `SizeTargeted` before encoding; a key run bigger than the target stays
+/// whole in its own chunk (`min == max`), never split mid-key.
+pub fn plan_chunks(
+    sorted: &RecordBatch,
+    packing_key: &str,
+    placement: &Placement,
+    bytes_per_row: f64,
+) -> Result<Vec<(i64, i64, RecordBatch)>, CompactorError> {
+    match placement {
+        Placement::Packed => {
+            let (min, max) = key_range(sorted, packing_key)?;
+            Ok(vec![(min, max, sorted.clone())])
+        }
+        Placement::Separated => Ok(split_by_key(sorted, packing_key)?
+            .into_iter()
+            .map(|(key, batch)| (key, key, batch))
+            .collect()),
+        Placement::SizeTargeted(target) => {
+            let target = (*target).max(1) as f64;
+            let bytes_per_row = bytes_per_row.max(1.0);
+            let mut chunks = Vec::new();
+            let mut start = 0usize; // first row of the open chunk
+            let mut rows = 0usize; // rows in the open chunk
+            let (mut min, mut max) = (0i64, 0i64);
+            for (key, run) in split_by_key(sorted, packing_key)? {
+                if rows > 0 && (rows + run.num_rows()) as f64 * bytes_per_row > target {
+                    chunks.push((min, max, sorted.slice(start, rows)));
+                    start += rows;
+                    rows = 0;
+                }
+                if rows == 0 {
+                    min = key;
+                }
+                max = key;
+                rows += run.num_rows();
+            }
+            if rows > 0 {
+                chunks.push((min, max, sorted.slice(start, rows)));
+            }
+            Ok(chunks)
+        }
+    }
 }
 
 /// ZSTD Parquet bytes for one batch, declaring `sort_key` (whichever names are
@@ -243,5 +292,83 @@ mod tests {
             .unwrap();
         let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
         assert_eq!(rows, 2);
+    }
+
+    /// (tenant_id, ts, payload) batch sorted by tenant: run lengths per key.
+    fn sorted_batch(runs: &[(i64, usize)]) -> RecordBatch {
+        let arrow_schema = Arc::new(arrow_schema_from_json(&schema_json()).unwrap());
+        let mut tenants = Vec::new();
+        let mut ts = Vec::new();
+        for &(key, n) in runs {
+            for i in 0..n {
+                tenants.push(key);
+                ts.push(i as i64);
+            }
+        }
+        let payload: arrow::array::StringArray =
+            tenants.iter().map(|k| Some(format!("p{k}"))).collect();
+        RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int64Array::from(tenants)),
+                Arc::new(Int64Array::from(ts)),
+                Arc::new(payload),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn ranges_and_rows(chunks: &[(i64, i64, RecordBatch)]) -> Vec<(i64, i64, usize)> {
+        chunks
+            .iter()
+            .map(|(min, max, b)| (*min, *max, b.num_rows()))
+            .collect()
+    }
+
+    #[test]
+    fn plan_chunks_packed_and_separated_match_old_semantics() {
+        use ukiel_core::Placement;
+        let batch = sorted_batch(&[(1, 3), (2, 3), (3, 6), (4, 1)]);
+
+        let packed = plan_chunks(&batch, "tenant_id", &Placement::Packed, 10.0).unwrap();
+        assert_eq!(ranges_and_rows(&packed), vec![(1, 4, 13)]);
+
+        let separated = plan_chunks(&batch, "tenant_id", &Placement::Separated, 10.0).unwrap();
+        assert_eq!(
+            ranges_and_rows(&separated),
+            vec![(1, 1, 3), (2, 2, 3), (3, 3, 6), (4, 4, 1)]
+        );
+    }
+
+    #[test]
+    fn plan_chunks_size_targeted_packs_small_keys_and_cuts_at_boundaries() {
+        use ukiel_core::Placement;
+        let batch = sorted_batch(&[(1, 3), (2, 3), (3, 6), (4, 1)]);
+
+        // 10 bytes/row, 100-byte target: k1+k2 = 60 fits, +k3 would be 120
+        // -> cut; k3+k4 = 70 fits.
+        let chunks = plan_chunks(&batch, "tenant_id", &Placement::SizeTargeted(100), 10.0).unwrap();
+        assert_eq!(ranges_and_rows(&chunks), vec![(1, 2, 6), (3, 4, 7)]);
+
+        // Chunks are contiguous, ordered, disjoint, and lossless.
+        let total: usize = chunks.iter().map(|(_, _, b)| b.num_rows()).sum();
+        assert_eq!(total, batch.num_rows());
+        for w in chunks.windows(2) {
+            assert!(w[0].1 < w[1].0, "overlapping chunk ranges");
+        }
+    }
+
+    #[test]
+    fn plan_chunks_isolates_keys_bigger_than_the_target() {
+        use ukiel_core::Placement;
+        let batch = sorted_batch(&[(1, 3), (2, 3), (3, 6), (4, 1)]);
+
+        // 40-byte target: every key run alone overflows any shared chunk;
+        // the 60-byte whale (k3) still lands whole in its own chunk.
+        let chunks = plan_chunks(&batch, "tenant_id", &Placement::SizeTargeted(40), 10.0).unwrap();
+        assert_eq!(
+            ranges_and_rows(&chunks),
+            vec![(1, 1, 3), (2, 2, 3), (3, 3, 6), (4, 4, 1)]
+        );
     }
 }

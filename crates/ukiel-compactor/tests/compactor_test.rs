@@ -524,3 +524,195 @@ async fn deletion_registers_intent_before_upload() {
         "the rewritten path must be registered as intent before it is uploaded"
     );
 }
+
+#[tokio::test]
+async fn compaction_builds_a_level_hierarchy() {
+    let env = setup().await;
+    let compactor = Compactor::new(
+        env.catalog.clone(),
+        env.store.clone(),
+        CompactorConfig::default(), // fanout = 2
+    );
+
+    // Two L0 runs -> one L1 run.
+    add_l0(
+        &env,
+        "2026-07-01",
+        vec![json!({"tenant_id": 1, "ts": 10, "payload": "a"})],
+    )
+    .await;
+    add_l0(
+        &env,
+        "2026-07-01",
+        vec![json!({"tenant_id": 2, "ts": 20, "payload": "b"})],
+    )
+    .await;
+    compactor.run_once().await.unwrap();
+    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].meta.level, 1);
+
+    // Two more L0 runs -> a second L1 run; then two L1 runs -> one L2 run.
+    add_l0(
+        &env,
+        "2026-07-01",
+        vec![json!({"tenant_id": 3, "ts": 30, "payload": "c"})],
+    )
+    .await;
+    add_l0(
+        &env,
+        "2026-07-01",
+        vec![json!({"tenant_id": 4, "ts": 40, "payload": "d"})],
+    )
+    .await;
+    compactor.run_once().await.unwrap(); // merges the L0s (level 0 first)
+    compactor.run_once().await.unwrap(); // now two L1 runs -> L2
+
+    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
+    assert_eq!(
+        parts.len(),
+        1,
+        "cold ladder collapses to one part: {parts:?}"
+    );
+    assert_eq!(parts[0].meta.level, 2);
+    assert!(
+        parts[0].meta.path.contains("/L2/"),
+        "path: {}",
+        parts[0].meta.path
+    );
+    assert_eq!(
+        live_payloads(&env).await,
+        ["a", "b", "c", "d"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<HashSet<_>>()
+    );
+}
+
+#[tokio::test]
+async fn size_targeted_placement_isolates_heavy_keys() {
+    let env = setup().await;
+
+    // Whale tenant 42: 100 rows. Tenants 1-4: 2 rows each (8 rows total).
+    let whale: Vec<_> = (0..100)
+        .map(|i| json!({"tenant_id": 42, "ts": i, "payload": format!("w{i}")}))
+        .collect();
+    let small: Vec<_> = (1..=4i64)
+        .flat_map(|t| {
+            (0..2).map(move |i| json!({"tenant_id": t, "ts": i, "payload": format!("s{t}x{i}")}))
+        })
+        .collect();
+    add_l0(&env, "2026-07-01", whale).await;
+    add_l0(&env, "2026-07-01", small).await;
+
+    // Target = ~20 rows' worth of bytes (from the real L0 stats): the four
+    // small tenants (8 rows) share one chunk, the whale (100 rows)
+    // overflows any shared chunk and gets its own file.
+    let live = env.catalog.live_parts(env.ht, None).await.unwrap();
+    let bytes: i64 = live.iter().map(|p| p.meta.size_bytes).sum();
+    let rows: i64 = live.iter().map(|p| p.meta.row_count).sum();
+    let target = (bytes as f64 / rows as f64 * 20.0) as i64;
+    env.catalog
+        .set_placement(env.ht, Placement::SizeTargeted(target))
+        .await
+        .unwrap();
+
+    let compactor = Compactor::new(
+        env.catalog.clone(),
+        env.store.clone(),
+        CompactorConfig::default(),
+    );
+    compactor.run_once().await.unwrap();
+
+    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
+    assert_eq!(parts.len(), 2, "smalls packed + whale isolated: {parts:?}");
+    let whale_part = parts.iter().find(|p| p.meta.packing_key_min == 42).unwrap();
+    assert_eq!(
+        whale_part.meta.packing_key_max, 42,
+        "whale file is min==max"
+    );
+    assert_eq!(whale_part.meta.row_count, 100);
+    let small_part = parts.iter().find(|p| p.meta.packing_key_min == 1).unwrap();
+    assert_eq!(
+        (
+            small_part.meta.packing_key_min,
+            small_part.meta.packing_key_max,
+            small_part.meta.row_count
+        ),
+        (1, 4, 8)
+    );
+}
+
+#[tokio::test]
+async fn l0_and_upper_levels_use_their_own_fanout() {
+    let env = setup().await;
+    let compactor = Compactor::new(
+        env.catalog.clone(),
+        env.store.clone(),
+        CompactorConfig {
+            l0_fanout: 2,
+            fanout: 3, // L1+ merges need three runs
+            ..CompactorConfig::default()
+        },
+    );
+
+    // Two rounds of two L0s: L0 merges eagerly at 2, the resulting L1 runs
+    // accumulate below the lazier upper trigger.
+    add_l0(
+        &env,
+        "2026-07-01",
+        vec![json!({"tenant_id": 1, "ts": 10, "payload": "a"})],
+    )
+    .await;
+    add_l0(
+        &env,
+        "2026-07-01",
+        vec![json!({"tenant_id": 2, "ts": 20, "payload": "b"})],
+    )
+    .await;
+    compactor.run_once().await.unwrap();
+    add_l0(
+        &env,
+        "2026-07-01",
+        vec![json!({"tenant_id": 3, "ts": 30, "payload": "c"})],
+    )
+    .await;
+    add_l0(
+        &env,
+        "2026-07-01",
+        vec![json!({"tenant_id": 4, "ts": 40, "payload": "d"})],
+    )
+    .await;
+    compactor.run_once().await.unwrap();
+
+    let levels: Vec<i16> = env
+        .catalog
+        .live_parts(env.ht, None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|p| p.meta.level)
+        .collect();
+    assert_eq!(levels, vec![1, 1], "two L1 runs wait below the L1+ fanout");
+    assert_eq!(compactor.run_once().await.unwrap().merged_groups, 0);
+
+    // A third L1 run reaches the upper trigger -> one L2 run.
+    add_l0(
+        &env,
+        "2026-07-01",
+        vec![json!({"tenant_id": 5, "ts": 50, "payload": "e"})],
+    )
+    .await;
+    add_l0(
+        &env,
+        "2026-07-01",
+        vec![json!({"tenant_id": 6, "ts": 60, "payload": "f"})],
+    )
+    .await;
+    compactor.run_once().await.unwrap(); // -> third L1 run
+    compactor.run_once().await.unwrap(); // 3 L1 runs -> L2
+
+    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].meta.level, 2);
+}
