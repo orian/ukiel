@@ -431,6 +431,41 @@ impl Stack {
             .any(|p| p.meta.packing_key_min <= key && p.meta.packing_key_max >= key)
     }
 
+    /// Runs GC (reaper + orphan sweep) with **zero graces** until a full pass
+    /// reaps and sweeps nothing — deterministic quiescence for S8. Reconcile is
+    /// disabled: the sweep works off the intent table, which is what we assert.
+    pub async fn run_gc_to_quiescence(&self) {
+        let gc = ukiel_gc::Gc::new(
+            self.catalog.clone(),
+            self.store.clone(),
+            ukiel_gc::GcConfig {
+                tombstone_grace_secs: 0.0,
+                orphan_grace_secs: 0,
+                poll_interval_ms: 1000,
+                reconcile_every_n_passes: 0,
+            },
+        );
+        loop {
+            let stats = gc.run_once().await.expect("gc pass");
+            if stats.reaped_parts == 0 && stats.swept_orphans == 0 {
+                break;
+            }
+        }
+    }
+
+    /// Every object path in the bucket under this hypertable's prefix. Listing
+    /// is allowed here — this is a test, not a hot path.
+    pub async fn object_paths(&self, ht: HypertableId) -> std::collections::HashSet<String> {
+        use futures::StreamExt;
+        let prefix = object_store::path::Path::from(format!("ht/{}", ht.0));
+        let mut stream = self.store.list(Some(&prefix));
+        let mut paths = std::collections::HashSet::new();
+        while let Some(meta) = stream.next().await {
+            paths.insert(meta.expect("list object").location.to_string());
+        }
+        paths
+    }
+
     /// Runs a SQL query for `namespace` through the HTTP endpoint, returning the
     /// `rows` JSON array (or an Err with the HTTP body on non-200). Pins the
     /// `rows` format explicitly (the server default is `columns`).

@@ -84,7 +84,7 @@ A test-only workspace member (no library code beyond the harness):
 | S7 | **Key deletion** *(with plan 4)* | I7 | After S1 converges, delete one namespace's key; assert its queries return empty, neighbors in the same packed files are intact. |
 | S8 | **GC hygiene** *(with plan 6)* | I8, storage lifecycle | After an S6-style run plus a key deletion, run GC to quiescence with zero graces: every object in the bucket is referenced by a live part, and every live part's object exists. No referenced object was removed (queries still return the full model). |
 
-All scenarios S1–S7 are implemented in `crates/ukiel-e2e/tests/` (plus an S0 smoke); this table remains the authoritative statement of what each one must keep proving.
+All scenarios S1–S8 are implemented in `crates/ukiel-e2e/tests/` (plus an S0 smoke); this table remains the authoritative statement of what each one must keep proving.
 
 ### CI
 

@@ -4866,6 +4866,7 @@ dependencies = [
  "ukiel-catalog",
  "ukiel-compactor",
  "ukiel-core",
+ "ukiel-gc",
  "ukiel-ingest",
  "ukiel-query",
  "url",
