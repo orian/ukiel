@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use metrics::{counter, gauge};
 use object_store::ObjectStore;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -81,6 +82,14 @@ struct Buffers {
     /// kafka partition -> (first, last) consumed offset since the last flush
     ranges: HashMap<i32, (i64, i64)>,
     total_rows: usize,
+    /// Max event ts (ms) of rows accepted since the last flush; drives the
+    /// `ingest_last_flush_event_ts_seconds` freshness gauge (metrics P1).
+    max_event_ts_ms: Option<i64>,
+}
+
+/// Running max of accepted event timestamps (metrics P1 freshness tracker).
+fn track_event_ts(current: Option<i64>, ts: i64) -> i64 {
+    current.map_or(ts, |m| m.max(ts))
 }
 
 /// Issue 0004: bounds event time so bad producer timestamps can't mint junk
@@ -190,23 +199,35 @@ impl RouteIngest {
         let range = buffers.ranges.entry(partition).or_insert((offset, offset));
         range.1 = offset;
 
-        let Some(payload) = payload else { return };
+        let Some(payload) = payload else {
+            counter!("ingest_poison_messages_total", "topic" => self.route.topic.clone())
+                .increment(1);
+            return;
+        };
         let Ok(row) = serde_json::from_slice::<serde_json::Value>(payload) else {
+            counter!("ingest_poison_messages_total", "topic" => self.route.topic.clone())
+                .increment(1);
             return;
         };
         let Some(ts) = row.get(&self.route.ts_column).and_then(|v| v.as_i64()) else {
+            counter!("ingest_poison_messages_total", "topic" => self.route.topic.clone())
+                .increment(1);
             return;
         };
         // Every buffered row must also carry a valid i64 packing key, or the
         // Parquet encoder would reject the whole flush at commit time. Skip
         // (but still advance past) rows that can't be encoded.
         if row.get(packing_key).and_then(|v| v.as_i64()).is_none() {
+            counter!("ingest_poison_messages_total", "topic" => self.route.topic.clone())
+                .increment(1);
             return;
         }
         // Out-of-bounds event time: skip like poison — the offset above has
         // already advanced, the row is dropped visibly (warn), and no junk
         // partition is minted (issue 0004).
         if !event_time_in_bounds(ts, chrono::Utc::now().timestamp_millis(), &self.config) {
+            counter!("ingest_out_of_bounds_total", "hypertable" => self.route.hypertable.clone())
+                .increment(1);
             tracing::warn!(ts, "event time out of bounds; row skipped");
             return;
         }
@@ -218,6 +239,7 @@ impl RouteIngest {
 
         buffers.rows_by_day.entry(day).or_default().push(row);
         buffers.total_rows += 1;
+        buffers.max_event_ts_ms = Some(track_event_ts(buffers.max_event_ts_ms, ts));
     }
 
     async fn flush(
@@ -253,9 +275,17 @@ impl RouteIngest {
             })
             .collect();
         buffers.total_rows = 0;
+        // Freshness (metrics P1): max event ts of this flush's rows, reset each
+        // flush. `None` on an offset-only flush leaves the gauge untouched.
+        let max_event_ts_ms = buffers.max_event_ts_ms.take();
 
         // Offset-only flush (all rows were skipped): commit offsets with no parts.
         self.flusher.flush(hypertable, items, offsets).await?;
+
+        if let Some(ts_ms) = max_event_ts_ms {
+            gauge!("ingest_last_flush_event_ts_seconds", "hypertable" => self.route.hypertable.clone())
+                .set(ts_ms as f64 / 1000.0);
+        }
         Ok(())
     }
 }
@@ -275,6 +305,19 @@ mod tests {
             max_event_future_secs: 3600,
             tables: vec![],
         }
+    }
+
+    #[test]
+    fn max_event_ts_tracks_max_out_of_order() {
+        // The freshness tracker holds the max ts regardless of arrival order.
+        let mut cur: Option<i64> = None;
+        for ts in [100, 50, 300, 200] {
+            cur = Some(track_event_ts(cur, ts));
+        }
+        assert_eq!(cur, Some(300));
+        // Reset-on-flush contract: taking the field yields the max, then clears.
+        assert_eq!(cur.take(), Some(300));
+        assert_eq!(cur, None);
     }
 
     #[test]

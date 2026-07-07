@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use metrics::{counter, histogram};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 use ukiel_catalog::{OffsetRange, PostgresCatalog};
@@ -32,6 +33,36 @@ impl Flusher {
     /// (never an untracked object). If the commit fails, uploaded objects are
     /// orphaned in the store — harmless (never referenced) and reaped by GC.
     pub async fn flush(
+        &self,
+        hypertable: &Hypertable,
+        items: Vec<FlushItem>,
+        offsets: Vec<OffsetRange>,
+    ) -> Result<CommitResult, IngestError> {
+        // Metric inputs captured before `items` is consumed (metrics P1).
+        let flush_rows: u64 = items.iter().map(|i| i.part.row_count.max(0) as u64).sum();
+        let flush_bytes: u64 = items.iter().map(|i| i.part.bytes.len() as u64).sum();
+        let flush_partitions = items.len();
+        let started = std::time::Instant::now();
+
+        let result = self.flush_inner(hypertable, items, offsets).await;
+
+        match &result {
+            Ok(_) => {
+                histogram!("ingest_flush_duration_seconds").record(started.elapsed().as_secs_f64());
+                histogram!("ingest_flush_rows").record(flush_rows as f64);
+                histogram!("ingest_flush_bytes").record(flush_bytes as f64);
+                histogram!("ingest_flush_partitions").record(flush_partitions as f64);
+                counter!("ingest_rows_total", "hypertable" => hypertable.name.clone())
+                    .increment(flush_rows);
+            }
+            Err(_) => {
+                counter!("ingest_commit_failures_total").increment(1);
+            }
+        }
+        result
+    }
+
+    async fn flush_inner(
         &self,
         hypertable: &Hypertable,
         items: Vec<FlushItem>,

@@ -21,7 +21,9 @@ uuid = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
+metrics = { workspace = true }
 
 [dev-dependencies]
 testcontainers-modules = { workspace = true, features = ["kafka"] }
 async-trait = { workspace = true }
+metrics-util = { workspace = true }
