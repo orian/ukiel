@@ -193,11 +193,10 @@ exactly-once, compaction equivalence under racing ingest, and key deletion.
   migrations carrying decades-old history are never silently dropped (see
   "Backfills & migrations"). Out-of-window rows are skipped like poison and the
   permanent `"unknown"` day is gone.
-- **Level ladder & size-targeted placement** — designed, plan written and
-  ready to execute (plan 17,
-  `docs/superpowers/plans/2026-07-06-ukiel-lsm-hierarchy.md`): fanout ladder
-  over runs, cold-partition finalization, `target_file_bytes` placement.
-  Supersedes the old "L1→L2 / size-based rolling" deferred item.
+- **Level ladder & size-targeted placement** — *implemented (plan 17,
+  `docs/notes/2026-07-06-lsm-hierarchy.md`)*: fanout ladder over runs,
+  cold-partition finalization, `target_file_bytes` placement. Superseded the
+  old "L1→L2 / size-based rolling" deferred item.
 - **Capacity guardrails** — designed (see "Limits & guardrails"), plan
   written and ready to execute (plan 18,
   `docs/superpowers/plans/2026-07-06-ukiel-guardrails.md`): ingest

@@ -84,10 +84,15 @@ endpoint: `SELECT table_name FROM information_schema.tables`.
   physical plan, HTTP SQL endpoint (`POST /api/query`), local-disk
   read-through cache in front of the object store.
 - `crates/ukiel-compactor` — background rewrite workers on the change feed:
-  L0→L1 compaction honoring each hypertable's placement policy (`packed` or
-  `separated` per key), and atomic key deletion (metadata-only for dedicated
-  files, rewrite for packed ones). All swaps are optimistic REPLACE commits;
-  losers replan from fresh state.
+  fanout-driven level-ladder compaction (a run = one commit's key-disjoint
+  output; runs merge a level up at a two-tier trigger — eager `l0_fanout`
+  for the unpruned L0 files, lazier `fanout` for L1+), placement policies
+  `packed` / `separated` / size-targeted (`target_file_mb`: small tenants
+  share files, heavy tenants separate organically), cold-partition
+  finalization into a single key-disjoint run, and atomic key deletion
+  (metadata-only for dedicated files, rewrite for packed ones). All swaps
+  are optimistic REPLACE commits; losers replan from fresh state.
+  See `docs/notes/2026-07-06-lsm-hierarchy.md`.
 - `crates/ukiel-expr` — deterministic SQL expression engine for column
   specs: `default` / `materialized` (computed at write + recomputed on
   rewrites = organic backfill) / `alias` (computed at query time). See
