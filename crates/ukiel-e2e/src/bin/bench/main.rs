@@ -13,6 +13,7 @@
 use std::process::ExitCode;
 
 mod hits;
+mod report;
 
 const USAGE: &str = "\
 bench — ukiel macro perf harness (plan 30, manual-only, run with --release)
@@ -48,10 +49,20 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
             Ok(())
         }
         (Some("hits"), Some("load")) => hits::load(opt_usize(args, "--files")?).await,
-        (Some("hits"), Some("queries")) => anyhow::bail!("`hits queries` lands in plan-30 task 3"),
+        (Some("hits"), Some("queries")) => {
+            let iters = opt_usize(args, "--iters")?.unwrap_or(10);
+            let label = opt_str(args, "--label").unwrap_or("baseline");
+            hits::queries(iters, label).await
+        }
         (Some("hits"), sub) => anyhow::bail!("unknown `hits` subcommand {sub:?}\n\n{USAGE}"),
         (Some(other), _) => anyhow::bail!("unknown command '{other}'\n\n{USAGE}"),
     }
+}
+
+/// Value of a `--flag VALUE` string option, if present.
+fn opt_str<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    let i = args.iter().position(|a| a == flag)?;
+    args.get(i + 1).map(String::as_str)
 }
 
 /// Value of a `--flag N` option, if present. Errors on a non-integer value.

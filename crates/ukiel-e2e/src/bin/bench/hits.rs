@@ -317,6 +317,132 @@ pub async fn load(files: Option<usize>) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Serialize)]
+struct ScenarioResult {
+    name: String,
+    median_ms: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct TenantReport {
+    class: String,
+    id: i64,
+    census_rows: i64,
+    observed_rows: i64,
+    fan_out: usize,
+    scenarios: Vec<ScenarioResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct HitsQueryReport {
+    label: String,
+    tenants: Vec<TenantReport>,
+}
+
+/// Reads `rows[0]["n"]` from a count query response.
+fn scalar_n(rows: &serde_json::Value) -> i64 {
+    rows.get(0)
+        .and_then(|r| r.get("n"))
+        .and_then(|n| n.as_i64())
+        .unwrap_or(0)
+}
+
+/// `bench hits queries [--iters N] [--label L]`: runs the per-tenant ClickBench
+/// scenario suite through the real HTTP query endpoint, reporting warm medians.
+pub async fn queries(iters: usize, label: &str) -> anyhow::Result<()> {
+    let census: HitsCensus = serde_json::from_reader(std::fs::File::open(
+        results_dir().join("hits-tenants.json"),
+    )?)
+    .context("read hits-tenants.json — run `bench hits load` first")?;
+    let stack = Stack::start().await;
+    let ht = stack.catalog.get_hypertable("hits").await?.id;
+
+    let classes = [
+        ("heavy", &census.heavy),
+        ("median", &census.median),
+        ("light", &census.light),
+    ];
+    let mut reports = Vec::new();
+    for (class, tenant) in classes {
+        let ns = NamespaceId(tenant.id);
+        // Windowed scenarios need a real, non-empty ts range for this tenant.
+        let range = stack
+            .query(ns, "SELECT min(ts) AS lo, max(ts) AS hi FROM hits")
+            .await
+            .map_err(|e| anyhow::anyhow!("range query for tenant {}: {e}", tenant.id))?;
+        let lo = range
+            .get(0)
+            .and_then(|r| r.get("lo"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let hi = range
+            .get(0)
+            .and_then(|r| r.get("hi"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(lo);
+        let mid = lo + (hi - lo) / 2;
+        let (wlo, whi) = (mid, mid + 24 * 3600 * 1000);
+
+        let scenarios: Vec<(&str, String)> = vec![
+            ("count", "SELECT count(*) AS n FROM hits".to_string()),
+            ("adv_filter", "SELECT count(*) AS n FROM hits WHERE adv_engine_id <> 0".to_string()),
+            ("distinct_users", "SELECT count(DISTINCT user_id) AS n FROM hits".to_string()),
+            ("top_urls", "SELECT url, count(*) AS c FROM hits GROUP BY url ORDER BY c DESC LIMIT 10".to_string()),
+            ("search_phrases", "SELECT search_phrase, count(*) AS c FROM hits WHERE search_phrase <> '' GROUP BY search_phrase ORDER BY c DESC LIMIT 10".to_string()),
+            ("ts_window", format!("SELECT count(*) AS n FROM hits WHERE ts BETWEEN {wlo} AND {whi}")),
+            ("minutely", format!("SELECT ts / 60000 AS m, count(*) AS c FROM hits WHERE ts BETWEEN {wlo} AND {whi} GROUP BY m ORDER BY m")),
+        ];
+
+        let observed_rows = scalar_n(
+            &stack
+                .query(ns, "SELECT count(*) AS n FROM hits")
+                .await
+                .map_err(|e| anyhow::anyhow!("count for tenant {}: {e}", tenant.id))?,
+        );
+        // Namespace isolation at volume: the count must equal the census.
+        if observed_rows != tenant.rows {
+            bail!(
+                "tenant {} count mismatch: query {observed_rows} != census {}",
+                tenant.id,
+                tenant.rows
+            );
+        }
+        let fan_out = stack.live_part_count(ht, Some(tenant.id)).await;
+
+        let mut results = Vec::new();
+        for (name, sql) in &scenarios {
+            let ms = crate::report::warm_median_ms(iters, || async {
+                stack
+                    .query(ns, sql)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{name}: {e}"))
+            })
+            .await?;
+            println!("PERF hits/{class}/{name}={ms:.1}");
+            results.push(ScenarioResult {
+                name: name.to_string(),
+                median_ms: ms,
+            });
+        }
+        reports.push(TenantReport {
+            class: class.to_string(),
+            id: tenant.id,
+            census_rows: tenant.rows,
+            observed_rows,
+            fan_out,
+            scenarios: results,
+        });
+    }
+
+    let report = HitsQueryReport {
+        label: label.to_string(),
+        tenants: reports,
+    };
+    let out = crate::report::write_json(&format!("hits-queries-{label}.json"), &report)?;
+    println!("wrote {}", out.display());
+    Ok(())
+}
+
 /// The `hits_*.parquet` files present under `dir`, sorted, capped at `limit`.
 fn present_files(dir: &Path, limit: Option<usize>) -> anyhow::Result<Vec<PathBuf>> {
     let mut files: Vec<PathBuf> = match std::fs::read_dir(dir) {
