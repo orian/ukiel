@@ -21,6 +21,11 @@ pub struct UkieldConfig {
     pub gc: GcSection,
     #[serde(default)]
     pub collector: CollectorSection,
+    /// Standalone `/metrics` listener address (e.g. `"127.0.0.1:9187"`).
+    /// Empty = disabled; a query-role-less process then has no metrics
+    /// listener and logs a startup warning (metrics P2).
+    #[serde(default)]
+    pub metrics_listen: String,
     /// Tables bootstrapped idempotently at startup.
     #[serde(default)]
     pub tables: Vec<TableConfig>,
@@ -395,6 +400,10 @@ mod tests {
         assert_eq!(cfg.gc.tombstone_grace_secs, 900.0);
         assert_eq!(cfg.object_store.kind, "s3");
         assert_eq!(cfg.object_store.bucket, "ukiel");
+        // Metrics P2 defaults: collector on at 30s, standalone listener off.
+        assert_eq!(cfg.collector.interval_ms, 30_000);
+        assert_eq!(cfg.collector.cache_walk_every, 10);
+        assert!(cfg.metrics_listen.is_empty());
 
         let table = &cfg.tables[0];
         assert_eq!(table.topic.as_deref(), Some("events"));

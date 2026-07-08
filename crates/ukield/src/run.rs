@@ -204,6 +204,33 @@ pub async fn run_with_bound_addr(
     // families. Role-independent, like metrics-upkeep below.
     crate::collector::spawn(&mut tasks, &cfg, catalog.clone(), shutdown.clone());
 
+    // Standalone /metrics listener (metrics P2): serves the P1 recorder for
+    // processes without the query role. Bound only when explicitly set; an
+    // unconfigured query-role-less process makes the P1 gap loud instead of
+    // silently emitting metrics nothing serves.
+    if !cfg.metrics_listen.is_empty() {
+        let listener = tokio::net::TcpListener::bind(&cfg.metrics_listen)
+            .await
+            .with_context(|| format!("binding metrics listener on {}", cfg.metrics_listen))?;
+        tracing::info!(addr = %listener.local_addr()?, "standalone metrics listener");
+        let served = crate::metrics::route(
+            axum::Router::new().route("/healthz", axum::routing::get(|| async { "ok" })),
+            prom.clone(),
+        );
+        let token = shutdown.clone();
+        tasks.spawn(async move {
+            axum::serve(listener, served)
+                .with_graceful_shutdown(async move { token.cancelled().await })
+                .await
+                .context("metrics listener")?;
+            Ok("metrics-listener")
+        });
+    } else if !cfg.roles.contains(&Role::Query) {
+        tracing::warn!(
+            "metrics have no listener: no query role and metrics_listen unset — set metrics_listen"
+        );
+    }
+
     // Drain histogram buffers between scrapes; without upkeep they grow
     // unboundedly (metrics P1). Runs regardless of the query role.
     {
