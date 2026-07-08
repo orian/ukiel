@@ -25,7 +25,8 @@ band plus the 2× memory valve bound both L0 count and ingest memory.
 
 Accepted as-is. The flat rule is easy to reason about and test (three
 bands, one counter); a proportional controller adds tuning surface without
-evidence it is needed. **Revisit trigger:** metrics P2 (roadmap row 21)
-backlog gauges showing partitions in sustained hover at `l0_stop_parts` —
-that is both the signal the band is too blunt and the data needed to tune a
-replacement.
+evidence it is needed. **Revisit trigger:** metrics P2 (roadmap row 21,
+executed) now emits the data — `ingest_backpressure_deferrals_total`,
+`compactor_backlog_groups`, and `compactor_unfinalized_partitions`. Sustained
+deferrals with a backlog stuck at `l0_stop_parts` is both the signal the band
+is too blunt and the data needed to tune a replacement.

@@ -146,8 +146,25 @@ of query nodes; workers don't need readiness (they self-heal by replanning).
   (plan 18), `compactor_backlog_groups`/`*_unfinalized_*` (plan 17),
   `ukield_worker_restarts_total` (needs a restart supervisor), and a standalone
   `/metrics` listener for query-role-less processes.
-- **P2:** the periodic collector gauges that need queries (live-part counts,
-  feed lag, pending/tombstone backlogs, Kafka high-watermark lag) — a small
-  ticker task in `ukield` reusing existing catalog APIs.
+- **P2 (roadmap row 21, `ukiel-metrics-p2`) — DONE:** a role-independent
+  collector task in `ukield` (`src/collector.rs`, default 30s tick) with
+  per-family error isolation (`collector_errors_total{family}`; a failing
+  family never crashes the process). Families: catalog (`catalog_live_parts`,
+  `catalog_feed_lag`, `catalog_pool_connections`), compactor regime
+  (`compactor_backlog_groups`, `compactor_unfinalized_partitions`,
+  `compactor_oldest_unfinalized_age_seconds`), GC (`catalog_pending_objects`,
+  `gc_pending_object_age_seconds`, `catalog_unpurged_tombstones`,
+  `gc_reap_fence_age_seconds`), consumer lag (Kafka high-watermarks vs catalog
+  offsets → `ingest_consumer_lag{topic,partition}`, disabled when no topic is
+  configured), and cache dir (`ukield_cache_dir_free_ratio` every tick,
+  `ukield_cache_dir_bytes` every Nth). Plus the standalone `/metrics` listener
+  (`metrics_listen`) closing the P1 role-split gap, and the two P1-deferred
+  ingest call-sites: `ingest_backpressure_deferrals_total` (added) and
+  `ingest_flush_partitions` (already shipped from the flusher in P1 — verified,
+  no duplicate added). Still deferred: `catalog_commit_conflicts_total{worker}`
+  (the `commit` API carries no worker identity — an API change across every
+  writer), `feed_horizon_margin_seconds` (arrives with roadmap row 23),
+  `ukield_worker_restarts_total` (needs a restart supervisor; workers fail the
+  process by design today).
 - **P3:** OTel spans across the query path; trace-id in query error
   responses.

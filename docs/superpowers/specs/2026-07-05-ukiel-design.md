@@ -193,13 +193,16 @@ capability:
 - `ukield` single binary: config-driven roles, idempotent TOML table
   bootstrap, graceful shutdown, `make play` quickstart.
 - Prometheus `/metrics` + `/readyz`, `ukield_worker_up`, and the freshness
-  timestamp gauge (monitoring P1).
+  timestamp gauge (monitoring P1); the P2 periodic collector — consumer/feed
+  lag, live-part counts, compactor backlog/unfinalized gauges, GC backlogs,
+  pool and cache-dir disk — plus a standalone `/metrics` listener for
+  query-role-less processes (plan 21).
 - e2e suite S0–S8 against the compose stack; dataset-parametric perf
   harness with committed baselines (plan 11).
 
-**Not yet** (roadmap rows; recommended order 21 → 30 → 27 → 14 → 29 → 13 →
-15 → 16 → 8, then 22 → 23 → 24; 25/26 gated on design decisions): metrics P2
-collector gauges (21), macro perf harness (30 — 10–100 GB baselines on
+**Not yet** (roadmap rows; recommended order 30 → 27 → 14 → 29 → 13 →
+15 → 16 → 8, then 22 → 23 → 24; 25/26 gated on design decisions):
+macro perf harness (30 — 10–100 GB baselines on
 ClickBench hits + Bluesky ndjson, plan written), ingest sort-by-sort-key
 (27, latent soundness gap),
 shared writer/file layout (14), **streaming merge** (29 — issue 0005's real
