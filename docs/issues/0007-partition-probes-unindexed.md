@@ -1,7 +1,7 @@
 # 0007 — Partition probes are unindexed; `partition_l0_quiet_since` scans all-time history
 
 - **Severity:** Low today (performance; grows unboundedly with part history)
-- **Status:** Open — fix planned in roadmap row 28 (migration 0007)
+- **Status:** Resolved (plan 28) — migration `0007_partition_probe_index.sql` adds `parts (hypertable_id, partition_values, level)` (non-partial, so tombstoned rows the arrival probes count are covered)
 - **Components:** `crates/ukiel-catalog`
 - **Found by:** post-landing review of plans 17/18, 2026-07-08 (`docs/notes/2026-07-08-plan17-18-review.md`)
 

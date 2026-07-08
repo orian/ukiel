@@ -1,7 +1,7 @@
 # 0006 — Backpressure probe issues one catalog query per buffered day, per flush tick
 
 - **Severity:** Low (performance/load, no correctness impact)
-- **Status:** Open — fix planned in roadmap row 28 (must land before plan 8 ports the backpressure code into `PipelineIngest`)
+- **Status:** Resolved (plan 28) — the flush probe calls `max_live_l0_parts(&[partitions])` once per tick (one grouped catalog query) instead of one `live_l0_parts` per buffered day
 - **Components:** `crates/ukiel-ingest`, `crates/ukiel-catalog`
 - **Found by:** post-landing review of plans 17/18, 2026-07-08 (`docs/notes/2026-07-08-plan17-18-review.md`)
 
@@ -23,10 +23,12 @@ is exactly-once-safe regardless.
 
 ## Fix
 
-One grouped probe: `live_l0_counts(hypertable_id, partitions: &[Value]) ->
-Vec<(Value, i64)>` — a single round-trip with `WHERE partition_values =
-ANY($2)` + `GROUP BY partition_values`. `flush_decision` keeps taking the
-max, as today. Pairs with the index from issue 0007.
+One grouped probe — refined by plan 28 to
+`max_live_l0_parts(hypertable_id, partitions: &[Value]) -> i64`: a single
+round-trip (`WHERE partition_values = ANY($2)` + `GROUP BY` + `max`),
+returning only the max since `flush_decision` never consumed per-partition
+counts. Replaces `live_l0_parts` (no other production caller). Pairs with
+the index from issue 0007.
 
 ## Notes
 

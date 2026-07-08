@@ -147,29 +147,69 @@ What about work committed after T? REPLACE outputs (compaction, deletion rewrite
 
 Not yet done (deferred): a documented restore runbook, automated `tombstone_grace >= backup_lag` validation at deploy time, and periodic restore drills. Time-travel reads (below) would give restores named, testable consistency points.
 
-## Implementation status
+## What already works (implementation status)
 
-Executed plan-by-plan; the authoritative status table is
-`docs/superpowers/plans/2026-07-05-ukiel-v1-roadmap.md`. Crates
-(`crates/*`): `ukiel-core` (shared types, column specs), `ukiel-catalog`
-(Postgres catalog: commit protocol, change feed, offsets, cursors, GC
-bookkeeping), `ukiel-ingest` (Kafka → sorted ZSTD Parquet L0, exactly-once),
-`ukiel-query` (DataFusion providers, namespace isolation, HTTP SQL, NVMe
-read-through cache), `ukiel-compactor` (L0→L1 with placement policy, key
-deletion), `ukiel-gc` (reaper + orphan sweep), `ukiel-expr` (column kinds:
-`default`/`materialized`/`alias`, plan 7), `ukiel-e2e` (scenario suite).
-Written, not yet executed (roadmap's recommended order:
-9 → 11 → 17 → 18 → 12 → 14 → 13 → 15 → 16 → 8): upload intent (plan 9),
-read-performance tiers (plans 11–16), level hierarchy + size-targeted
-placement (plan 17), capacity guardrails (plan 18). Engines + pipelines
-(plan 8, per `docs/notes/2026-07-06-pipelines.md`) is not written — write it
-after plan 18, since pipelines replace the ingest routing code 18's
-backpressure lands in.
+Executed: plans 1–7, 9–12, and 17–20; the authoritative per-plan status
+table is `docs/superpowers/plans/2026-07-05-ukiel-v1-roadmap.md`. Crates
+(`crates/*`): `ukiel-core`, `ukiel-catalog`, `ukiel-ingest`, `ukiel-query`,
+`ukiel-compactor`, `ukiel-gc`, `ukiel-expr`, `ukiel-e2e`, `ukield`. By
+capability:
+
+**Write path**
+- Kafka → sorted ZSTD Parquet L0 → atomic catalog commit; exactly-once via
+  catalog-anchored offsets (crash/resume proven by S2); a duplicate writer
+  on a topic fails loudly via the offset CAS instead of duplicating data
+  (issue 0003).
+- Poison-message skipping with advancing offsets (S4); asymmetric
+  event-time bounds with the per-table backfill override (issue 0004).
+- `default` / `materialized` columns computed at ingest and recomputed on
+  every rewrite (organic backfill); `alias` columns resolved at query time.
+- Ingest backpressure on live-L0 pressure (slowdown / stop / 2× memory
+  valve, exactly-once-safe) and the partition-spread backfill warning.
+
+**Storage & compaction**
+- Fanout-driven level ladder over commit-runs (two-tier trigger: eager L0,
+  lazy L1+) and cold-partition finalization to a single key-disjoint run;
+  compaction equivalence under racing ingest proven by S6.
+- Placement per hypertable: packed / separated / size-targeted
+  (`target_file_bytes`) — heavy keys separate into dedicated files
+  organically.
+- Atomic key deletion: metadata-only DELETE for dedicated files,
+  REPLACE-rewrite for packed ones (S7).
+- Write-ahead upload intent (`pending_objects`); GC reaper (tombstone grace
+  + worker-cursor fence) and orphan sweep with catalog-only discovery;
+  bucket ↔ live-parts bijection proven by S8.
+
+**Query path**
+- DataFusion provider: logical-table resolution, plan-time namespace
+  isolation (S1; 1k-tenant scale in S5), catalog live-part pruning +
+  column-stats pruning, predicate/projection pushdown into Parquet,
+  declared output ordering, NVMe read-through cache.
+- HTTP SQL endpoint: three result formats (columnar JSON default / rows /
+  Arrow IPC), per-namespace `information_schema` introspection, statement
+  timeout with the `timeout < gc grace` startup invariant (issue 0002).
+
+**Operations**
+- `ukield` single binary: config-driven roles, idempotent TOML table
+  bootstrap, graceful shutdown, `make play` quickstart.
+- Prometheus `/metrics` + `/readyz`, `ukield_worker_up`, and the freshness
+  timestamp gauge (monitoring P1).
+- e2e suite S0–S8 against the compose stack; dataset-parametric perf
+  harness with committed baselines (plan 11).
+
+**Not yet** (roadmap rows; recommended order 28 → 21 → 27 → 14 → 13 → 15 →
+16 → 8, then 22 → 23 → 24; 25/26 gated on design decisions): review
+hardening (28, issues 0005–0007/0009), metrics P2 collector gauges (21),
+ingest sort-by-sort-key (27, latent soundness gap), file-layout and caching
+perf tiers (14/13/15/16), pipelines & MVs (8 — plan written), partition
+coalescing + retention (22), feed horizon (23), egress (24), auth (25),
+horizontal ingest (26).
 
 Verification philosophy and the scenario catalog (S0–S8, invariants I1–I8)
 live in `docs/superpowers/specs/2026-07-05-ukiel-testing-design.md`; the e2e
 suite proves isolation under packing, ≤20s freshness, crash/resume
-exactly-once, compaction equivalence under racing ingest, and key deletion.
+exactly-once, compaction equivalence under racing ingest, key deletion, and
+GC hygiene.
 
 ## Known gaps & deferred work
 
@@ -206,7 +246,9 @@ exactly-once, compaction equivalence under racing ingest, and key deletion.
   Arrow Flight SQL, catalog DB sharding (schema is shard-ready),
   `alter_hypertable_add_column` API (storage layer already handles additive
   evolution via schema-adapting rewrites), streaming merges (compaction
-  currently holds a whole merge group in RAM), stable split points across
+  currently holds a whole merge group in RAM — issue 0005: finalization
+  makes this the peak-memory event; interim input-size cap in roadmap
+  row 28), stable split points across
   merges, **partition coalescing** (rewrite aged fine partitions into
   coarse ones via a per-hypertable declared coarsening mapping, e.g.
   day → month — the answer to the per-partition file floor; the worker

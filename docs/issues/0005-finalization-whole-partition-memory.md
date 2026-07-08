@@ -1,7 +1,7 @@
 # 0005 — Whole-partition merges are in-memory; finalization makes them the peak-memory event
 
 - **Severity:** Medium (scaling ceiling, not a correctness bug — degrades to OOM crash loop under partition growth)
-- **Status:** Open — interim size cap planned (roadmap row 28); streaming merge deferred post-v1
+- **Status:** Interim cap shipped (plan 28) — `max_merge_input_bytes` skips oversized merges (warn + `compactor_capped_merges_total`) instead of OOM-crash-looping. Streaming merge remains the open fix, post-v1 after plan 14
 - **Components:** `crates/ukiel-compactor`
 - **Found by:** post-landing review of plans 17/18, 2026-07-08 (`docs/notes/2026-07-08-plan17-18-review.md`)
 
