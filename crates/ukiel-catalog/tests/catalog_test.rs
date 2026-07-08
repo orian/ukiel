@@ -894,7 +894,14 @@ async fn capacity_probes_count_l0_runs_and_candidates() {
     let day2 = json!({ "day": "2026-07-02" });
 
     // Empty: no pressure, no candidates.
-    assert_eq!(catalog.live_l0_parts(ht, &day1).await.unwrap(), 0);
+    assert_eq!(catalog.max_live_l0_parts(ht, &[]).await.unwrap(), 0);
+    assert_eq!(
+        catalog
+            .max_live_l0_parts(ht, std::slice::from_ref(&day1))
+            .await
+            .unwrap(),
+        0
+    );
     assert!(catalog.finalize_candidates(ht).await.unwrap().is_empty());
 
     // Two L0 commits on day1, one on day2.
@@ -902,8 +909,28 @@ async fn capacity_probes_count_l0_runs_and_candidates() {
     add_l0_part(&catalog, ht, &day1).await;
     add_l0_part(&catalog, ht, &day2).await;
 
-    assert_eq!(catalog.live_l0_parts(ht, &day1).await.unwrap(), 2);
-    assert_eq!(catalog.live_l0_parts(ht, &day2).await.unwrap(), 1);
+    // Grouped probe: max live-L0 count across the probed partitions.
+    assert_eq!(
+        catalog
+            .max_live_l0_parts(ht, std::slice::from_ref(&day1))
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        catalog
+            .max_live_l0_parts(ht, std::slice::from_ref(&day2))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        catalog
+            .max_live_l0_parts(ht, &[day1.clone(), day2.clone()])
+            .await
+            .unwrap(),
+        2
+    );
 
     // Only day1 has >= 2 live runs.
     let candidates = catalog.finalize_candidates(ht).await.unwrap();
@@ -937,7 +964,13 @@ async fn capacity_probes_count_l0_runs_and_candidates() {
         )
         .await
         .unwrap();
-    assert_eq!(catalog.live_l0_parts(ht, &day1).await.unwrap(), 0);
+    assert_eq!(
+        catalog
+            .max_live_l0_parts(ht, std::slice::from_ref(&day1))
+            .await
+            .unwrap(),
+        0
+    );
     // day1 now has a single run (the L1 merge); day2 still has one L0 run.
     assert!(catalog.finalize_candidates(ht).await.unwrap().is_empty());
 }

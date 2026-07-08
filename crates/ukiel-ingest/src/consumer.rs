@@ -291,11 +291,15 @@ impl RouteIngest {
             // Backpressure: probe live-L0 pressure on the partitions this
             // flush would touch. Deferring is exactly-once-safe — offsets
             // only advance with a flush.
-            let mut max_live = 0i64;
-            for day in buffers.rows_by_day.keys() {
-                let pv = serde_json::json!({ "day": day });
-                max_live = max_live.max(self.catalog.live_l0_parts(hypertable.id, &pv).await?);
-            }
+            let partitions: Vec<serde_json::Value> = buffers
+                .rows_by_day
+                .keys()
+                .map(|day| serde_json::json!({ "day": day }))
+                .collect();
+            let max_live = self
+                .catalog
+                .max_live_l0_parts(hypertable.id, &partitions)
+                .await?;
             if let FlushDecision::Defer = flush_decision(
                 max_live,
                 buffers.deferred_flushes,

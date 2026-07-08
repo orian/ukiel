@@ -126,24 +126,30 @@ impl PostgresCatalog {
         Ok(quiet)
     }
 
-    /// Live L0 parts in one partition. Each L0 part is one ingest commit,
-    /// so this is also the partition's L0 run count — the ingest
-    /// backpressure input (plan 18).
-    pub async fn live_l0_parts(
+    /// Max live-L0 count across the given partitions, in one round-trip —
+    /// the ingest backpressure input (issue 0006: the per-day probe loop
+    /// was most expensive exactly during backfills). Each L0 part is one
+    /// ingest commit, so counts are also L0 run counts. Empty slice → 0.
+    pub async fn max_live_l0_parts(
         &self,
         hypertable_id: HypertableId,
-        partition_values: &serde_json::Value,
+        partitions: &[serde_json::Value],
     ) -> Result<i64, CatalogError> {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM parts
-             WHERE hypertable_id = $1 AND deleted_by_commit IS NULL
-               AND partition_values = $2 AND level = 0",
+        if partitions.is_empty() {
+            return Ok(0);
+        }
+        let max: i64 = sqlx::query_scalar(
+            "SELECT coalesce(max(cnt), 0) FROM (
+                 SELECT count(*) AS cnt FROM parts
+                 WHERE hypertable_id = $1 AND deleted_by_commit IS NULL
+                   AND level = 0 AND partition_values = ANY($2)
+                 GROUP BY partition_values) per_partition",
         )
         .bind(hypertable_id.0)
-        .bind(partition_values)
+        .bind(partitions)
         .fetch_one(&self.pool)
         .await?;
-        Ok(count)
+        Ok(max)
     }
 
     /// Partitions holding more than one live run (distinct commits) —
