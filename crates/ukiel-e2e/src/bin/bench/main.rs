@@ -62,7 +62,14 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
             let topic = opt_str(args, "--topic").unwrap_or("bsky");
             bluesky::produce(files, topic).await
         }
-        (Some("bluesky"), Some("run")) => anyhow::bail!("`bluesky run` lands in plan-30 task 5"),
+        (Some("bluesky"), Some("run")) => {
+            let files = opt_usize(args, "--files")?
+                .ok_or_else(|| anyhow::anyhow!("bluesky run needs --files N"))?;
+            let wave_files = opt_usize(args, "--wave-files")?;
+            let flush_ms = opt_usize(args, "--flush-ms")?.unwrap_or(10_000) as u64;
+            let label = opt_str(args, "--label").unwrap_or("baseline");
+            bluesky::run(files, wave_files, flush_ms, label).await
+        }
         (Some("bluesky"), sub) => anyhow::bail!("unknown `bluesky` subcommand {sub:?}\n\n{USAGE}"),
         (Some(other), _) => anyhow::bail!("unknown command '{other}'\n\n{USAGE}"),
     }

@@ -9,14 +9,20 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::BufRead;
 use std::path::PathBuf;
 
+use std::time::{Duration, Instant};
+
 use anyhow::{Context, bail};
 use flate2::read::MultiGzDecoder;
 use rdkafka::producer::FutureRecord;
 use rdkafka::producer::future_producer::DeliveryFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use ukiel_core::HypertableId;
+use tokio_util::sync::CancellationToken;
+use ukiel_compactor::compactor::{Compactor, CompactorConfig};
+use ukiel_core::{HypertableId, NamespaceId};
 use ukiel_e2e::Stack;
+use ukiel_ingest::config::{IngestConfig, TableRoute};
+use ukiel_ingest::consumer::IngestWorker;
 
 use crate::hits::TenantCount;
 
@@ -25,7 +31,6 @@ fn dataset_dir() -> PathBuf {
 }
 
 /// The ukiel `bsky` table schema (JSON, `TableColumns` format).
-#[allow(dead_code)] // used by `bluesky run` (Task 5)
 pub fn bsky_schema_json() -> serde_json::Value {
     json!({"fields": [
         {"name": "tenant_id", "type": "int64"},
@@ -222,7 +227,6 @@ async fn drain_inflight(inflight: &mut VecDeque<DeliveryFuture>) {
 /// Waits until ingest has durably accounted for at least `target` messages
 /// (its offset sum), so Kafka isn't holding more than ~one wave uncompressed.
 async fn wait_for_ingest(stack: &Stack, ht: HypertableId, topic: &str, target: i64) {
-    use std::time::{Duration, Instant};
     let deadline = Instant::now() + Duration::from_secs(600);
     loop {
         let sum = stack.ingest_offset_sum(ht, topic).await;
@@ -247,6 +251,325 @@ pub async fn produce(files: usize, topic: &str) -> anyhow::Result<()> {
         out.display()
     );
     Ok(())
+}
+
+#[derive(Debug, Default, Serialize)]
+struct LevelStat {
+    parts: usize,
+    bytes: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct TenantQuery {
+    id: i64,
+    census_rows: i64,
+    observed_rows: i64,
+    scenarios: Vec<(String, f64)>,
+}
+
+#[derive(Debug, Serialize)]
+struct BskyRunReport {
+    label: String,
+    lines: i64,
+    mapped: i64,
+    poison: i64,
+    produce_secs: f64,
+    produce_rows_per_s: f64,
+    ingest_catchup_secs: f64,
+    stored_rows: i64,
+    offset_sum: i64,
+    compaction_secs: f64,
+    finalization_secs: f64,
+    parts_by_level: BTreeMap<i16, LevelStat>,
+    backpressure_deferrals: u64,
+    capped_merges: u64,
+    tenant_queries: Vec<TenantQuery>,
+    invariant_violations: Vec<String>,
+    metrics_dump: String,
+}
+
+/// Total committed rows and per-level part stats from the catalog — the
+/// storage-layer view of what ingest + compaction produced.
+async fn storage_snapshot(stack: &Stack, ht: HypertableId) -> (i64, BTreeMap<i16, LevelStat>) {
+    let parts = stack
+        .catalog
+        .live_parts(ht, None)
+        .await
+        .expect("live_parts");
+    let mut rows = 0i64;
+    let mut by_level: BTreeMap<i16, LevelStat> = BTreeMap::new();
+    for p in &parts {
+        rows += p.meta.row_count;
+        let e = by_level.entry(p.meta.level).or_default();
+        e.parts += 1;
+        e.bytes += p.meta.size_bytes;
+    }
+    (rows, by_level)
+}
+
+/// Parses a `metric_name{...} value` counter total out of a Prometheus dump
+/// (summing all label sets).
+fn counter_total(dump: &str, metric: &str) -> u64 {
+    dump.lines()
+        .filter(|l| l.starts_with(metric) && !l.starts_with('#'))
+        .filter_map(|l| l.rsplit(' ').next())
+        .filter_map(|v| v.parse::<f64>().ok())
+        .map(|v| v as u64)
+        .sum()
+}
+
+/// `bench bluesky run --files N [--wave-files W] [--flush-ms MS] [--label L]`:
+/// the full write path in one command — produce → ingest → ladder →
+/// finalization — with exactly-once asserted at volume.
+pub async fn run(
+    files: usize,
+    wave_files: Option<usize>,
+    flush_ms: u64,
+    label: &str,
+) -> anyhow::Result<()> {
+    // Recorder first, so in-process workers' counters are captured. Installed
+    // once per process; `bench` runs a single command, so this is safe.
+    let prom = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .context("install prometheus recorder")?;
+
+    let stack = Stack::start().await;
+    let topic = format!("bsky_{}", stack.nonce);
+    let ht = stack
+        .catalog
+        .create_hypertable(
+            "bsky",
+            &bsky_schema_json(),
+            &json!({ "columns": ["day"] }),
+            &["tenant_id".to_string(), "ts".to_string()],
+            "tenant_id",
+        )
+        .await
+        .context("create bsky hypertable")?;
+    stack.ensure_topic(&topic).await;
+
+    // In-process ingest (production guardrail defaults; wide event-time bound
+    // for the historical dataset) and compactor loop (production 4/10 fanouts).
+    let ingest_cfg = IngestConfig {
+        brokers: stack.brokers.clone(),
+        group_id: format!("bench-{}", stack.nonce),
+        flush_interval_ms: flush_ms,
+        max_buffer_rows: 100_000,
+        l0_slowdown_parts: ukiel_ingest::config::defaults::L0_SLOWDOWN_PARTS,
+        l0_stop_parts: ukiel_ingest::config::defaults::L0_STOP_PARTS,
+        warn_partitions_per_flush: ukiel_ingest::config::defaults::WARN_PARTITIONS_PER_FLUSH,
+        max_event_age_days: 30_000, // historical dataset
+        max_event_future_secs: 3600,
+        tables: vec![TableRoute {
+            topic: topic.clone(),
+            hypertable: "bsky".to_string(),
+            ts_column: "ts".to_string(),
+        }],
+    };
+    let ingest_worker = IngestWorker::new(stack.catalog.clone(), stack.store.clone(), ingest_cfg);
+    let ingest_token = CancellationToken::new();
+    let ingest_handle = {
+        let token = ingest_token.clone();
+        tokio::spawn(async move { ingest_worker.run(token).await })
+    };
+    let compactor = Compactor::new(
+        stack.catalog.clone(),
+        stack.store.clone(),
+        CompactorConfig {
+            worker_name: "bench-loop".to_string(),
+            l0_fanout: 4,
+            fanout: 10,
+            poll_interval_ms: 1000,
+            ..CompactorConfig::default()
+        },
+    );
+    let compactor_token = CancellationToken::new();
+    let compactor_handle = {
+        let token = compactor_token.clone();
+        tokio::spawn(async move { compactor.run(token).await })
+    };
+
+    // Produce (rate-aware if waves configured).
+    let wave = wave_files.map(|w| (ht, w));
+    let produce_start = Instant::now();
+    let outcome = stream_and_produce(&stack, &topic, files, wave).await?;
+    let produce_secs = produce_start.elapsed().as_secs_f64();
+
+    // Wait until ingest has consumed every produced message (offsets = lines).
+    let catchup_start = Instant::now();
+    let offset_sum =
+        wait_offset(&stack, ht, &topic, outcome.lines, Duration::from_secs(1800)).await;
+    let ingest_catchup_secs = catchup_start.elapsed().as_secs_f64();
+    ingest_token.cancel();
+    let _ = ingest_handle.await; // clean shutdown → final flush
+    compactor_token.cancel();
+    let _ = compactor_handle.await;
+
+    // Drain compaction + finalization to quiescence (finalize immediately:
+    // ingest stopped, so every partition is quiet).
+    let drain = Compactor::new(
+        stack.catalog.clone(),
+        stack.store.clone(),
+        CompactorConfig {
+            worker_name: "bench-drain".to_string(),
+            l0_fanout: 4,
+            fanout: 10,
+            finalize_after_secs: 0,
+            ..CompactorConfig::default()
+        },
+    );
+    let comp_start = Instant::now();
+    while drain.run_once().await?.merged_groups > 0 {}
+    let compaction_secs = comp_start.elapsed().as_secs_f64();
+    let fin_start = Instant::now();
+    while drain.finalize_once().await? > 0 {}
+    let finalization_secs = fin_start.elapsed().as_secs_f64();
+
+    let (stored_rows, parts_by_level) = storage_snapshot(&stack, ht).await;
+    let dump = prom.render();
+    let mut violations = Vec::new();
+    if stored_rows != outcome.mapped {
+        violations.push(format!(
+            "stored rows {stored_rows} != mapped events {} (exactly-once at storage)",
+            outcome.mapped
+        ));
+    }
+    if offset_sum != outcome.lines {
+        violations.push(format!(
+            "offset sum {offset_sum} != produced lines {} (ingest did not consume everything)",
+            outcome.lines
+        ));
+    }
+
+    // Per-tenant queryable suite over the top census tenants.
+    let mut tenant_queries = Vec::new();
+    for tenant in outcome.census.top100.iter().take(3) {
+        let ns = NamespaceId(tenant.id);
+        let _ = stack.catalog.create_logical_table(ns, "bsky", ht).await; // idempotent-ish
+        let observed = query_count(&stack, ns).await;
+        if observed != tenant.rows {
+            violations.push(format!(
+                "tenant {} queryable count {observed} != census {}",
+                tenant.id, tenant.rows
+            ));
+        }
+        let range = stack
+            .query(ns, "SELECT min(ts) AS lo, max(ts) AS hi FROM bsky")
+            .await
+            .unwrap_or_else(|_| json!([]));
+        let lo = range
+            .get(0)
+            .and_then(|r| r.get("lo"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let hi = range
+            .get(0)
+            .and_then(|r| r.get("hi"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(lo);
+        let mid = lo + (hi - lo) / 2;
+        let scenarios_sql = [
+            ("count", "SELECT count(*) AS n FROM bsky".to_string()),
+            (
+                "by_collection",
+                "SELECT collection, count(*) AS c FROM bsky GROUP BY collection ORDER BY c DESC LIMIT 10".to_string(),
+            ),
+            (
+                "ts_window",
+                format!("SELECT count(*) AS n FROM bsky WHERE ts BETWEEN {mid} AND {}", mid + 3_600_000),
+            ),
+        ];
+        let mut scenarios = Vec::new();
+        for (name, sql) in &scenarios_sql {
+            let ms = crate::report::warm_median_ms(5, || async {
+                stack
+                    .query(ns, sql)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{name}: {e}"))
+            })
+            .await?;
+            println!("PERF bsky/{}/{name}={ms:.1}", tenant.id);
+            scenarios.push((name.to_string(), ms));
+        }
+        tenant_queries.push(TenantQuery {
+            id: tenant.id,
+            census_rows: tenant.rows,
+            observed_rows: observed,
+            scenarios,
+        });
+    }
+
+    let report = BskyRunReport {
+        label: label.to_string(),
+        lines: outcome.lines,
+        mapped: outcome.mapped,
+        poison: outcome.poison,
+        produce_secs,
+        produce_rows_per_s: if produce_secs > 0.0 {
+            outcome.lines as f64 / produce_secs
+        } else {
+            0.0
+        },
+        ingest_catchup_secs,
+        stored_rows,
+        offset_sum,
+        compaction_secs,
+        finalization_secs,
+        parts_by_level,
+        backpressure_deferrals: counter_total(&dump, "ingest_backpressure_deferrals_total"),
+        capped_merges: counter_total(&dump, "compactor_capped_merges_total"),
+        tenant_queries,
+        invariant_violations: violations.clone(),
+        metrics_dump: dump,
+    };
+    let out = crate::report::write_json(&format!("bsky-run-{label}.json"), &report)?;
+    println!(
+        "bsky run: {} lines, {} mapped, stored {}, compaction {:.1}s, finalization {:.1}s → {}",
+        report.lines,
+        report.mapped,
+        report.stored_rows,
+        report.compaction_secs,
+        report.finalization_secs,
+        out.display()
+    );
+    if !violations.is_empty() {
+        bail!(
+            "write-path invariants violated (report written):\n  {}",
+            violations.join("\n  ")
+        );
+    }
+    Ok(())
+}
+
+/// Polls the ingest offset sum until it reaches `target` or the deadline.
+async fn wait_offset(
+    stack: &Stack,
+    ht: HypertableId,
+    topic: &str,
+    target: i64,
+    timeout: Duration,
+) -> i64 {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let sum = stack.ingest_offset_sum(ht, topic).await;
+        if sum >= target || Instant::now() >= deadline {
+            return sum;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn query_count(stack: &Stack, ns: NamespaceId) -> i64 {
+    stack
+        .query(ns, "SELECT count(*) AS n FROM bsky")
+        .await
+        .ok()
+        .and_then(|rows| {
+            rows.get(0)
+                .and_then(|r| r.get("n"))
+                .and_then(|n| n.as_i64())
+        })
+        .unwrap_or(-1)
 }
 
 #[cfg(test)]
