@@ -41,4 +41,24 @@ impl PostgresCatalog {
         .await?;
         Ok(())
     }
+
+    /// Feed lag per `(worker, hypertable)`: head commit id minus the worker's
+    /// cursor, floored at 0 — the `catalog_feed_lag` gauge (metrics P2).
+    /// `commits_feed_idx (hypertable_id, id)` serves the per-hypertable max.
+    pub async fn feed_lags(&self) -> Result<Vec<(String, HypertableId, i64)>, CatalogError> {
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT c.worker, c.hypertable_id,
+                    greatest(coalesce(m.head, 0) - c.last_commit_id, 0)
+             FROM worker_cursors c
+             LEFT JOIN LATERAL (
+                 SELECT max(id) AS head FROM commits WHERE hypertable_id = c.hypertable_id
+             ) m ON true",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(worker, ht, lag)| (worker, HypertableId(ht), lag))
+            .collect())
+    }
 }

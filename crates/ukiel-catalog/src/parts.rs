@@ -172,6 +172,81 @@ impl PostgresCatalog {
         Ok(rows)
     }
 
+    /// Live part counts per `(hypertable, level)` — the `catalog_live_parts`
+    /// gauge (metrics P2). The scan is bounded by live parts, exactly the
+    /// quantity being measured (partial `parts_live_idx` covers live rows).
+    pub async fn live_part_counts(&self) -> Result<Vec<(HypertableId, i16, i64)>, CatalogError> {
+        let rows: Vec<(i64, i16, i64)> = sqlx::query_as(
+            "SELECT hypertable_id, level, count(*) FROM parts
+             WHERE deleted_by_commit IS NULL
+             GROUP BY hypertable_id, level",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(ht, level, n)| (HypertableId(ht), level, n))
+            .collect())
+    }
+
+    /// Count of `(partition, level)` groups at or over their merge trigger —
+    /// the `compactor_backlog_groups` gauge (metrics P2). The migration-0007
+    /// index `(hypertable_id, partition_values, level)` serves the GROUP BY.
+    pub async fn backlog_groups(&self, l0_fanout: i64, fanout: i64) -> Result<i64, CatalogError> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM (
+                 SELECT level, count(DISTINCT created_by_commit) AS runs FROM parts
+                 WHERE deleted_by_commit IS NULL
+                 GROUP BY hypertable_id, partition_values, level) g
+             WHERE runs >= CASE WHEN level = 0 THEN $1 ELSE $2 END",
+        )
+        .bind(l0_fanout)
+        .bind(fanout)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
+    /// Partitions past `quiet_secs` with no L0 arrival still holding >1 live
+    /// run, plus the oldest such partition's quiet age in seconds — the
+    /// plan-17 terminal invariant ("cold partition = one run") as production
+    /// gauges (`compactor_unfinalized_partitions`, `_oldest_..._age_seconds`).
+    /// A partition with live runs but no L0 parts counts as quiet (matches
+    /// `partition_l0_quiet_since`'s coalesce-to-true). 0007 index.
+    pub async fn unfinalized_partitions(
+        &self,
+        quiet_secs: f64,
+    ) -> Result<(i64, f64), CatalogError> {
+        let (count, oldest): (i64, f64) = sqlx::query_as(
+            "WITH live_runs AS (
+                 SELECT hypertable_id, partition_values
+                 FROM parts
+                 WHERE deleted_by_commit IS NULL
+                 GROUP BY hypertable_id, partition_values
+                 HAVING count(DISTINCT created_by_commit) >= 2),
+             last_arrival AS (
+                 SELECT p.hypertable_id, p.partition_values, max(c.created_at) AS last_l0
+                 FROM parts p JOIN commits c ON c.id = p.created_by_commit
+                 WHERE p.level = 0
+                 GROUP BY p.hypertable_id, p.partition_values)
+             SELECT
+                 count(*) FILTER (
+                     WHERE a.last_l0 IS NULL
+                        OR a.last_l0 < now() - make_interval(secs => $1)),
+                 coalesce(max(EXTRACT(EPOCH FROM (now() - a.last_l0))) FILTER (
+                     WHERE a.last_l0 IS NULL
+                        OR a.last_l0 < now() - make_interval(secs => $1)), 0)::float8
+             FROM live_runs r
+             LEFT JOIN last_arrival a
+               ON a.hypertable_id = r.hypertable_id
+              AND a.partition_values = r.partition_values",
+        )
+        .bind(quiet_secs)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((count, oldest))
+    }
+
     /// Live parts of one partition (what a finalization merge consumes).
     pub async fn live_partition_parts(
         &self,

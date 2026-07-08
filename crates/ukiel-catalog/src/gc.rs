@@ -127,4 +127,45 @@ impl PostgresCatalog {
             .await?;
         Ok(())
     }
+
+    /// GC backlog scalars in one round-trip — the metrics-P2 GC gauges.
+    /// `pending_objects_sweep_idx` and `parts_reapable_idx` serve the counts;
+    /// the age minima are the oldest-in-backlog fence-stall proxies.
+    pub async fn gc_backlogs(&self) -> Result<GcBacklogs, CatalogError> {
+        let (pending, pending_oldest_secs, unpurged_tombstones, oldest_tombstone_secs): (
+            i64,
+            f64,
+            i64,
+            f64,
+        ) = sqlx::query_as(
+            "SELECT
+                 (SELECT count(*) FROM pending_objects),
+                 (SELECT coalesce(EXTRACT(EPOCH FROM (now() - min(created_at))), 0)
+                    FROM pending_objects)::float8,
+                 (SELECT count(*) FROM parts
+                   WHERE deleted_by_commit IS NOT NULL AND purged_at IS NULL),
+                 (SELECT coalesce(EXTRACT(EPOCH FROM (now() - min(c.created_at))), 0)
+                    FROM parts p JOIN commits c ON c.id = p.deleted_by_commit
+                   WHERE p.purged_at IS NULL)::float8",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(GcBacklogs {
+            pending,
+            pending_oldest_secs,
+            unpurged_tombstones,
+            oldest_tombstone_secs,
+        })
+    }
+}
+
+/// GC backlog gauges (metrics P2): pending-object count and oldest age, and
+/// unpurged-tombstone count and oldest deleting-commit age (a reap-fence
+/// stall shows here as a growing `oldest_tombstone_secs`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GcBacklogs {
+    pub pending: i64,
+    pub pending_oldest_secs: f64,
+    pub unpurged_tombstones: i64,
+    pub oldest_tombstone_secs: f64,
 }

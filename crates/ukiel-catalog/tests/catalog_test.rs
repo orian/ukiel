@@ -1057,3 +1057,83 @@ async fn live_parts_pruned_by_column_stats() {
         3
     );
 }
+
+#[tokio::test]
+async fn collector_probes_report_live_counts_lag_and_backlogs() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let day1 = json!({ "day": "2026-07-01" });
+    let day2 = json!({ "day": "2026-07-02" });
+
+    // day1: two L0 commits (2 runs) + one L1 commit; day2: one L0 commit.
+    add_l0_part(&catalog, ht, &day1).await;
+    add_l0_part(&catalog, ht, &day1).await;
+    add_l0_part(&catalog, ht, &day2).await;
+    let l1 = PartMeta {
+        path: "day1-l1.parquet".to_string(),
+        partition_values: day1.clone(),
+        packing_key_min: 1,
+        packing_key_max: 1,
+        row_count: 1,
+        size_bytes: 1,
+        level: 1,
+        column_stats: None,
+    };
+    catalog
+        .commit(ht, CommitOp::Add { parts: vec![l1] }, None)
+        .await
+        .unwrap();
+
+    // live_part_counts: 3 L0 + 1 L1 for this hypertable.
+    let mut counts = catalog.live_part_counts().await.unwrap();
+    counts.retain(|(h, _, _)| *h == ht);
+    counts.sort_by_key(|(_, level, _)| *level);
+    assert_eq!(counts, vec![(ht, 0, 3), (ht, 1, 1)]);
+
+    // backlog_groups(2, 10): only day1's level-0 group (2 runs >= 2) qualifies.
+    assert_eq!(catalog.backlog_groups(2, 10).await.unwrap(), 1);
+
+    // unfinalized: day1 has 3 distinct commits (>1 run) and is quiet at 0s.
+    let (unfin, oldest) = catalog.unfinalized_partitions(0.0).await.unwrap();
+    assert_eq!(unfin, 1);
+    assert!(oldest >= 0.0);
+    // A huge quiet window means nothing is quiet yet.
+    assert_eq!(catalog.unfinalized_partitions(3600.0).await.unwrap().0, 0);
+
+    // feed_lags: a lagging worker sees head-0; an ahead worker floors at 0.
+    catalog
+        .set_cursor("lagging", ht, CommitId(0))
+        .await
+        .unwrap();
+    catalog
+        .set_cursor("ahead", ht, CommitId(1_000_000))
+        .await
+        .unwrap();
+    let lags = catalog.feed_lags().await.unwrap();
+    let lagging = lags.iter().find(|(w, _, _)| w == "lagging").unwrap();
+    assert!(lagging.2 > 0, "lagging worker has positive lag");
+    let ahead = lags.iter().find(|(w, _, _)| w == "ahead").unwrap();
+    assert_eq!(ahead.2, 0, "greatest() floors lag at 0");
+
+    // gc_backlogs: one pending object; one tombstone after deleting the L1.
+    catalog
+        .register_pending_objects(ht, &["orphan.parquet".to_string()])
+        .await
+        .unwrap();
+    let live = catalog.live_partition_parts(ht, &day1).await.unwrap();
+    let l1_id = live.iter().find(|p| p.meta.level == 1).unwrap().id;
+    catalog
+        .commit(ht, CommitOp::Delete { parts: vec![l1_id] }, None)
+        .await
+        .unwrap();
+    let gc = catalog.gc_backlogs().await.unwrap();
+    assert_eq!(gc.pending, 1);
+    assert!(gc.pending_oldest_secs >= 0.0);
+    assert_eq!(gc.unpurged_tombstones, 1);
+    assert!(gc.oldest_tombstone_secs >= 0.0);
+
+    // pool_stats: at least one connection exists; idle never exceeds size.
+    let (size, idle) = catalog.pool_stats();
+    assert!(size >= 1);
+    assert!(idle <= size as usize);
+}
