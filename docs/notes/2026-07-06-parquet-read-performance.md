@@ -97,6 +97,11 @@ Perf smoke numbers get appended here after each plan.
 
 ## Baseline & results
 
+This note holds the **micro tier** (`tests/perf_smoke.rs`, ~100k synthetic
+rows). **Volume-scale baselines** (10–100 GB on ClickBench `hits` and Bluesky
+ndjson) live in `docs/notes/2026-07-08-macro-perf.md` (plan 30's `bench`
+binary).
+
 (Recorded by plan executors; medians from `tests/perf_smoke.rs`. Methodology,
 tiers beyond this micro harness, and results discipline:
 `docs/superpowers/specs/2026-07-06-ukiel-performance-testing.md`.)
