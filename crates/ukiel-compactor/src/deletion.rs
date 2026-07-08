@@ -81,7 +81,7 @@ pub async fn delete_key(
             row_count: kept.num_rows() as i64,
             size_bytes,
             level: part.meta.level,
-            column_stats: None,
+            column_stats: ukiel_core::stats::int64_column_stats(&kept),
         });
     }
 

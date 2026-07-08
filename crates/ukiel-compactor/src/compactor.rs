@@ -336,7 +336,7 @@ impl Compactor {
                 row_count: batch.num_rows() as i64,
                 size_bytes,
                 level: output_level,
-                column_stats: None,
+                column_stats: ukiel_core::stats::int64_column_stats(batch),
             });
         }
 

@@ -770,3 +770,42 @@ async fn cold_partitions_finalize_into_a_single_run() {
     // A single run is final: the sweep is idempotent.
     assert_eq!(compactor.finalize_once().await.unwrap(), 0);
 }
+
+#[tokio::test]
+async fn compaction_outputs_carry_column_stats() {
+    let env = setup().await;
+    add_l0(
+        &env,
+        "d1",
+        vec![json!({"tenant_id": 2, "ts": 10, "payload": "a"})],
+    )
+    .await;
+    add_l0(
+        &env,
+        "d1",
+        vec![json!({"tenant_id": 5, "ts": 99, "payload": "b"})],
+    )
+    .await;
+
+    let compactor = Compactor::new(
+        env.catalog.clone(),
+        env.store.clone(),
+        CompactorConfig::default(),
+    );
+    compactor.run_once().await.unwrap();
+
+    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
+    let l1 = parts
+        .iter()
+        .find(|p| p.meta.level == 1)
+        .expect("merged L1 part");
+    let stats = l1
+        .meta
+        .column_stats
+        .as_ref()
+        .expect("stats on compaction output");
+    assert_eq!(stats["ts"]["min"], json!(10));
+    assert_eq!(stats["ts"]["max"], json!(99));
+    assert_eq!(stats["tenant_id"]["min"], json!(2));
+    assert_eq!(stats["tenant_id"]["max"], json!(5));
+}
