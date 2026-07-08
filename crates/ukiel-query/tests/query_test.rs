@@ -694,3 +694,100 @@ async fn order_by_sort_key_results_stay_correct_and_ordered() {
         "expected the scan to carry a declared ordering hint; plan was:\n{plan}"
     );
 }
+
+#[tokio::test]
+async fn catalog_prunes_parts_by_ts_stats() {
+    let h = setup().await;
+    // A second table with two parts in disjoint ts ranges, stats populated.
+    let ht = h
+        .catalog
+        .create_hypertable(
+            "tsr",
+            &events_schema(),
+            &json!({"columns": []}),
+            &["tenant_id".to_string(), "ts".to_string()],
+            "tenant_id",
+        )
+        .await
+        .unwrap();
+    h.catalog
+        .create_logical_table(NamespaceId(1), "tsr", ht)
+        .await
+        .unwrap();
+    let schema = arrow_schema_from_json(&events_schema()).unwrap();
+
+    for (name, ts_base, payload) in [("early", 100i64, "old"), ("late", 10_000i64, "new")] {
+        let part = rows_to_parquet(
+            &schema,
+            "tenant_id",
+            "ts",
+            vec![json!({"tenant_id": 1, "ts": ts_base, "payload": payload})],
+        )
+        .unwrap();
+        let path = format!("ht/{ht}/L0/{name}.parquet");
+        let size = part.bytes.len() as i64;
+        h.store
+            .put(&Path::from(path.clone()), part.bytes.into())
+            .await
+            .unwrap();
+        h.catalog
+            .commit(
+                ht,
+                CommitOp::Add {
+                    parts: vec![PartMeta {
+                        path,
+                        partition_values: json!({}),
+                        packing_key_min: 1,
+                        packing_key_max: 1,
+                        row_count: 1,
+                        size_bytes: size,
+                        level: 0,
+                        column_stats: Some(json!({"ts": {"min": ts_base, "max": ts_base}})),
+                    }],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let store_url = url::Url::parse(STORE_URL).unwrap();
+    let ctx = ukiel_query::context::session_for_namespace(
+        &h.catalog,
+        NamespaceId(1),
+        h.store.clone(),
+        &store_url,
+    )
+    .await
+    .unwrap();
+
+    // Correctness: the predicate returns only the matching row.
+    let batches = ctx
+        .sql("SELECT payload FROM tsr WHERE ts < 5000")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(all_strings(&batches, "payload"), vec!["old"]);
+
+    // Pruning: the physical plan's file listing contains only the early part.
+    let batches = ctx
+        .sql("EXPLAIN SELECT payload FROM tsr WHERE ts < 5000")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let plan = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string();
+    assert!(
+        plan.contains("early.parquet"),
+        "plan should list the early part:\n{plan}"
+    );
+    assert!(
+        !plan.contains("late.parquet"),
+        "late part must be pruned in the catalog, not scanned:\n{plan}"
+    );
+}

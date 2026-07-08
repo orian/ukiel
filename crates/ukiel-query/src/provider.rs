@@ -28,6 +28,67 @@ use ukiel_core::{Hypertable, TableColumns};
 
 use crate::QueryError;
 
+/// Extracts per-column Int64 bounds from pushed-down filters for catalog
+/// part pruning. Conservative by construction: anything unrecognized simply
+/// contributes no bound. DataFusion splits conjunctions before pushdown, so
+/// top-level binary comparisons cover the practical cases.
+fn extract_int64_ranges(
+    filters: &[Expr],
+    schema: &datafusion::arrow::datatypes::Schema,
+) -> Vec<ukiel_core::ColumnRange> {
+    use datafusion::logical_expr::BinaryExpr;
+    use std::collections::HashMap;
+
+    let mut bounds: HashMap<String, (Option<i64>, Option<i64>)> = HashMap::new();
+    let mut apply = |name: &str, op: &Operator, value: i64| {
+        let Ok(field) = schema.field_with_name(name) else {
+            return;
+        };
+        if field.data_type() != &datafusion::arrow::datatypes::DataType::Int64 {
+            return;
+        }
+        let entry = bounds.entry(name.to_string()).or_insert((None, None));
+        match op {
+            Operator::Eq => {
+                entry.0 = Some(entry.0.map_or(value, |m| m.max(value)));
+                entry.1 = Some(entry.1.map_or(value, |m| m.min(value)));
+            }
+            Operator::Gt => entry.0 = Some(entry.0.map_or(value + 1, |m| m.max(value + 1))),
+            Operator::GtEq => entry.0 = Some(entry.0.map_or(value, |m| m.max(value))),
+            Operator::Lt => entry.1 = Some(entry.1.map_or(value - 1, |m| m.min(value - 1))),
+            Operator::LtEq => entry.1 = Some(entry.1.map_or(value, |m| m.min(value))),
+            _ => {}
+        }
+    };
+
+    for filter in filters {
+        if let Expr::BinaryExpr(BinaryExpr { left, op, right }) = filter {
+            match (left.as_ref(), right.as_ref()) {
+                (Expr::Column(c), Expr::Literal(ScalarValue::Int64(Some(v)), _)) => {
+                    apply(&c.name, op, *v)
+                }
+                (Expr::Literal(ScalarValue::Int64(Some(v)), _), Expr::Column(c)) => {
+                    // literal <op> col: mirror the operator.
+                    let mirrored = match op {
+                        Operator::Lt => Operator::Gt,
+                        Operator::LtEq => Operator::GtEq,
+                        Operator::Gt => Operator::Lt,
+                        Operator::GtEq => Operator::LtEq,
+                        other => *other,
+                    };
+                    apply(&c.name, &mirrored, *v)
+                }
+                _ => {}
+            }
+        }
+    }
+
+    bounds
+        .into_iter()
+        .map(|(column, (min, max))| ukiel_core::ColumnRange { column, min, max })
+        .collect()
+}
+
 pub struct UkielTableProvider {
     catalog: PostgresCatalog,
     hypertable: Hypertable,
@@ -98,9 +159,10 @@ impl TableProvider for UkielTableProvider {
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         // Catalog-pruned file list: only parts whose packing-key range
         // contains this namespace's key. Never lists the object store.
+        let ranges = extract_int64_ranges(filters, &self.physical_schema);
         let parts = self
             .catalog
-            .live_parts(self.hypertable.id, Some(self.packing_key_value))
+            .live_parts_pruned(self.hypertable.id, Some(self.packing_key_value), &ranges)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let files: Vec<PartitionedFile> = parts
