@@ -42,10 +42,15 @@ below). The reusable perf harness lives at `crates/ukiel-query/tests/perf_smoke.
 The catalog is a queryable database in front of every file open — most
 lakehouses don't have one. Prune before I/O exists:
 
-4. **Populate `column_stats`** (field exists since plan 1, never filled): at
-   minimum `ts` min/max per part, written by ingest + compactor. Extract time
-   bounds from query predicates in `scan()` and prune **parts in the catalog
-   query**. Same for `day` partition pruning (also currently unused).
+4. ~~**Populate `column_stats`**~~ **(plan 12, done)**: ingest + compactor +
+   deletion rewrites write per-column Int64 min/max (`ts`, packing key, any
+   Int64 column) into `parts.column_stats`; `scan()` extracts time bounds from
+   query predicates and `live_parts_pruned` eliminates whole parts in the
+   catalog query before any I/O. Day-partition pruning was **subsumed, not
+   implemented**: part-level `ts` min/max gives equal granularity (a `day`
+   partition and its parts share the same time bound), so a separate
+   `partition_values`-based clause would be redundant. Parts without stats
+   (all pre-plan-12 files) always survive — pruning is strictly an optimization.
 5. **Per-part key bitmap for packed files**: min/max ranges false-positive on
    sparse tenants (range 100–4500 "contains" keyless tenant 300). A roaring
    bitmap of distinct packing keys (~100s of bytes in `column_stats`) makes
@@ -103,9 +108,16 @@ to record another fixture in its own rows.
 
 | Scenario | Baseline | After plan 11 | After stats pruning |
 |---|---|---|---|
-| `wide/selective_count`: 1 tenant of 100 in packed file, `count(*)` | 16.0 ms | 13.4 ms | |
-| `wide/narrow_projection`: 1 of 8 columns | 13.6 ms | 8.9 ms | |
-| `wide/order_by_limit`: `ORDER BY ts LIMIT 100` | 16.1 ms | 11.0 ms | |
+| `wide/selective_count`: 1 tenant of 100 in packed file, `count(*)` | 16.0 ms | 13.4 ms | 13.6 ms |
+| `wide/narrow_projection`: 1 of 8 columns | 13.6 ms | 8.9 ms | 8.9 ms |
+| `wide/order_by_limit`: `ORDER BY ts LIMIT 100` | 16.1 ms | 11.0 ms | 12.1 ms |
+
+Stats pruning is flat on this fixture by design: the `wide` dataset is a
+single packed L1 file, and part pruning eliminates whole *files* — with one
+file there is nothing to drop. The win shows when a table spans many parts in
+disjoint time ranges; the `catalog_prunes_parts_by_ts_stats` query test asserts
+it directly (the pruned part never appears in the physical plan). Numbers
+recorded here for regression visibility only.
 
 Plan 11 wins on the micro fixture: row-group pruning + predicate pushdown
 (`selective_count`), column pruning (`narrow_projection`, the largest relative
