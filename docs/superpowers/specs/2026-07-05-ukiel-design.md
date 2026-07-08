@@ -197,9 +197,11 @@ capability:
 - e2e suite S0–S8 against the compose stack; dataset-parametric perf
   harness with committed baselines (plan 11).
 
-**Not yet** (roadmap rows; recommended order 21 → 27 → 14 → 29 → 13 → 15 →
-16 → 8, then 22 → 23 → 24; 25/26 gated on design decisions): metrics P2
-collector gauges (21), ingest sort-by-sort-key (27, latent soundness gap),
+**Not yet** (roadmap rows; recommended order 21 → 30 → 27 → 14 → 29 → 13 →
+15 → 16 → 8, then 22 → 23 → 24; 25/26 gated on design decisions): metrics P2
+collector gauges (21), macro perf harness (30 — 10–100 GB baselines on
+ClickBench hits + Bluesky ndjson, plan written), ingest sort-by-sort-key
+(27, latent soundness gap),
 shared writer/file layout (14), **streaming merge** (29 — issue 0005's real
 fix; bounded-memory compaction + whale-key splitting, the PB+-scale gate:
 `docs/notes/2026-07-08-streaming-merge.md`), read-side perf tiers
