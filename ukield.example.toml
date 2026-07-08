@@ -46,6 +46,17 @@ poll_interval_ms = 60000
 tombstone_grace_secs = 900
 orphan_grace_secs = 3600
 
+[collector]
+# Periodic metrics collector (P2): lag/backlog/pool/disk gauges. Runs in every
+# process regardless of role.
+interval_ms = 30000    # gauge refresh cadence
+cache_walk_every = 10  # run the (expensive) cache-dir byte walk every Nth tick
+
+# Standalone Prometheus listener for a process WITHOUT the query role (which
+# already serves /metrics on its own listener). Empty = disabled; a query-less
+# process then logs a startup warning that its metrics have no endpoint.
+# metrics_listen = "127.0.0.1:9187"
+
 # Tables are bootstrapped idempotently at startup. `topic`/`ts_column` are the
 # pre-pipelines routing config (see docs/notes/2026-07-06-pipelines.md).
 [[tables]]
