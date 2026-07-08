@@ -19,6 +19,8 @@ pub struct EncodedPart {
     pub row_count: i64,
     pub key_min: i64,
     pub key_max: i64,
+    /// Per-column Int64 min/max for catalog part pruning.
+    pub column_stats: Option<serde_json::Value>,
 }
 
 /// Sorts `rows` by (packing key, ts) and encodes them as one Parquet file
@@ -112,6 +114,7 @@ fn finish_batch(
         })?;
     let key_min = arrow::compute::min(keys).ok_or(IngestError::EmptyFlush)?;
     let key_max = arrow::compute::max(keys).ok_or(IngestError::EmptyFlush)?;
+    let column_stats = ukiel_core::stats::int64_column_stats(&batch);
 
     let sorting = vec![
         parquet::file::metadata::SortingColumn {
@@ -139,6 +142,7 @@ fn finish_batch(
         row_count: batch.num_rows() as i64,
         key_min,
         key_max,
+        column_stats,
     })
 }
 

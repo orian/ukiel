@@ -21,6 +21,15 @@ pub struct PartMeta {
     pub column_stats: Option<serde_json::Value>,
 }
 
+/// A per-column bound extracted from query predicates, used for part-level
+/// pruning against `PartMeta::column_stats`. Either bound may be open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnRange {
+    pub column: String,
+    pub min: Option<i64>,
+    pub max: Option<i64>,
+}
+
 /// A part as registered in the catalog.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Part {

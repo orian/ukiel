@@ -86,6 +86,7 @@ impl Flusher {
         let mut parts = Vec::with_capacity(prepared.len());
         for (path, item) in prepared {
             let size_bytes = item.part.bytes.len() as i64;
+            let column_stats = item.part.column_stats.clone();
             self.store
                 .put(&Path::from(path.clone()), item.part.bytes.into())
                 .await?;
@@ -97,7 +98,7 @@ impl Flusher {
                 row_count: item.part.row_count,
                 size_bytes,
                 level: 0,
-                column_stats: None,
+                column_stats,
             });
         }
         let result = self

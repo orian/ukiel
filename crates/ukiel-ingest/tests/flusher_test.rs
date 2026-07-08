@@ -102,6 +102,18 @@ async fn flush_writes_objects_and_commits_atomically() {
     assert_eq!(total_rows, 3);
     assert!(parts.iter().all(|p| p.meta.size_bytes > 0));
 
+    // Column stats populated for the two-row part (Int64 columns tenant_id + ts).
+    let with_stats = parts.iter().find(|p| p.meta.row_count == 2).unwrap();
+    let stats = with_stats
+        .meta
+        .column_stats
+        .as_ref()
+        .expect("stats populated");
+    assert_eq!(stats["ts"]["min"], serde_json::json!(1000));
+    assert_eq!(stats["ts"]["max"], serde_json::json!(2000));
+    assert_eq!(stats["tenant_id"]["min"], serde_json::json!(1));
+    assert_eq!(stats["tenant_id"]["max"], serde_json::json!(2));
+
     // Offsets advanced with the same commit.
     let offsets = catalog.ingest_offsets(ht_id, "events").await.unwrap();
     assert_eq!(offsets.get(&0), Some(&3));

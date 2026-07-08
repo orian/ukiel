@@ -4,11 +4,12 @@ pub mod commit;
 pub mod ids;
 pub mod part;
 pub mod schema;
+pub mod stats;
 pub mod table;
 
 pub use commit::{ChangeEvent, CommitOp, CommitResult};
 pub use ids::{CommitId, HypertableId, LogicalTableId, NamespaceId, PartId};
-pub use part::{Part, PartMeta};
+pub use part::{ColumnRange, Part, PartMeta};
 pub use schema::{
     ColumnKind, ColumnSpec, SchemaError, TableColumns, UKIEL_TYPE_META, arrow_schema_from_json,
     ukiel_type_of,
