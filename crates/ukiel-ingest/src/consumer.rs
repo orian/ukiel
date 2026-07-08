@@ -307,6 +307,8 @@ impl RouteIngest {
                 &self.config,
             ) {
                 buffers.deferred_flushes += 1;
+                counter!("ingest_backpressure_deferrals_total", "hypertable" => self.route.hypertable.clone())
+                    .increment(1);
                 tracing::warn!(
                     hypertable = %hypertable.name,
                     max_live_l0 = max_live,
