@@ -50,8 +50,11 @@ plan 16's target (roaring key bitmaps).
 - Whole-partition merges stream through RAM (same as v1 packed merges);
   streaming merge is deferred. Issue 0005: finalization makes this the
   compactor's peak-memory event — interim merge-input size cap shipped
-  (plan 28); streaming merge still deferred post-v1.
+  (plan 28); the real fix is designed as roadmap row 29
+  (`docs/notes/2026-07-08-streaming-merge.md`: k-way merge over sorted
+  inputs, whale-key splitting, slice sealing).
 - Split points are recomputed per merge (no remembered boundaries); stable
-  cut keys would tighten pre-finalization overlap and are deferred.
+  cut keys would tighten pre-finalization overlap and are deferred —
+  concretized as row 29's slice sealing.
 - Retention-aware compaction and L2+ scheduling niceties ride the same
   machinery later.

@@ -1,7 +1,7 @@
 # 0005 — Whole-partition merges are in-memory; finalization makes them the peak-memory event
 
 - **Severity:** Medium (scaling ceiling, not a correctness bug — degrades to OOM crash loop under partition growth)
-- **Status:** Interim cap shipped (plan 28) — `max_merge_input_bytes` skips oversized merges (warn + `compactor_capped_merges_total`) instead of OOM-crash-looping. Streaming merge remains the open fix, post-v1 after plan 14
+- **Status:** Interim cap shipped (plan 28) — `max_merge_input_bytes` skips oversized merges (warn + `compactor_capped_merges_total`) instead of OOM-crash-looping. Real fix designed: streaming merge + whale-key splitting + slice sealing (`docs/notes/2026-07-08-streaming-merge.md`, roadmap row 29, after 27/14) — the cap must not be the steady state at PB+ scale
 - **Components:** `crates/ukiel-compactor`
 - **Found by:** post-landing review of plans 17/18, 2026-07-08 (`docs/notes/2026-07-08-plan17-18-review.md`)
 
@@ -38,11 +38,17 @@ too, since a single level's runs can also grow arbitrarily large. The
 `size_bytes` stats needed are already on `PartMeta` (the same numbers drive
 `plan_chunks`' `bytes_per_row` estimate).
 
-**Real fix (post-v1):** streaming merge. Inputs are already sorted files, so
-a k-way merge over Parquet readers writing output chunk-by-chunk bounds
-memory at O(row-group) instead of O(partition) and removes the cap. Slots
-naturally after plan 14 (shared writer-props module restructures the write
-path this would build on).
+**Real fix (roadmap row 29, designed 2026-07-08):**
+`docs/notes/2026-07-08-streaming-merge.md`. The cap must not be the steady
+state: at target scale (PB+, 100–500 GB partitions and keys common), capped
+partitions would be the norm and the terminal invariant would stop holding
+exactly where read amp hurts most. The design: k-way streaming merge over
+already-sorted inputs (O(K·batch + row-group) RAM; plan 27 is the ordering
+trust anchor), incremental chunk cutting on actual encoded size, whale-key
+splitting into ts-sliced dedicated files (a 500 GB key must not be one
+file), and phase-2 slice sealing so sealed whale history is never rewritten
+(write amp O(1) per byte). After plans 27 and 14; retires or repurposes the
+cap.
 
 ## Notes
 

@@ -197,13 +197,15 @@ capability:
 - e2e suite S0–S8 against the compose stack; dataset-parametric perf
   harness with committed baselines (plan 11).
 
-**Not yet** (roadmap rows; recommended order 28 → 21 → 27 → 14 → 13 → 15 →
-16 → 8, then 22 → 23 → 24; 25/26 gated on design decisions): review
-hardening (28, issues 0005–0007/0009), metrics P2 collector gauges (21),
-ingest sort-by-sort-key (27, latent soundness gap), file-layout and caching
-perf tiers (14/13/15/16), pipelines & MVs (8 — plan written), partition
-coalescing + retention (22), feed horizon (23), egress (24), auth (25),
-horizontal ingest (26).
+**Not yet** (roadmap rows; recommended order 21 → 27 → 14 → 29 → 13 → 15 →
+16 → 8, then 22 → 23 → 24; 25/26 gated on design decisions): metrics P2
+collector gauges (21), ingest sort-by-sort-key (27, latent soundness gap),
+shared writer/file layout (14), **streaming merge** (29 — issue 0005's real
+fix; bounded-memory compaction + whale-key splitting, the PB+-scale gate:
+`docs/notes/2026-07-08-streaming-merge.md`), read-side perf tiers
+(13/15/16), pipelines & MVs (8 — plan written), partition coalescing +
+retention (22), feed horizon (23), egress (24), auth (25), horizontal
+ingest (26).
 
 Verification philosophy and the scenario catalog (S0–S8, invariants I1–I8)
 live in `docs/superpowers/specs/2026-07-05-ukiel-testing-design.md`; the e2e
@@ -247,9 +249,11 @@ GC hygiene.
   `alter_hypertable_add_column` API (storage layer already handles additive
   evolution via schema-adapting rewrites), streaming merges (compaction
   currently holds a whole merge group in RAM — issue 0005: finalization
-  makes this the peak-memory event; interim input-size cap in roadmap
-  row 28), stable split points across
-  merges, **partition coalescing** (rewrite aged fine partitions into
+  makes this the peak-memory event; interim input-size cap shipped in
+  plan 28, real fix designed as roadmap row 29 —
+  `docs/notes/2026-07-08-streaming-merge.md`: k-way merge over sorted
+  inputs, whale-key splitting into ts-sliced dedicated files, slice
+  sealing; subsumes the old "stable split points" item), **partition coalescing** (rewrite aged fine partitions into
   coarse ones via a per-hypertable declared coarsening mapping, e.g.
   day → month — the answer to the per-partition file floor; the worker
   applies the mapping, never parses partition values), **change
