@@ -20,6 +20,7 @@ use ukiel_catalog::{OffsetRange, PostgresCatalog};
 use ukiel_core::Hypertable;
 
 use crate::IngestError;
+use crate::assignment::{Ownership, desired_assignment};
 use crate::config::{IngestConfig, TableRoute};
 use crate::flusher::{FlushItem, Flusher};
 
@@ -188,23 +189,18 @@ impl RouteIngest {
         // topic to actually exist with partitions. A freshly-declared topic is
         // auto-created lazily; a metadata fetch that races that creation can
         // report zero partitions, which would silently consume nothing.
-        let mut tpl = TopicPartitionList::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
+        let existing = loop {
             let metadata =
                 consumer.fetch_metadata(Some(&self.route.topic), Duration::from_secs(10))?;
-            let partitions = metadata
+            let ids: Vec<i32> = metadata
                 .topics()
                 .iter()
                 .find(|t| t.name() == self.route.topic)
-                .map(|t| t.partitions())
-                .unwrap_or(&[]);
-            if !partitions.is_empty() {
-                for p in partitions {
-                    let next = stored.get(&p.id()).copied().unwrap_or(0);
-                    tpl.add_partition_offset(&self.route.topic, p.id(), Offset::Offset(next))?;
-                }
-                break;
+                .map(|t| t.partitions().iter().map(|p| p.id()).collect())
+                .unwrap_or_default();
+            if !ids.is_empty() {
+                break ids;
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(IngestError::Config(format!(
@@ -213,6 +209,14 @@ impl RouteIngest {
                 )));
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+
+        // Ownership is `All` today (single writer per topic). Horizontal
+        // ingest narrows this to a leased subset (roadmap row 26) — the seam
+        // is the `Ownership` argument, nothing else.
+        let mut tpl = TopicPartitionList::new();
+        for ps in desired_assignment(&existing, &Ownership::All, &stored) {
+            tpl.add_partition_offset(&self.route.topic, ps.partition, Offset::Offset(ps.offset))?;
         }
         consumer.assign(&tpl)?;
         Ok(consumer)
