@@ -30,16 +30,25 @@ pub struct IngestConfig {
     pub tables: Vec<TableRoute>,
 }
 
+/// Guardrail defaults (issue 0009: one source of truth — ukield's
+/// `IngestSection` and the e2e fixture reference these, so the production
+/// defaults cannot drift between the crate and its embedders).
+pub mod defaults {
+    pub const L0_SLOWDOWN_PARTS: usize = 30;
+    pub const L0_STOP_PARTS: usize = 200;
+    pub const WARN_PARTITIONS_PER_FLUSH: usize = 64;
+}
+
 fn default_l0_slowdown_parts() -> usize {
-    30
+    defaults::L0_SLOWDOWN_PARTS
 }
 
 fn default_l0_stop_parts() -> usize {
-    200
+    defaults::L0_STOP_PARTS
 }
 
 fn default_warn_partitions_per_flush() -> usize {
-    64
+    defaults::WARN_PARTITIONS_PER_FLUSH
 }
 
 fn default_max_event_age_days() -> u64 {

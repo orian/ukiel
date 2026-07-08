@@ -140,9 +140,9 @@ impl Default for IngestSection {
             group_id: "ukield".to_string(),
             flush_interval_ms: 10_000,
             max_buffer_rows: 100_000,
-            l0_slowdown_parts: 30,
-            l0_stop_parts: 200,
-            warn_partitions_per_flush: 64,
+            l0_slowdown_parts: ukiel_ingest::config::defaults::L0_SLOWDOWN_PARTS,
+            l0_stop_parts: ukiel_ingest::config::defaults::L0_STOP_PARTS,
+            warn_partitions_per_flush: ukiel_ingest::config::defaults::WARN_PARTITIONS_PER_FLUSH,
             max_event_age_days: 3650,
             max_event_future_secs: 3600,
         }
