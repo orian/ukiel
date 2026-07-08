@@ -62,6 +62,45 @@ impl PostgresCatalog {
         Ok(rows.into_iter().map(Part::from).collect())
     }
 
+    /// `live_parts` plus stats-based pruning: a part is excluded only when its
+    /// column_stats PROVE it cannot overlap a requested range. Missing stats
+    /// (or a missing column entry) keep the part — pruning is an optimization,
+    /// never a correctness dependency.
+    pub async fn live_parts_pruned(
+        &self,
+        hypertable_id: HypertableId,
+        key: Option<i64>,
+        ranges: &[ukiel_core::ColumnRange],
+    ) -> Result<Vec<Part>, CatalogError> {
+        let mut sql = format!(
+            "SELECT {PART_COLUMNS} FROM parts
+             WHERE hypertable_id = $1 AND deleted_by_commit IS NULL
+               AND ($2::BIGINT IS NULL OR (packing_key_min <= $2 AND packing_key_max >= $2))"
+        );
+        // Three binds per range: column name, min, max. NULL bind = open bound.
+        for i in 0..ranges.len() {
+            let col = 3 + i * 3; // column-name bind
+            let min = col + 1;
+            let max = col + 2;
+            sql.push_str(&format!(
+                " AND ( column_stats -> ${col} IS NULL
+                        OR ( (${min}::BIGINT IS NULL
+                              OR (column_stats -> ${col} ->> 'max')::bigint >= ${min})
+                         AND (${max}::BIGINT IS NULL
+                              OR (column_stats -> ${col} ->> 'min')::bigint <= ${max}) ) )"
+            ));
+        }
+        sql.push_str(" ORDER BY id");
+
+        let mut query = sqlx::query_as::<_, PartRow>(sqlx::AssertSqlSafe(sql));
+        query = query.bind(hypertable_id.0).bind(key);
+        for range in ranges {
+            query = query.bind(&range.column).bind(range.min).bind(range.max);
+        }
+        let rows: Vec<PartRow> = query.fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(Part::from).collect())
+    }
+
     /// True iff no L0 part was committed to this partition within the last
     /// `quiet_secs` (rows are never deleted, so tombstoned/purged L0 parts
     /// still count as arrivals). Drives cold-partition finalization.

@@ -941,3 +941,86 @@ async fn capacity_probes_count_l0_runs_and_candidates() {
     // day1 now has a single run (the L1 merge); day2 still has one L0 run.
     assert!(catalog.finalize_candidates(ht).await.unwrap().is_empty());
 }
+
+use ukiel_core::ColumnRange;
+
+fn part_meta_with_ts(path: &str, ts_min: i64, ts_max: i64) -> PartMeta {
+    let mut meta = part_meta(path, 1, 10);
+    meta.column_stats = Some(json!({"ts": {"min": ts_min, "max": ts_max}}));
+    meta
+}
+
+#[tokio::test]
+async fn live_parts_pruned_by_column_stats() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![
+                    part_meta_with_ts("early.parquet", 0, 100),
+                    part_meta_with_ts("late.parquet", 1000, 2000),
+                    part_meta("no-stats.parquet", 1, 10), // must always survive
+                ],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let range = |min, max| ColumnRange {
+        column: "ts".to_string(),
+        min,
+        max,
+    };
+
+    // ts <= 150: excludes 'late'.
+    let parts = catalog
+        .live_parts_pruned(ht, None, &[range(None, Some(150))])
+        .await
+        .unwrap();
+    let paths: Vec<_> = parts.iter().map(|p| p.meta.path.as_str()).collect();
+    assert_eq!(paths, vec!["early.parquet", "no-stats.parquet"]);
+
+    // ts >= 500: excludes 'early'.
+    let parts = catalog
+        .live_parts_pruned(ht, None, &[range(Some(500), None)])
+        .await
+        .unwrap();
+    let paths: Vec<_> = parts.iter().map(|p| p.meta.path.as_str()).collect();
+    assert_eq!(paths, vec!["late.parquet", "no-stats.parquet"]);
+
+    // 200..=500: only the stats-less part survives.
+    let parts = catalog
+        .live_parts_pruned(ht, None, &[range(Some(200), Some(500))])
+        .await
+        .unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].meta.path, "no-stats.parquet");
+
+    // A range on a column with no stats anywhere prunes nothing.
+    let parts = catalog
+        .live_parts_pruned(
+            ht,
+            None,
+            &[ColumnRange {
+                column: "nope".to_string(),
+                min: Some(1),
+                max: Some(2),
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(parts.len(), 3);
+
+    // Empty ranges == live_parts.
+    assert_eq!(
+        catalog
+            .live_parts_pruned(ht, None, &[])
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+}
