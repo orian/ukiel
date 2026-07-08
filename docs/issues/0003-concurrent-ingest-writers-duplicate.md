@@ -44,7 +44,9 @@ duplicate data.
 True horizontal ingest (partition-subset ownership, e.g. leases per
 `(topic, kafka_partition)` in the catalog) stays future work — the CAS makes
 it safe to build later by making the current single-writer assumption
-enforced rather than assumed.
+enforced rather than assumed. Sketch: `docs/notes/2026-07-07-ingest-scaleout.md`
+(roadmap row 26); the ownership seam it plugs into (`desired_assignment` /
+`Ownership::All | Subset`) lives in `ukiel-ingest` today.
 
 ## Notes
 
