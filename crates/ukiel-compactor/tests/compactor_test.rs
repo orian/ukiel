@@ -809,3 +809,64 @@ async fn compaction_outputs_carry_column_stats() {
     assert_eq!(stats["tenant_id"]["min"], json!(2));
     assert_eq!(stats["tenant_id"]["max"], json!(5));
 }
+
+#[tokio::test]
+async fn oversized_merges_are_capped_not_attempted() {
+    let env = setup().await;
+    // Two L0 commits on one partition (>= l0_fanout, so the ladder would merge).
+    add_l0(
+        &env,
+        "d1",
+        vec![json!({"tenant_id": 1, "ts": 10, "payload": "a"})],
+    )
+    .await;
+    add_l0(
+        &env,
+        "d1",
+        vec![json!({"tenant_id": 2, "ts": 20, "payload": "b"})],
+    )
+    .await;
+
+    // Cap of 1 byte: every real part exceeds it. finalize_after_secs: 0 makes
+    // the fresh partition immediately quiet so the finalize path is reached.
+    let capped = Compactor::new(
+        env.catalog.clone(),
+        env.store.clone(),
+        CompactorConfig {
+            max_merge_input_bytes: 1,
+            finalize_after_secs: 0,
+            ..CompactorConfig::default()
+        },
+    );
+
+    // Ladder merge is capped: no merge, both L0 parts stay live.
+    let stats = capped.run_once().await.unwrap();
+    assert_eq!(stats.merged_groups, 0, "capped merge must not run");
+    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
+    assert_eq!(parts.len(), 2);
+    assert!(parts.iter().all(|p| p.meta.level == 0));
+
+    // Finalization is capped too: partition stays multi-run.
+    assert_eq!(capped.finalize_once().await.unwrap(), 0);
+    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
+    assert_eq!(parts.len(), 2);
+
+    // max_merge_input_bytes: 0 (unlimited) disables the cap. A distinct
+    // worker_name gives it a fresh feed cursor so it re-plans the same L0s.
+    let unlimited = Compactor::new(
+        env.catalog.clone(),
+        env.store.clone(),
+        CompactorConfig {
+            worker_name: "compactor-unlimited".to_string(),
+            max_merge_input_bytes: 0,
+            ..CompactorConfig::default()
+        },
+    );
+    let stats = unlimited.run_once().await.unwrap();
+    assert_eq!(stats.merged_groups, 1, "uncapped merge must run");
+    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
+    assert!(
+        parts.iter().any(|p| p.meta.level == 1),
+        "merged L1 part present"
+    );
+}
