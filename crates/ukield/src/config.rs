@@ -19,6 +19,8 @@ pub struct UkieldConfig {
     pub compactor: CompactorSection,
     #[serde(default)]
     pub gc: GcSection,
+    #[serde(default)]
+    pub collector: CollectorSection,
     /// Tables bootstrapped idempotently at startup.
     #[serde(default)]
     pub tables: Vec<TableConfig>,
@@ -199,6 +201,27 @@ impl Default for GcSection {
             poll_interval_ms: 60_000,
             tombstone_grace_secs: 900.0,
             orphan_grace_secs: 3600,
+        }
+    }
+}
+
+/// Periodic metrics collector (metrics P2): the gauge families that need a
+/// query or API call each tick. Role-independent; runs in every process.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct CollectorSection {
+    /// Tick cadence. Every family runs each tick except the cache-dir walk.
+    pub interval_ms: u64,
+    /// Run the (expensive) cache-dir byte walk every Nth tick; the cheap
+    /// free-ratio statvfs still runs every tick.
+    pub cache_walk_every: u32,
+}
+
+impl Default for CollectorSection {
+    fn default() -> Self {
+        Self {
+            interval_ms: 30_000,
+            cache_walk_every: 10,
         }
     }
 }

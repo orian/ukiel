@@ -200,6 +200,10 @@ pub async fn run_with_bound_addr(
         });
     }
 
+    // Periodic gauge collector (metrics P2): lag, backlog, pool, and disk
+    // families. Role-independent, like metrics-upkeep below.
+    crate::collector::spawn(&mut tasks, &cfg, catalog.clone(), shutdown.clone());
+
     // Drain histogram buffers between scrapes; without upkeep they grow
     // unboundedly (metrics P1). Runs regardless of the query role.
     {
