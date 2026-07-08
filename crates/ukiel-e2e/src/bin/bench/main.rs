@@ -12,6 +12,7 @@
 
 use std::process::ExitCode;
 
+mod bluesky;
 mod hits;
 mod report;
 
@@ -55,6 +56,14 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
             hits::queries(iters, label).await
         }
         (Some("hits"), sub) => anyhow::bail!("unknown `hits` subcommand {sub:?}\n\n{USAGE}"),
+        (Some("bluesky"), Some("produce")) => {
+            let files = opt_usize(args, "--files")?
+                .ok_or_else(|| anyhow::anyhow!("bluesky produce needs --files N"))?;
+            let topic = opt_str(args, "--topic").unwrap_or("bsky");
+            bluesky::produce(files, topic).await
+        }
+        (Some("bluesky"), Some("run")) => anyhow::bail!("`bluesky run` lands in plan-30 task 5"),
+        (Some("bluesky"), sub) => anyhow::bail!("unknown `bluesky` subcommand {sub:?}\n\n{USAGE}"),
         (Some(other), _) => anyhow::bail!("unknown command '{other}'\n\n{USAGE}"),
     }
 }
