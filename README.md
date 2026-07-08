@@ -41,6 +41,9 @@ soon, but i'd like to run it in prod to test query performance.
 Rust workspace. Design spec: `docs/superpowers/specs/2026-07-05-ukiel-design.md`,
 plans: `docs/superpowers/plans/`, concept notes: `docs/notes/`
 (e.g. [schema management](docs/notes/schema-management.md)).
+Plans follow the house format — the `write-plan` skill
+(`.claude/skills/write-plan/`) holds the process and template for writing
+one from a roadmap row.
 
 ## Requirements
 
