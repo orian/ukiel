@@ -12,6 +12,8 @@
 
 use std::process::ExitCode;
 
+mod hits;
+
 const USAGE: &str = "\
 bench — ukiel macro perf harness (plan 30, manual-only, run with --release)
 
@@ -37,12 +39,32 @@ async fn main() -> ExitCode {
 }
 
 async fn run(args: &[String]) -> anyhow::Result<()> {
-    let mut it = args.iter().map(String::as_str);
-    match it.next() {
-        None | Some("--help") | Some("-h") => {
+    match (
+        args.first().map(String::as_str),
+        args.get(1).map(String::as_str),
+    ) {
+        (None, _) | (Some("--help"), _) | (Some("-h"), _) => {
             println!("{USAGE}");
             Ok(())
         }
-        Some(other) => anyhow::bail!("unknown command '{other}'\n\n{USAGE}"),
+        (Some("hits"), Some("load")) => hits::load(opt_usize(args, "--files")?).await,
+        (Some("hits"), Some("queries")) => anyhow::bail!("`hits queries` lands in plan-30 task 3"),
+        (Some("hits"), sub) => anyhow::bail!("unknown `hits` subcommand {sub:?}\n\n{USAGE}"),
+        (Some(other), _) => anyhow::bail!("unknown command '{other}'\n\n{USAGE}"),
+    }
+}
+
+/// Value of a `--flag N` option, if present. Errors on a non-integer value.
+fn opt_usize(args: &[String], flag: &str) -> anyhow::Result<Option<usize>> {
+    match args.iter().position(|a| a == flag) {
+        Some(i) => {
+            let raw = args
+                .get(i + 1)
+                .ok_or_else(|| anyhow::anyhow!("{flag} needs a value"))?;
+            Ok(Some(raw.parse().map_err(|_| {
+                anyhow::anyhow!("{flag} value '{raw}' is not a non-negative integer")
+            })?))
+        }
+        None => Ok(None),
     }
 }
