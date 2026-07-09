@@ -948,3 +948,31 @@ In `docs/superpowers/plans/2026-07-05-ukiel-v1-roadmap.md`, plan 13's row alread
 git add docs/
 git commit -m "docs: record parquet metadata cache status, roadmap row 13 executed"
 ```
+
+---
+
+## Measured results (2026-07-09)
+
+Verified on the ClickBench `hits` 10 GB tier (100M rows, 1,102 live L1 parts,
+per-tenant fan-out 67–108 files/query) — the exact bottleneck this plan
+targeted. Same machine and tuned build (ThinLTO + `target-cpu=native`),
+identical fixture, so the footer cache is the only variable
+(`bench/bench.sh cache13 tuned --skip-bluesky`). Warm-median latency,
+**tuned (no cache) → cache13**:
+
+| scenario | heavy | median | light |
+|---|---|---|---|
+| `count` | 40.4 → 24.1 ms (−40%) | 48.5 → 32.1 (−34%) | 42.3 → 27.1 (−36%) |
+| `adv_filter` | 51.2 → 36.0 (−30%) | 60.7 → 37.4 (−38%) | 47.5 → 29.8 (−37%) |
+| `distinct_users` | 67.5 → 52.9 (−21%) | 52.7 → 35.6 (−33%) | 45.7 → 27.8 (−39%) |
+| `top_urls` | 366.2 → 366.8 (±0%) | 52.4 → 38.0 (−27%) | 50.8 → 31.8 (−37%) |
+| `search_phrases` | 182.9 → 181.4 (−1%) | 54.5 → 43.1 (−21%) | 50.3 → 32.6 (−35%) |
+| `ts_window` / `minutely` | 2–4 ms (unchanged) | | |
+
+The cache does exactly what the plan predicted: the fixed footer-read floor
+(67–108 files × ~2 object-store roundtrips) drops **~30–40%** on every
+fan-out-bound query. Scan-bound heavy-tenant string aggregations (`top_urls`,
+`search_phrases` over 8.5M rows) are dominated by actual scan work, not footer
+reads, so they stay flat — the cache never touches the scan path. Already
+stats-pruned queries (`ts_window`/`minutely`, plan 12) were near-zero and stay
+there. Full tables + reproduce steps: `bench/README.md` §6.

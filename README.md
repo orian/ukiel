@@ -45,6 +45,15 @@ Plans follow the house format — the `write-plan` skill
 (`.claude/skills/write-plan/`) holds the process and template for writing
 one from a roadmap row.
 
+### Benchmarks
+
+Volume-scale benchmarks (ClickBench `hits` reads, Bluesky ndjson write path)
+run against the compose stack via the `bench` binary — runbook, tooling, and
+recorded results in [`bench/README.md`](bench/README.md). Latest headline: the
+process-wide Parquet footer cache (plan 13) cut per-tenant read latency
+**~30–40%** at the 100M-row / 10 GB tier by removing the 67–108-footer-reads
+fan-out floor.
+
 ## Requirements
 
 This repo needs Rust. I run it on the newest stable version. Beware, the dependiecies for this project are crazy (DataFlow, Parquet, etc.)
