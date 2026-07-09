@@ -3,6 +3,7 @@
 pub mod compactor;
 pub mod deletion;
 mod error;
+pub mod merge;
 pub mod rewrite;
 
 pub use error::CompactorError;
