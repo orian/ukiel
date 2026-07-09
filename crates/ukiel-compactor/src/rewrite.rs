@@ -7,13 +7,73 @@ use std::sync::Arc;
 use arrow::array::{Array, Int64Array, RecordBatch};
 use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
+use futures::StreamExt;
+use futures::stream::BoxStream;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use ukiel_core::{Part, Placement};
+use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+use ukiel_core::{Part, Placement, TableColumns};
 
 use crate::CompactorError;
+
+/// Batch size for merge input streams: small enough that K streams stay cheap,
+/// large enough to amortize decode (K × `MERGE_BATCH_ROWS` rows resident).
+pub const MERGE_BATCH_ROWS: usize = 8 * 1024;
+
+/// One async, schema-adapted, materialized-recomputed batch stream over a part,
+/// carrying its path for error attribution (the merge guard names the file).
+pub struct PartBatchStream {
+    pub path: String,
+    pub stream: BoxStream<'static, Result<RecordBatch, CompactorError>>,
+}
+
+/// One async batch stream per input part. Range-reads via `ParquetObjectReader`
+/// (O(row-group) memory per stream — the file is never resident), applying the
+/// existing `adapt_to_schema` (additive evolution: old files NULL-fill new
+/// columns) and `apply_defaults_and_materialized` (organic backfill) **per
+/// batch** — both row-wise deterministic, so per-batch ≡ the old post-concat
+/// application. `read_parts_to_batch` is untouched (deletion still uses it).
+pub async fn part_streams(
+    store: &Arc<dyn ObjectStore>,
+    schema: SchemaRef,
+    cols: &TableColumns,
+    parts: &[Part],
+) -> Result<Vec<PartBatchStream>, CompactorError> {
+    let mut out = Vec::with_capacity(parts.len());
+    for part in parts {
+        let path = part.meta.path.clone();
+        let reader = ParquetObjectReader::new(store.clone(), Path::from(path.clone()));
+        let raw = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .map_err(|source| CompactorError::PartRead {
+                path: path.clone(),
+                source,
+            })?
+            .with_batch_size(MERGE_BATCH_ROWS)
+            .build()
+            .map_err(|source| CompactorError::PartRead {
+                path: path.clone(),
+                source,
+            })?;
+        let schema = schema.clone();
+        let cols = cols.clone();
+        let err_path = path.clone();
+        let stream = raw
+            .map(move |batch| {
+                let batch = batch.map_err(|source| CompactorError::PartRead {
+                    path: err_path.clone(),
+                    source,
+                })?;
+                let adapted = adapt_to_schema(batch, &schema)?;
+                Ok(ukiel_expr::apply_defaults_and_materialized(adapted, &cols)?)
+            })
+            .boxed();
+        out.push(PartBatchStream { path, stream });
+    }
+    Ok(out)
+}
 
 /// Downloads every part and concatenates all row batches into one, adapting
 /// each file to `schema`: a column the file predates contributes NULLs
@@ -305,6 +365,94 @@ mod tests {
                 column_stats: None,
             },
             created_by_commit: CommitId(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn part_streams_adapt_schema_recompute_and_attribute_errors() {
+        use futures::StreamExt;
+        use ukiel_core::TableColumns;
+
+        // Target: adds `region` and a materialized `doubled = region * 2`.
+        let cols = TableColumns::parse(&json!({"fields": [
+            {"name": "tenant_id", "type": "int64"},
+            {"name": "ts", "type": "timestamp_ms"},
+            {"name": "region", "type": "int64"},
+            {"name": "doubled", "type": "int64", "materialized": "region * 2"}
+        ]}))
+        .unwrap();
+        let target = Arc::new(cols.physical_schema());
+        let sk = vec!["tenant_id".to_string(), "ts".to_string()];
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        // Part A predates `region`/`doubled` (only tenant_id, ts).
+        let schema_a = arrow_schema_from_json(&json!({"fields": [
+            {"name": "tenant_id", "type": "int64"},
+            {"name": "ts", "type": "timestamp_ms"}
+        ]}))
+        .unwrap();
+        let a = rows_to_parquet(
+            &schema_a,
+            "tenant_id",
+            "ts",
+            &sk,
+            vec![json!({"tenant_id": 1, "ts": 10})],
+        )
+        .unwrap();
+        store
+            .put(&Path::from("a.parquet"), a.bytes.clone().into())
+            .await
+            .unwrap();
+        // Part B carries `region`.
+        let schema_b = arrow_schema_from_json(&json!({"fields": [
+            {"name": "tenant_id", "type": "int64"},
+            {"name": "ts", "type": "timestamp_ms"},
+            {"name": "region", "type": "int64"}
+        ]}))
+        .unwrap();
+        let b = rows_to_parquet(
+            &schema_b,
+            "tenant_id",
+            "ts",
+            &sk,
+            vec![json!({"tenant_id": 2, "ts": 20, "region": 5})],
+        )
+        .unwrap();
+        store
+            .put(&Path::from("b.parquet"), b.bytes.clone().into())
+            .await
+            .unwrap();
+
+        let pa = part("a.parquet", &a);
+        let pb = part("b.parquet", &b);
+        let mut streams = part_streams(&store, target.clone(), &cols, &[pa, pb])
+            .await
+            .unwrap();
+        assert_eq!(streams[0].path, "a.parquet");
+
+        let ba = streams[0].stream.next().await.unwrap().unwrap();
+        assert!(ba.num_rows() <= MERGE_BATCH_ROWS);
+        let ri = ba.schema().index_of("region").unwrap();
+        assert!(ba.column(ri).is_null(0), "predating column is NULL-filled");
+
+        let bb = streams[1].stream.next().await.unwrap().unwrap();
+        let di = bb.schema().index_of("doubled").unwrap();
+        let doubled: &Int64Array = bb.column(di).as_any().downcast_ref().unwrap();
+        assert_eq!(doubled.value(0), 10, "materialized recomputed per batch");
+
+        // A corrupt file fails with the offending path attributed.
+        store
+            .put(
+                &Path::from("bad.parquet"),
+                bytes::Bytes::from_static(b"not parquet").into(),
+            )
+            .await
+            .unwrap();
+        let mut bad = part("bad.parquet", &b);
+        bad.meta.path = "bad.parquet".to_string();
+        match part_streams(&store, target, &cols, &[bad]).await {
+            Err(CompactorError::PartRead { path, .. }) => assert_eq!(path, "bad.parquet"),
+            other => panic!("expected PartRead(bad.parquet), got {:?}", other.err()),
         }
     }
 
