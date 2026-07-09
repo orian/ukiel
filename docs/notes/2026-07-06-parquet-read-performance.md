@@ -60,19 +60,29 @@ lakehouses don't have one. Prune before I/O exists:
    provider hands DataFusion exact row-group selections **without reading
    footers** — the catalog becomes a global page index.
 
-## Tier 3 — write-side layout & encoding (rides the compactor)
+## Tier 3 — write-side layout & encoding (rides the compactor) — plan 14, done
 
-7. **Row groups aligned to packing-key runs** (a row group never spans two
-   keys, up to a size cap): row-group stats become perfectly selective for
-   the isolation predicate.
-8. **Row-group size discipline** for compaction output (~64–128k rows):
-   large enough to amortize metadata, small enough to prune.
-9. **Encodings**: `DELTA_BINARY_PACKED` for sorted `ts` (delta-packs
-   spectacularly → fewer pages → less I/O); dictionary stays for `utf8`.
-   Compression per level: L0 = LZ4 (3–5× faster decompress, short-lived),
-   L1+ = ZSTD (read-many, space wins) — compaction re-encodes anyway, free.
-10. **Bloom filters** on chosen high-cardinality non-sort columns
-    (write-side per-column enable; DataFusion prunes with them).
+All four land in the shared `ukiel_core::sorting` module (`WriteOpts` +
+`writer_props`, extending plan 27's ordering half) and the compactor's
+`rewrite::batch_to_parquet_key_aligned`; a `"bloom_filter": true` schema
+attribute drives #10.
+
+7. ~~**Row groups aligned to packing-key runs**~~ **(done)**: multi-key rewrite
+   chunks (`key_min != key_max`) stream per-key `split_by_key` slices into one
+   writer, flushing before a key run would overflow the cap — so a row group
+   never spans two keys (except a single key bigger than the cap). Per-group
+   key stats become perfectly selective for the isolation predicate.
+8. ~~**Row-group size discipline**~~ **(done)**: `DEFAULT_MAX_ROW_GROUP_ROWS =
+   128k` on every writer (ingest L0, compaction, deletion, bench loader — via
+   `sorted_writer_props`'s silent gain).
+9. ~~**Encodings**~~ **(done)**: `DELTA_BINARY_PACKED` + dictionary-off for the
+   sorted ts column; per-level compression L0 = `LZ4_RAW`, L1+ = ZSTD.
+10. ~~**Bloom filters**~~ **(done)**: opt-in per column via `"bloom_filter": true`
+    (rejected on alias columns); `WriteOpts::from_columns` picks them up.
+
+Measurement: the 10 GB-tier read baseline (`bench/README.md` §6) predates this
+layout — its fixture files are pre-14. A reloaded fixture measures the new
+layout (a follow-up data-collection run; row 16 revalidates the population).
 
 ## Tier 4 — metadata & cache
 
