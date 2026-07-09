@@ -175,7 +175,6 @@ pub async fn run_with_bound_addr(
                 fanout: cfg.compactor.fanout,
                 finalize_after_secs: cfg.compactor.finalize_after_secs,
                 finalize_poll_interval_ms: cfg.compactor.finalize_poll_interval_ms,
-                max_merge_input_bytes: (cfg.compactor.max_merge_input_mb as i64) * 1024 * 1024,
                 ..CompactorConfig::default()
             },
         );

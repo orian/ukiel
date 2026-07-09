@@ -597,12 +597,17 @@ async fn compaction_builds_a_level_hierarchy() {
 }
 
 #[tokio::test]
-async fn size_targeted_placement_isolates_heavy_keys() {
+async fn size_targeted_whale_splits_into_dedicated_slices() {
+    // Plan 29 SizeTargeted semantics (streaming): small keys share a file; a key
+    // whose run dwarfs the target splits *mid-key* into multiple dedicated
+    // (k,k) files whose ts ranges tile without overlap (plan-12 ts pruning +
+    // metadata-only retention). Distinct payloads defeat compression so the
+    // whale's encoded size genuinely exceeds the target at test scale.
     let env = setup().await;
 
-    // Whale tenant 42: 100 rows. Tenants 1-4: 2 rows each (8 rows total).
-    let whale: Vec<_> = (0..100)
-        .map(|i| json!({"tenant_id": 42, "ts": i, "payload": format!("w{i}")}))
+    const WHALE_ROWS: i64 = 24_000;
+    let whale: Vec<_> = (0..WHALE_ROWS)
+        .map(|i| json!({"tenant_id": 42, "ts": i, "payload": format!("whale-{i}-{}", i * 7 + 3)}))
         .collect();
     let small: Vec<_> = (1..=4i64)
         .flat_map(|t| {
@@ -612,13 +617,15 @@ async fn size_targeted_placement_isolates_heavy_keys() {
     add_l0(&env, "2026-07-01", whale).await;
     add_l0(&env, "2026-07-01", small).await;
 
-    // Target = ~20 rows' worth of bytes (from the real L0 stats): the four
-    // small tenants (8 rows) share one chunk, the whale (100 rows)
-    // overflows any shared chunk and gets its own file.
+    // Target = a fraction of the whale's own bytes: the whale overflows it
+    // several times over (multiple slices); the eight small rows never do.
     let live = env.catalog.live_parts(env.ht, None).await.unwrap();
-    let bytes: i64 = live.iter().map(|p| p.meta.size_bytes).sum();
-    let rows: i64 = live.iter().map(|p| p.meta.row_count).sum();
-    let target = (bytes as f64 / rows as f64 * 20.0) as i64;
+    let whale_bytes: i64 = live
+        .iter()
+        .filter(|p| p.meta.packing_key_max == 42)
+        .map(|p| p.meta.size_bytes)
+        .sum();
+    let target = whale_bytes / 8;
     env.catalog
         .set_placement(env.ht, Placement::SizeTargeted(target))
         .await
@@ -632,22 +639,41 @@ async fn size_targeted_placement_isolates_heavy_keys() {
     compactor.run_once().await.unwrap();
 
     let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
-    assert_eq!(parts.len(), 2, "smalls packed + whale isolated: {parts:?}");
-    let whale_part = parts.iter().find(|p| p.meta.packing_key_min == 42).unwrap();
+
+    // Every row survives the streaming merge (whale + the eight small rows).
     assert_eq!(
-        whale_part.meta.packing_key_max, 42,
-        "whale file is min==max"
+        parts.iter().map(|p| p.meta.row_count).sum::<i64>(),
+        WHALE_ROWS + 8,
+        "all rows preserved: {parts:?}"
     );
-    assert_eq!(whale_part.meta.row_count, 100);
-    let small_part = parts.iter().find(|p| p.meta.packing_key_min == 1).unwrap();
-    assert_eq!(
-        (
-            small_part.meta.packing_key_min,
-            small_part.meta.packing_key_max,
-            small_part.meta.row_count
-        ),
-        (1, 4, 8)
+    // The small keys land somewhere (they share the whale's first slice, since
+    // eight rows never reach the target on their own — that file is min<42).
+    assert!(
+        parts.iter().any(|p| p.meta.packing_key_min < 42),
+        "small keys are present: {parts:?}"
     );
+
+    // The whale split into >= 2 dedicated (42,42) files ...
+    let mut dedicated_ts: Vec<(i64, i64)> = parts
+        .iter()
+        .filter(|p| p.meta.packing_key_min == 42 && p.meta.packing_key_max == 42)
+        .map(|p| {
+            let ts = &p.meta.column_stats.as_ref().unwrap()["ts"];
+            (ts["min"].as_i64().unwrap(), ts["max"].as_i64().unwrap())
+        })
+        .collect();
+    assert!(
+        dedicated_ts.len() >= 2,
+        "whale splits into >= 2 dedicated slices: {parts:?}"
+    );
+    // ... whose ts ranges tile the whale without overlap ((key,ts)-sorted).
+    dedicated_ts.sort();
+    for w in dedicated_ts.windows(2) {
+        assert!(
+            w[0].1 < w[1].0,
+            "dedicated slice ts ranges are disjoint: {dedicated_ts:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -818,9 +844,11 @@ async fn compaction_outputs_carry_column_stats() {
 }
 
 #[tokio::test]
-async fn oversized_merges_are_capped_not_attempted() {
+async fn merges_stream_without_a_cap() {
+    // Plan 29 retired the plan-28 cap: the same fixture the cap would have
+    // skipped now merges to completion through the bounded-memory streaming
+    // path (issue 0005 closed).
     let env = setup().await;
-    // Two L0 commits on one partition (>= l0_fanout, so the ladder would merge).
     add_l0(
         &env,
         "d1",
@@ -834,46 +862,19 @@ async fn oversized_merges_are_capped_not_attempted() {
     )
     .await;
 
-    // Cap of 1 byte: every real part exceeds it. finalize_after_secs: 0 makes
-    // the fresh partition immediately quiet so the finalize path is reached.
-    let capped = Compactor::new(
+    let compactor = Compactor::new(
         env.catalog.clone(),
         env.store.clone(),
-        CompactorConfig {
-            max_merge_input_bytes: 1,
-            finalize_after_secs: 0,
-            ..CompactorConfig::default()
-        },
+        CompactorConfig::default(),
     );
+    let stats = compactor.run_once().await.unwrap();
+    assert_eq!(stats.merged_groups, 1, "the merge runs — no cap");
 
-    // Ladder merge is capped: no merge, both L0 parts stay live.
-    let stats = capped.run_once().await.unwrap();
-    assert_eq!(stats.merged_groups, 0, "capped merge must not run");
-    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
-    assert_eq!(parts.len(), 2);
-    assert!(parts.iter().all(|p| p.meta.level == 0));
-
-    // Finalization is capped too: partition stays multi-run.
-    assert_eq!(capped.finalize_once().await.unwrap(), 0);
-    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
-    assert_eq!(parts.len(), 2);
-
-    // max_merge_input_bytes: 0 (unlimited) disables the cap. A distinct
-    // worker_name gives it a fresh feed cursor so it re-plans the same L0s.
-    let unlimited = Compactor::new(
-        env.catalog.clone(),
-        env.store.clone(),
-        CompactorConfig {
-            worker_name: "compactor-unlimited".to_string(),
-            max_merge_input_bytes: 0,
-            ..CompactorConfig::default()
-        },
-    );
-    let stats = unlimited.run_once().await.unwrap();
-    assert_eq!(stats.merged_groups, 1, "uncapped merge must run");
     let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
     assert!(
         parts.iter().any(|p| p.meta.level == 1),
         "merged L1 part present"
     );
+    let rows: i64 = parts.iter().map(|p| p.meta.row_count).sum();
+    assert_eq!(rows, 2, "both rows survive the merge");
 }

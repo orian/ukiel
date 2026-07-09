@@ -7,9 +7,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use futures::FutureExt;
 use object_store::ObjectStore;
-use object_store::ObjectStoreExt;
-use object_store::path::Path;
 use ukiel_catalog::{CatalogError, PostgresCatalog};
 use ukiel_core::{CommitOp, Hypertable, Part, PartMeta};
 
@@ -41,13 +40,6 @@ pub struct CompactorConfig {
     /// higher than `l0_fanout`. Read amp per key <= l0_fanout + fanout x
     /// depth while a partition is hot.
     pub fanout: usize,
-    /// Skip any merge whose inputs' total size_bytes exceeds this (issue
-    /// 0005: merges are in-memory until streaming merge lands; finalization
-    /// would otherwise pull an arbitrarily large cold partition into RAM
-    /// and OOM-crash-loop, since the sweep is stateless). Skipped merges
-    /// warn and count `compactor_capped_merges_total`; the partition stays
-    /// multi-run. `0` = unlimited.
-    pub max_merge_input_bytes: i64,
     /// A partition with no L0 arrivals for this long and more than one live
     /// run is folded into a single run one level above its maximum
     /// (finalization; see `finalize_once`).
@@ -66,7 +58,6 @@ impl Default for CompactorConfig {
             // Production tuning lives in the ukield config defaults (4/10).
             l0_fanout: 2,
             fanout: 2,
-            max_merge_input_bytes: 1 << 30,
             finalize_after_secs: 3600,
             finalize_poll_interval_ms: 60_000,
             poll_interval_ms: 5000,
@@ -194,9 +185,6 @@ impl Compactor {
                 if runs.len() < 2 {
                     continue;
                 }
-                if self.merge_capped(&hypertable, &parts) {
-                    continue; // stays multi-run until the cap is raised
-                }
                 let top = parts.iter().map(|p| p.meta.level).max().unwrap_or(0);
                 match self.merge_parts(&hypertable, &parts, top + 1).await {
                     Ok(_) => finalized += 1,
@@ -257,9 +245,6 @@ impl Compactor {
                 if runs.len() < trigger {
                     continue;
                 }
-                if self.merge_capped(hypertable, &group) {
-                    continue; // next level; don't break the ladder for this partition
-                }
                 match self.merge_parts(hypertable, &group, level + 1).await {
                     Ok(parts_out) => {
                         stats.merged_groups += 1;
@@ -287,34 +272,11 @@ impl Compactor {
         Ok(())
     }
 
-    /// Issue 0005 interim guardrail (real fix: streaming merge, post-v1).
-    /// True when the group's inputs exceed `max_merge_input_bytes` — the
-    /// merge is skipped (warn + counter), never attempted.
-    fn merge_capped(&self, hypertable: &Hypertable, group: &[Part]) -> bool {
-        let cap = self.config.max_merge_input_bytes;
-        if cap <= 0 {
-            return false;
-        }
-        let total: i64 = group.iter().map(|p| p.meta.size_bytes).sum();
-        if total <= cap {
-            return false;
-        }
-        tracing::warn!(
-            hypertable = %hypertable.name,
-            partition = %group[0].meta.partition_values,
-            input_bytes = total,
-            cap_bytes = cap,
-            parts = group.len(),
-            "merge skipped: input exceeds max_merge_input_bytes (issue 0005)"
-        );
-        metrics::counter!("compactor_capped_merges_total").increment(1);
-        true
-    }
-
-    /// Merges the given live parts (all one partition) into one run at
-    /// `output_level` per the placement policy and commits the swap. The
-    /// run's files are key-disjoint by construction (`plan_chunks`).
-    /// Returns the number of output parts.
+    /// Streams the given live parts (all one partition) through a bounded-memory
+    /// k-way merge into placement-shaped output files at `output_level`, then
+    /// commits the swap (plan 29). Memory is O(K·batch + row-group), not
+    /// O(decoded partition) — so an arbitrarily large cold partition no longer
+    /// needs the plan-28 cap. Returns the number of output parts.
     async fn merge_parts(
         &self,
         hypertable: &Hypertable,
@@ -323,74 +285,61 @@ impl Compactor {
     ) -> Result<usize, CompactorError> {
         let cols = ukiel_core::TableColumns::parse(&hypertable.table_schema)?;
         let schema = Arc::new(cols.physical_schema());
-        let merged = rewrite::read_parts_to_batch(&self.store, schema, group).await?;
-        // Rewrites recompute write-time columns: this is what backfills a
-        // materialized column added after these files were written.
-        let merged = ukiel_expr::apply_defaults_and_materialized(merged, &cols)?;
-        let sorted = rewrite::sort_batch(&merged, &hypertable.sort_key)?;
         let partition_values = group[0].meta.partition_values.clone();
 
-        // Encoded-size estimate for SizeTargeted, from the inputs' stats.
-        let total_bytes: i64 = group.iter().map(|p| p.meta.size_bytes).sum();
-        let total_rows: i64 = group.iter().map(|p| p.meta.row_count).sum();
-        let bytes_per_row = (total_bytes as f64 / total_rows.max(1) as f64).max(1.0);
+        // Async per-part streams -> k-way streaming merge over the already-sorted
+        // inputs (never re-sorts; plan-27 ordering is the trust anchor).
+        let streams = rewrite::part_streams(&self.store, schema.clone(), &cols, group).await?;
+        let merged = crate::merge::merge_streams(streams, schema.clone(), &hypertable.sort_key);
 
-        let outputs = rewrite::plan_chunks(
-            &sorted,
-            &hypertable.packing_key,
-            &hypertable.placement,
-            bytes_per_row,
-        )?;
-        // Layout for the output level (delta-ts, blooms, ZSTD at L1+, cap).
+        // Streaming writer: placement cuts on actual encoded size, whale-splits
+        // big keys, and registers upload intent per file before its first byte.
         let opts = ukiel_core::WriteOpts::from_columns(&cols, &hypertable.sort_key, output_level);
+        let ht_id = hypertable.id;
+        let next_path: rewrite::NextPath = Box::new(move || {
+            format!(
+                "ht/{}/L{}/{}.parquet",
+                ht_id.0,
+                output_level,
+                uuid::Uuid::new_v4()
+            )
+        });
+        let catalog = self.catalog.clone();
+        let on_open: rewrite::OnOpen = Box::new(move |path| {
+            let catalog = catalog.clone();
+            async move {
+                catalog
+                    .register_pending_objects(ht_id, &[path])
+                    .await
+                    .map_err(CompactorError::from)
+            }
+            .boxed()
+        });
+        let writer = rewrite::StreamingChunkWriter::new(
+            self.store.clone(),
+            schema,
+            opts,
+            hypertable.placement,
+            hypertable.packing_key.clone(),
+            hypertable.sort_key.clone(),
+            next_path,
+            on_open,
+        );
+        let outputs = writer.write(merged).await?;
 
-        // Assign paths and record upload intent before any upload: GC orphan
-        // discovery is a catalog query over pending_objects (plan 9).
-        let paths: Vec<String> = outputs
-            .iter()
-            .map(|_| {
-                format!(
-                    "ht/{}/L{}/{}.parquet",
-                    hypertable.id,
-                    output_level,
-                    uuid::Uuid::new_v4()
-                )
+        let new_parts: Vec<PartMeta> = outputs
+            .into_iter()
+            .map(|c| PartMeta {
+                path: c.path,
+                partition_values: partition_values.clone(),
+                packing_key_min: c.key_min,
+                packing_key_max: c.key_max,
+                row_count: c.row_count,
+                size_bytes: c.size_bytes,
+                level: output_level,
+                column_stats: c.column_stats,
             })
             .collect();
-        self.catalog
-            .register_pending_objects(hypertable.id, &paths)
-            .await?;
-
-        let mut new_parts = Vec::with_capacity(outputs.len());
-        for ((key_min, key_max, batch), path) in outputs.iter().zip(paths) {
-            // Multi-key chunks (packed / SizeTargeted shared) get row groups
-            // aligned to key boundaries so per-group key stats prune exactly;
-            // single-key chunks (separated / whale) need no alignment.
-            let bytes = if key_min != key_max {
-                rewrite::batch_to_parquet_key_aligned(
-                    batch,
-                    &hypertable.packing_key,
-                    &hypertable.sort_key,
-                    &opts,
-                )?
-            } else {
-                rewrite::batch_to_parquet_opts(batch, &hypertable.sort_key, &opts)?
-            };
-            let size_bytes = bytes.len() as i64;
-            self.store
-                .put(&Path::from(path.clone()), bytes.into())
-                .await?;
-            new_parts.push(PartMeta {
-                path,
-                partition_values: partition_values.clone(),
-                packing_key_min: *key_min,
-                packing_key_max: *key_max,
-                row_count: batch.num_rows() as i64,
-                size_bytes,
-                level: output_level,
-                column_stats: ukiel_core::stats::int64_column_stats(batch),
-            });
-        }
 
         let old = group.iter().map(|p| p.id).collect();
         let count = new_parts.len();

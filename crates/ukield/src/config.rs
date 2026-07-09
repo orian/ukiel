@@ -171,9 +171,6 @@ pub struct CompactorSection {
     pub finalize_after_secs: u64,
     /// Cadence of the finalization sweep.
     pub finalize_poll_interval_ms: u64,
-    /// Skip merges whose inputs exceed this (issue 0005: guards against
-    /// pulling an oversized cold partition into RAM; `0` = unlimited).
-    pub max_merge_input_mb: u64,
 }
 
 impl Default for CompactorSection {
@@ -187,7 +184,6 @@ impl Default for CompactorSection {
             fanout: 10,
             finalize_after_secs: 3_600,
             finalize_poll_interval_ms: 60_000,
-            max_merge_input_mb: 1024,
         }
     }
 }

@@ -39,7 +39,6 @@ poll_interval_ms = 5000
 l0_fanout = 2            # L0 merge trigger (demo; prod ~4) — L0 files are unpruned by key
 fanout = 2               # L1+ run-count trigger (demo; prod ~10) — runs are key-disjoint
 finalize_after_secs = 60 # fold quiet partitions into one run (demo; prod ~3600)
-max_merge_input_mb = 1024 # skip merges bigger than this (issue 0005; 0 = unlimited)
 
 [gc]
 poll_interval_ms = 60000
