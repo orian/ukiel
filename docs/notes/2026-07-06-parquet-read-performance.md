@@ -77,9 +77,15 @@ lakehouses don't have one. Prune before I/O exists:
 ## Tier 4 — metadata & cache
 
 11. **Footer + page-index cache** (custom `ParquetFileReaderFactory`):
-    every query currently re-fetches every file's footer (~2 object-store
+    every query otherwise re-fetches every file's footer (~2 object-store
     roundtrips per file). Files are **immutable** — the cache never
     invalidates. Biggest *latency* win for interactive queries.
+    *Status: plan 13 (`2026-07-06-ukiel-parquet-metadata-cache.md`) —
+    process-wide LRU keyed by path, hit/miss counters, page-index-aware
+    lookups, wired through provider/session/server/`ukield`. Directly targets
+    the 10 GB-tier per-tenant fan-out floor (67–108 footer reads/query,
+    `bench/README.md` §6) — re-run `bench hits queries` vs the recorded
+    baseline to measure.*
 12. **Write-through cache prewarm**: compactor L1 outputs are the hottest
     files in the system; push them into the NVMe cache at write time.
 13. **Range-granular caching** for large dedicated files (whole-file caching
