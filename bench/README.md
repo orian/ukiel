@@ -70,6 +70,14 @@ Files land under `bench/datasets/hits/hits_*.parquet` and
 `bench/datasets/bluesky/file_*.json.gz`. You don't have to fetch all of them —
 every command takes a `--files N` cap and uses whatever is present.
 
+**Keep the datasets — do not delete them between runs.** They are gitignored
+(`bench/datasets/`), so they never touch the repo, and ~16 GB is cheap disk.
+Re-running `make bench-fetch-*` with the files already present is **resume-only**
+(`curl -C -` issues a HEAD per file and transfers nothing), so it costs seconds,
+not another 15 GB download. `bench/bench.sh` never touches the datasets — only
+`docker compose down -v` (which wipes MinIO/Postgres/Kafka volumes, not
+`bench/datasets/`).
+
 ---
 
 ## 3. Commands
@@ -475,6 +483,50 @@ Readings:
 
 Reproduce: `bench/bench.sh sort27 tuned --skip-bluesky` (runs the write path
 under `sort27`, prints the `tuned → sort27` delta).
+
+### 10 GB / 10M — plan 14 (Tier-3 file layout), 2026-07-09
+
+Same machine, tuned profile. Plan 14 added key-aligned row groups (compaction),
+per-level compression (L0 LZ4_RAW / L1+ ZSTD), delta-packed ts, and a 128k
+row-group cap. Two comparisons, each isolating what the fixture actually
+exercises.
+
+**Bluesky write path — `sort27 → plan14`** (the real measurement: the compacted
+file goes through the full key-aligned layout). `bluesky run --files 10`:
+
+| metric | sort27 | plan14 | Δ |
+|---|---|---|---|
+| ingest catch-up | 38.5 s | 36.0 s | −6.4% (LZ4_RAW L0 encodes faster) |
+| finalization | 7.5 s | 9.2 s | +23% (key-aligned flushes cost extra) |
+| final file | 575.6 MB | 571.3 MB | −0.75% (delta-ts; payload dominates) |
+| stored rows | 9,999,994 ✓ | 9,999,994 ✓ | exactly-once held |
+
+Per-tenant reads, median ms (top-3 census tenants):
+
+| scenario | tenant A | tenant B | tenant C |
+|---|---|---|---|
+| `count` | 10.2 → 10.4 | 11.0 → 10.5 | 9.8 → 9.8 |
+| `by_collection` | 12.3 → 12.5 | 13.3 → 10.6 (−20%) | 12.8 → 11.7 (−9%) |
+| `ts_window` | 16.4 → 11.9 (**−28%**) | 17.6 → 11.6 (**−34%**) | 17.3 → 11.3 (**−35%**) |
+
+**This is the layout → reads win plan 14 was for.** `ts_window` (a
+`ts BETWEEN` filter within one tenant) drops **~30%**: key-aligned row groups
+put each tenant's rows in contiguous groups, and delta-packed ts sharpens the
+per-group ts stats, so DataFusion prunes row groups/pages by ts range instead
+of scanning. `count` is flat (no filter → nothing to prune); `by_collection`
+gains from finer row groups. Write cost is a small, honest trade: LZ4 L0 is
+faster (−6% ingest) but the key-aligned flushes make finalization a bit slower.
+
+**hits read path — `cache13 → plan14`** (partial: the hits loader writes plain
+files with the 128k cap, but is **not** compacted, so it never exercises
+key-alignment/delta-ts). Mixed and noisy as expected; the consistent signal is
+the heavy-tenant scan-bound aggregations improving from finer row groups —
+`top_urls` 366.8 → 323.6 ms (−12%), `search_phrases` 181.4 → 148.6 ms (−18%) —
+while `count`/`adv_filter` wobble in noise. A hits fixture that measures the
+full plan-14 layout needs compaction (row 16 revalidates the population).
+
+Reproduce: `bench/bench.sh plan14 sort27 --skip-hits` (Bluesky) and
+`bench/bench.sh plan14 cache13 --skip-bluesky` (hits).
 
 ### 100M / 1B tiers — optional / stretch
 
