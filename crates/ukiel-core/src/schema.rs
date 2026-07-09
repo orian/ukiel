@@ -63,6 +63,10 @@ pub struct ColumnSpec {
     /// The declared Ukiel type name (e.g. `timestamp_ms`), preserved because
     /// several names (`int64`, `timestamp_ms`) collapse to the same Arrow type.
     pub ukiel_type: String,
+    /// Write a Parquet bloom filter for this column (plan 14 Tier-3 #10):
+    /// opt-in per column, for high-cardinality non-sort columns queries
+    /// filter on. Never valid on an alias column (never stored).
+    pub bloom_filter: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -113,12 +117,22 @@ impl TableColumns {
                     )));
                 }
             };
+            let bloom_filter = f
+                .get("bloom_filter")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+            if bloom_filter && matches!(kind, ColumnKind::Alias(_)) {
+                return Err(SchemaError::Invalid(format!(
+                    "field '{name}': bloom_filter is invalid on an alias column (never stored)"
+                )));
+            }
             specs.push(ColumnSpec {
                 name: name.to_string(),
                 data_type,
                 nullable,
                 kind,
                 ukiel_type: type_name.to_string(),
+                bloom_filter,
             });
         }
         Ok(TableColumns { specs })
@@ -160,6 +174,15 @@ impl TableColumns {
     /// What SQL sees: physical + alias.
     pub fn query_schema(&self) -> Schema {
         self.schema_where(|_| true)
+    }
+
+    /// Stored (non-alias) columns flagged for a bloom filter, in schema order.
+    pub fn bloom_columns(&self) -> Vec<String> {
+        self.specs
+            .iter()
+            .filter(|s| s.bloom_filter && !matches!(s.kind, ColumnKind::Alias(_)))
+            .map(|s| s.name.clone())
+            .collect()
     }
 }
 
@@ -245,6 +268,31 @@ mod tests {
             arrow_schema_from_json(&rich_schema()).unwrap(),
             cols.physical_schema()
         );
+    }
+
+    #[test]
+    fn bloom_filter_parses_defaults_false_and_rejects_on_alias() {
+        let cols = TableColumns::parse(&json!({"fields": [
+            {"name": "tenant_id", "type": "int64"},
+            {"name": "url", "type": "utf8", "bloom_filter": true},
+            {"name": "referer", "type": "utf8"},
+            {"name": "region", "type": "int64", "default": "0", "bloom_filter": true}
+        ]}))
+        .unwrap();
+        assert!(!cols.specs[0].bloom_filter);
+        assert!(cols.specs[1].bloom_filter);
+        assert!(!cols.specs[2].bloom_filter, "defaults false");
+        // Orthogonal to default/materialized: a default column may carry a bloom.
+        assert!(cols.specs[3].bloom_filter);
+        assert_eq!(cols.bloom_columns(), vec!["url", "region"]);
+
+        // Rejected on an alias column (never stored).
+        let err = TableColumns::parse(&json!({"fields": [
+            {"name": "x", "type": "int64"},
+            {"name": "y", "type": "int64", "alias": "x + 1", "bloom_filter": true}
+        ]}))
+        .unwrap_err();
+        assert!(matches!(err, SchemaError::Invalid(_)));
     }
 
     #[test]

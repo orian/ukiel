@@ -9,9 +9,12 @@
 use arrow::array::RecordBatch;
 use arrow::compute::{SortColumn, SortOptions, lexsort_to_indices, take};
 use arrow::datatypes::Schema;
-use parquet::basic::{Compression, ZstdLevel};
+use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::metadata::SortingColumn;
 use parquet::file::properties::WriterProperties;
+use parquet::schema::types::ColumnPath;
+
+use crate::schema::TableColumns;
 
 /// Canonical order: ascending.
 pub const SORT_DESCENDING: bool = false;
@@ -77,14 +80,96 @@ pub fn sorting_columns(schema: &Schema, sort_key: &[String]) -> Vec<SortingColum
         .collect()
 }
 
-/// ZSTD writer properties stamping `sort_key` as the file's sorting columns —
-/// used by both the ingest and compaction writers so compression and the
-/// declared ordering stay identical.
+/// Row-group row-count cap (Tier-3 #8): large enough to amortize metadata,
+/// small enough that per-group stats prune. Applied by every writer.
+pub const DEFAULT_MAX_ROW_GROUP_ROWS: usize = 128 * 1024;
+
+/// Write-side layout policy (plan 14, Tier-3 #7–10), alongside plan 27's
+/// ordering half. `writer_props` turns it into `WriterProperties`.
+#[derive(Debug, Clone)]
+pub struct WriteOpts {
+    /// Compression by level: 0 → LZ4_RAW (short-lived L0, fast decode);
+    /// >= 1 → ZSTD (read-many L1+, space wins).
+    pub level: i16,
+    /// The sorted epoch-ms column, if any: gets DELTA_BINARY_PACKED with the
+    /// dictionary off (sorted deltas pack spectacularly; a dictionary on a
+    /// near-unique column only adds indirection).
+    pub ts_column: Option<String>,
+    /// Columns to write a bloom filter for (opt-in, from the schema).
+    pub bloom_columns: Vec<String>,
+    pub max_row_group_rows: usize,
+}
+
+impl WriteOpts {
+    /// Defaults for a level with no schema hints (compression by level, the
+    /// row-group cap, no delta-ts, no blooms).
+    pub fn for_level(level: i16) -> Self {
+        Self {
+            level,
+            ts_column: None,
+            bloom_columns: vec![],
+            max_row_group_rows: DEFAULT_MAX_ROW_GROUP_ROWS,
+        }
+    }
+
+    /// Derives the ts column (first `sort_key` entry whose declared type is
+    /// `timestamp_ms`) and bloom columns from the table schema.
+    pub fn from_columns(cols: &TableColumns, sort_key: &[String], level: i16) -> Self {
+        let ts_column = sort_key
+            .iter()
+            .find(|name| {
+                cols.specs
+                    .iter()
+                    .any(|s| &s.name == *name && s.ukiel_type == "timestamp_ms")
+            })
+            .cloned();
+        Self {
+            level,
+            ts_column,
+            bloom_columns: cols.bloom_columns(),
+            max_row_group_rows: DEFAULT_MAX_ROW_GROUP_ROWS,
+        }
+    }
+}
+
+/// The writer properties: compression by level, sort-column stamps via the
+/// plan-27 `sorting_columns` helper (nulls_first: true — never re-implemented),
+/// delta-packed ts, opt-in per-column blooms, and the row-group cap.
+pub fn writer_props(schema: &Schema, sort_key: &[String], opts: &WriteOpts) -> WriterProperties {
+    let compression = if opts.level == 0 {
+        Compression::LZ4_RAW
+    } else {
+        Compression::ZSTD(ZstdLevel::default())
+    };
+    let mut builder = WriterProperties::builder()
+        .set_compression(compression)
+        .set_max_row_group_row_count(Some(opts.max_row_group_rows));
+
+    let sorting = sorting_columns(schema, sort_key);
+    if !sorting.is_empty() {
+        builder = builder.set_sorting_columns(Some(sorting));
+    }
+    if let Some(ts) = &opts.ts_column
+        && schema.index_of(ts).is_ok()
+    {
+        let path = ColumnPath::from(ts.clone());
+        builder = builder
+            .set_column_encoding(path.clone(), Encoding::DELTA_BINARY_PACKED)
+            .set_column_dictionary_enabled(path, false);
+    }
+    for col in &opts.bloom_columns {
+        if schema.index_of(col).is_ok() {
+            builder = builder.set_column_bloom_filter_enabled(ColumnPath::from(col.clone()), true);
+        }
+    }
+    builder.build()
+}
+
+/// ZSTD (L1+) writer properties stamping `sort_key` as the file's sorting
+/// columns. Plan-27 signature, now a thin delegate over `writer_props`, so
+/// every existing caller compiles unchanged and gains the row-group cap.
 pub fn sorted_writer_props(schema: &Schema, sort_key: &[String]) -> WriterProperties {
-    WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::default()))
-        .set_sorting_columns(Some(sorting_columns(schema, sort_key)))
-        .build()
+    writer_props(schema, sort_key, &WriteOpts::for_level(1))
 }
 
 /// Registration-time invariants (design note `docs/notes/2026-07-07-ingest-sort-by-sort-key.md`):
@@ -250,5 +335,129 @@ mod tests {
             validate_sort_key(&s, &["tenant_id".to_string()], "tenant_id", Some("ts")),
             Err(SortKeyError::TsNotInSortKey(_))
         ));
+    }
+
+    /// Writes `n` rows (tenant_id = i%3, ts = i, url = "u{i}") with `opts` and
+    /// returns the parsed footer metadata for layout assertions.
+    fn layout_meta(
+        opts: &WriteOpts,
+        n: usize,
+    ) -> std::sync::Arc<parquet::file::metadata::ParquetMetaData> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tenant_id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, true),
+            Field::new("url", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(
+                    (0..n as i64).map(|i| i % 3).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(
+                    (0..n).map(|i| format!("u{i}")).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let sort_key = vec!["tenant_id".to_string(), "ts".to_string()];
+        let props = writer_props(&schema, &sort_key, opts);
+        let mut bytes = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut bytes, schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+            .unwrap()
+            .metadata()
+            .clone()
+    }
+
+    #[test]
+    fn compression_by_level() {
+        let m0 = layout_meta(&WriteOpts::for_level(0), 6);
+        for rg in m0.row_groups() {
+            for c in rg.columns() {
+                assert!(
+                    matches!(c.compression(), Compression::LZ4_RAW),
+                    "L0 must be LZ4_RAW, got {:?}",
+                    c.compression()
+                );
+            }
+        }
+        let m1 = layout_meta(&WriteOpts::for_level(1), 6);
+        for rg in m1.row_groups() {
+            for c in rg.columns() {
+                assert!(
+                    matches!(c.compression(), Compression::ZSTD(_)),
+                    "L1 must be ZSTD, got {:?}",
+                    c.compression()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ts_delta_packed_dictionary_off_others_keep_dictionary() {
+        let opts = WriteOpts {
+            level: 1,
+            ts_column: Some("ts".to_string()),
+            bloom_columns: vec![],
+            max_row_group_rows: DEFAULT_MAX_ROW_GROUP_ROWS,
+        };
+        let m = layout_meta(&opts, 32);
+        let rg = m.row_group(0);
+        let ts = rg.column(1);
+        let ts_encodings: Vec<Encoding> = ts.encodings().collect();
+        assert!(
+            ts_encodings.contains(&Encoding::DELTA_BINARY_PACKED),
+            "ts not delta-packed: {ts_encodings:?}"
+        );
+        assert!(
+            ts.dictionary_page_offset().is_none(),
+            "ts dictionary must be off"
+        );
+        // A column with no override keeps its dictionary.
+        assert!(
+            rg.column(2).dictionary_page_offset().is_some(),
+            "url should keep its dictionary"
+        );
+    }
+
+    #[test]
+    fn row_group_cap_splits_groups() {
+        let opts = WriteOpts {
+            level: 1,
+            ts_column: None,
+            bloom_columns: vec![],
+            max_row_group_rows: 4,
+        };
+        let m = layout_meta(&opts, 10);
+        let counts: Vec<i64> = m.row_groups().iter().map(|rg| rg.num_rows()).collect();
+        assert_eq!(counts, vec![4, 4, 2]);
+    }
+
+    #[test]
+    fn stamps_nulls_first_and_blooms_only_where_asked() {
+        let opts = WriteOpts {
+            level: 1,
+            ts_column: Some("ts".to_string()),
+            bloom_columns: vec!["url".to_string()],
+            max_row_group_rows: DEFAULT_MAX_ROW_GROUP_ROWS,
+        };
+        let m = layout_meta(&opts, 8);
+        let rg = m.row_group(0);
+        let sc = rg.sorting_columns().expect("stamps present");
+        assert_eq!(sc.len(), 2, "tenant_id, ts");
+        assert!(sc.iter().all(|c| c.nulls_first && !c.descending));
+        assert!(
+            rg.column(2).bloom_filter_offset().is_some(),
+            "url bloom missing"
+        );
+        assert!(
+            rg.column(0).bloom_filter_offset().is_none(),
+            "tenant_id: no bloom"
+        );
+        assert!(rg.column(1).bloom_filter_offset().is_none(), "ts: no bloom");
     }
 }
