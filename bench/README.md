@@ -181,6 +181,47 @@ subsequent bench runs reuse it.
 
 ---
 
+## 4a. Running & comparing (no LLM needed)
+
+Two helpers under `bench/` automate a full run and A/B comparison — pure
+Python 3 + bash, no extra deps.
+
+**`bench/bench.sh LABEL [BASELINE] [opts]`** — builds the tuned binary, resets
+the compose stack, runs the benches, saves `bench/results/*-LABEL.json`,
+regenerates the HTML page, and (if `BASELINE` given) prints a terminal delta:
+
+```bash
+# Baseline on the current code, then a candidate after your change:
+git stash && bench/bench.sh before
+git stash pop && bench/bench.sh after before      # prints `before → after` deltas
+```
+
+Options: `--skip-hits`, `--skip-bluesky`, `--files N` (bluesky, default 10),
+`--iters N` (hits queries, default 10), `--no-native` (portable build),
+`--no-reset` (reuse a clean running stack). It brings the stack up/down itself;
+you still fetch datasets once with `make bench-fetch-*`.
+
+**`bench/report.py`** — the reporter `bench.sh` calls, also usable directly:
+
+```bash
+python3 bench/report.py list                 # available run labels
+python3 bench/report.py compare A B          # terminal delta tables (A → B)
+python3 bench/report.py html                 # → bench/results/report.html
+make bench-report                            # same as `report.py html`
+```
+
+`compare` reads `hits-queries-<label>.json` and `bsky-run-<label>.json` for the
+two labels and prints per-scenario and per-metric deltas (Δ%; lower ms is
+better, higher throughput is better). `html` embeds every run's JSON into one
+self-contained page (`bench/results/report.html`, gitignored) — open it
+directly, no server: it shows every run as a table plus a baseline/candidate
+picker that colours regressions red and improvements green.
+
+Both `bench/results/report.html` and the `*.json` reports are gitignored, so
+comparisons stay local.
+
+---
+
 ## 5. Run-semantics caveats
 
 - **hits parts overlap by key.** ClickBench files are row-range slices, so

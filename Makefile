@@ -1,6 +1,6 @@
 # Ukiel developer targets.
 
-.PHONY: test e2e e2e-up e2e-down play bench-fetch-hits bench-fetch-bluesky
+.PHONY: test e2e e2e-up e2e-down play bench-fetch-hits bench-fetch-bluesky bench-report
 
 # Unit + component tests (Docker required for testcontainers).
 # --test-threads=2: each component test starts its own containers; unbounded
@@ -37,6 +37,11 @@ bench-fetch-bluesky:
 	  curl -f -C - -o bench/datasets/bluesky/file_$$i.json.gz \
 	    https://clickhouse-public-datasets.s3.amazonaws.com/bluesky/file_$$i.json.gz; \
 	done
+
+# Regenerate the self-contained HTML results page from bench/results/*.json.
+bench-report:
+	python3 bench/report.py html
+	@echo "open bench/results/report.html"
 
 # Run the all-in-one server against the compose stack with the example config.
 play:
