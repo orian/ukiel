@@ -104,7 +104,21 @@ and writes `bench/results/hits-tenants.json` (heavy / median / light / top-20),
 creating logical `hits` tables for those tenants' namespaces (namespace id =
 `counter_id`). `--files` caps how many present files to load (default: all).
 
-The **compactor is deliberately not run** over this fixture — see caveats.
+`hits load` leaves the fixture uncompacted (per-file L1 runs); run
+`hits compact` to fold it — see below and §5.
+
+### `hits compact [--target-mb N]`
+
+Drives compaction + finalization to quiescence over the loaded `hits`
+hypertable, folding the per-file L1 runs into one run per day-partition (the
+plan-17 terminal invariant). This is the plan-29 streaming merge at volume —
+the ~15 GB fold streams in O(K·batch + row-group) memory where the retired
+plan-28 cap once forbade it. Prints the fan-out collapse (parts before/after,
+worst per-day run count, per-census-tenant fan-out). With `--target-mb N` it
+first switches the hypertable to `SizeTargeted(N MiB)` placement, so heavy
+keys **whale-split** into dedicated key-disjoint slices instead of collapsing
+into one large packed file per day. Run `hits queries` before and after to
+quantify the read impact.
 
 ### `hits queries [--iters N] [--label LABEL]`
 
@@ -232,13 +246,16 @@ comparisons stay local.
 
 ## 5. Run-semantics caveats
 
-- **hits parts overlap by key.** ClickBench files are row-range slices, so
-  their `counter_id` ranges overlap; the loader commits one part per (file,
-  day) at level 1 and **does not run the compactor** (a merge would rewrite the
-  whole ~15 GB and trip the plan-28 cap). So per-tenant *fan-out* (files a scan
-  opens) equals roughly the day-count, not 1 — pruning is under-measured
-  relative to a compacted layout. Revisit once row 29 (streaming merge) makes
-  compacting the fixture feasible. The `day` partition is derived from `ts`
+- **hits parts overlap by key (loaded fixture).** ClickBench files are
+  row-range slices, so their `counter_id` ranges overlap; `hits load` commits
+  one part per (file, day) at level 1, giving a per-tenant *fan-out* (files a
+  scan opens) of ~67–108. **`hits compact` folds this away** — plan 29's
+  streaming merge makes the ~15 GB fold feasible in bounded memory (the
+  plan-28 cap that once forbade it is retired), so the caveat is now
+  measurable, not hypothetical: packed compaction collapses each day-partition
+  to one run (fan-out → day-count ≈ 14), and `--target-mb N` uses SizeTargeted
+  placement so heavy keys whale-split into dedicated slices instead. See §6
+  "plan 29" for the before/after. The `day` partition is derived from `ts`
   (the same `chrono::from_timestamp_millis` ingest uses), not `EventDate`.
 - **hits row-group size** is the arrow-writer default (via the shared
   `rewrite::batch_to_parquet`), not a hand-tuned 64k — row-group sizing is
@@ -527,6 +544,77 @@ full plan-14 layout needs compaction (row 16 revalidates the population).
 
 Reproduce: `bench/bench.sh plan14 sort27 --skip-hits` (Bluesky) and
 `bench/bench.sh plan14 cache13 --skip-bluesky` (hits).
+
+### 10 GB / 10M — plan 29 (streaming merge + whale-key splitting), 2026-07-09
+
+Same machine, tuned profile. Plan 29 rewrote `merge_parts` to stream
+(`part_streams` → k-way `merge_streams` → `StreamingChunkWriter`) in
+O(K·batch + row-group) memory and split whale keys into ts-sliced dedicated
+files; the plan-28 input-size cap is retired. **This is the first run that
+compacts the hits fixture** — the fold the cap used to forbid (§5 caveat
+lifted).
+
+**Bluesky write path — `plan14 → post-29`** (`bluesky run --files 10`, 10M
+events): the streaming writer must not regress the write path.
+
+| metric | plan14 | post-29 | Δ |
+|---|---|---|---|
+| produce rate | 221.4k rows/s | 219.0k rows/s | −1.1% (noise) |
+| finalization | 9.2 s | 7.3 s | −21% |
+| stored rows | 9,999,994 ✓ | 9,999,994 ✓ | exactly-once held |
+
+Reads wobble ±10% at ~10 ms (noise). No write-path regression; finalization is
+if anything faster (bounded-memory streaming vs read-all-then-sort).
+
+**hits fold — `hits compact`** on the full fixture (1,102 live parts across 22
+day-partitions, ~640 MB/day). The headline is that it completes at all:
+
+| placement | result | fold time | heavy fan-out | median/light fan-out |
+|---|---|---|---|---|
+| Packed (default) | 1,102 → **22** parts (1 run/day) | 94 s | 84 → **14** | 84 → **14** |
+| SizeTargeted(16 MiB) | 1,102 → **545** parts | 108 s | 84 → **59** (whale-split) | 84 → **14** |
+
+**hits read path — `post-29` (loaded) → packed-compacted → SizeTargeted**, warm
+median ms (census heavy = 3922 / 8.53M rows, median = 150550 / 123 rows, light =
+240030 / 1,003 rows):
+
+| scenario | heavy: loaded → packed → **sized** | median: loaded → packed → **sized** | light: loaded → packed → **sized** |
+|---|---|---|---|
+| `count` | 26.6 → 22.6 → **16.7** | 33.2 → 18.4 → **10.4** | 25.4 → 18.6 → **9.8** |
+| `adv_filter` | 47.3 → 55.3 → **37.9** | 41.4 → 19.4 → **12.5** | 32.5 → 20.9 → **12.7** |
+| `distinct_users` | 57.8 → 78.7 → **44.2** | 40.1 → 22.1 → **12.6** | 30.4 → 21.9 → **11.7** |
+| `top_urls` | 321 → 571 → **312** | 46.6 → 24.3 → **15.4** | 33.1 → 24.2 → **15.4** |
+| `search_phrases` | 136 → 300 → **131** | 42.4 → 23.5 → **15.2** | 34.9 → 23.4 → **14.2** |
+| `ts_window` | 2.7 → 2.5 → **2.5** | 2.7 → 2.5 → **2.3** | 2.6 → 2.4 → **2.2** |
+
+Readings — **compaction's value depends on placement, and whale-splitting is
+why**:
+
+- **The fold is now possible in bounded memory.** 14 GB / 1,102 parts collapse
+  to one run per day-partition in ~94 s without the plan-28 cap ever engaging —
+  the terminal invariant (cold partition = one run) holds at volume, which is
+  the entire point of plan 29. RSS stays flat; nothing is ever fully resident.
+- **The tail wins big under any placement.** Median/light tenants drop **~45%**
+  on the scan-heavy scenarios (`top_urls` median 46.6 → 24.3 packed → 15.4
+  sized) — fewer files to open, the fan-out floor plan 13 targeted is now
+  structurally lower.
+- **Packed compaction *regresses* the whale tenant** (heavy `top_urls` 321 →
+  571, `search_phrases` 136 → 300): consolidating a dominant tenant's 8.5M rows
+  into one big file per day collapses the read parallelism the 84-small-files
+  layout had. Honest confounder — and exactly the failure mode whale-splitting
+  exists to prevent.
+- **SizeTargeted whale-splitting fixes it and then some.** With
+  `--target-mb 16` the heavy tenant splits into 59 dedicated key-disjoint
+  slices (parallelism restored) while median/light keep fan-out 14: heavy
+  `top_urls` recovers to **312 ms** (below the uncompacted 321) and every other
+  heavy scenario beats both other layouts. This is the recommended SaaS
+  posture — heavy keys separate organically, the long tail packs.
+
+Reproduce: `bench hits load && bench hits queries --label post-29` (loaded),
+`bench hits compact && bench hits queries --label post-29-compacted` (packed),
+then a fresh `hits load && bench hits compact --target-mb 16 && bench hits
+queries --label post-29-sizetargeted`. Bluesky: `bench/bench.sh post-29 plan14
+--skip-hits`.
 
 ### 100M / 1B tiers — optional / stretch
 

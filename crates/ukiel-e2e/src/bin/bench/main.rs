@@ -4,6 +4,7 @@
 //!
 //! Subcommands (see docs/notes/2026-07-08-macro-perf.md for the runbook):
 //!   bench hits load [--files N]                 load ClickBench hits into ukiel parts
+//!   bench hits compact [--target-mb N]          fold the fixture (SizeTargeted whale-split)
 //!   bench hits queries [--iters N] [--label L]  run the per-tenant read suite
 //!   bench bluesky produce --files N [...]        stream Bluesky ndjson to Kafka
 //!   bench bluesky run --files N [...]            full ingest→ladder→finalization run
@@ -21,6 +22,7 @@ bench — ukiel macro perf harness (plan 30, manual-only, run with --release)
 
 USAGE:
     bench hits load [--files N]
+    bench hits compact [--target-mb N]
     bench hits queries [--iters N] [--label LABEL]
     bench bluesky produce --files N [--topic T] [--wave-files W]
     bench bluesky run --files N [--wave-files W] [--flush-ms MS] [--label LABEL]
@@ -50,6 +52,7 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
             Ok(())
         }
         (Some("hits"), Some("load")) => hits::load(opt_usize(args, "--files")?).await,
+        (Some("hits"), Some("compact")) => hits::compact(opt_usize(args, "--target-mb")?).await,
         (Some("hits"), Some("queries")) => {
             let iters = opt_usize(args, "--iters")?.unwrap_or(10);
             let label = opt_str(args, "--label").unwrap_or("baseline");

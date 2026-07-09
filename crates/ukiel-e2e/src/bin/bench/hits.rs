@@ -4,10 +4,12 @@
 //! lowercase subset of the ~100-column source, cast to supported types
 //! (`int64`/`timestamp_ms`/`utf8`), day-split, sorted by `(counter_id, ts)`, and
 //! committed one-commit-per-file at level 1 with column stats populated. The
-//! compactor is deliberately NOT run over this fixture: the source files are
-//! row-range slices, so their `counter_id` ranges overlap and a merge would
-//! rewrite the whole ~15 GB (and trip the plan-28 cap). Overlap under-measures
-//! pruning — a caveat, not a correctness issue (recorded in the runbook note).
+//! source files are row-range slices, so their `counter_id` ranges overlap and
+//! the loaded fixture measures pruning against ~file-count fan-out per tenant.
+//! `bench hits compact` collapses that into one run per day-partition: since
+//! plan 29 (streaming merge, O(K·batch + row-group) RAM) the ~15 GB fold no
+//! longer trips the retired plan-28 cap — running the read suite before and
+//! after quantifies the fan-out collapse (bench §5 caveat lifted).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -22,7 +24,9 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
-use ukiel_core::{CommitOp, NamespaceId, PartMeta};
+use std::time::Instant;
+use ukiel_compactor::compactor::{Compactor, CompactorConfig};
+use ukiel_core::{CommitOp, HypertableId, NamespaceId, PartMeta};
 use ukiel_e2e::Stack;
 
 /// (ukiel column, ClickBench source column) for the Int64 subset. `counter_id`
@@ -314,6 +318,105 @@ pub async fn load(files: Option<usize>) -> anyhow::Result<()> {
         picked.light.id,
         out.display()
     );
+    Ok(())
+}
+
+/// Live-part fan-out over a hypertable: total parts, how many day-partitions
+/// they span, and the worst per-partition run count (the read-side fan-out a
+/// whole-partition query pays).
+struct RunSummary {
+    parts: usize,
+    partitions: usize,
+    max_per_partition: usize,
+}
+
+async fn partition_run_summary(stack: &Stack, ht: HypertableId) -> anyhow::Result<RunSummary> {
+    let parts = stack.catalog.live_parts(ht, None).await?;
+    let mut per: HashMap<String, usize> = HashMap::new();
+    for p in &parts {
+        *per.entry(p.meta.partition_values.to_string()).or_default() += 1;
+    }
+    Ok(RunSummary {
+        parts: parts.len(),
+        partitions: per.len(),
+        max_per_partition: per.values().copied().max().unwrap_or(0),
+    })
+}
+
+/// `bench hits compact [--target-mb N]`: drives compaction + finalization to
+/// quiescence over the loaded `hits` fixture, folding the per-file L1 runs into
+/// one run per day-partition (the plan-17 terminal invariant). This is the
+/// plan-29 exercise at volume — the ~15 GB fold streams in bounded memory where
+/// the retired plan-28 cap once forbade it. With `--target-mb N` the hypertable
+/// switches to `SizeTargeted(N MiB)` placement first, so heavy keys **whale-split**
+/// into dedicated files instead of collapsing into one big packed file per day
+/// (restoring scan parallelism for the whale while the tail still shrinks). Run
+/// `bench hits queries` before and after to quantify the fan-out collapse
+/// (lifts the bench §5 caveat).
+pub async fn compact(target_mb: Option<usize>) -> anyhow::Result<()> {
+    let stack = Stack::start().await;
+    let ht = stack.catalog.get_hypertable("hits").await?.id;
+
+    if let Some(mb) = target_mb {
+        let bytes = (mb * 1024 * 1024) as i64;
+        stack
+            .catalog
+            .set_placement(ht, ukiel_core::Placement::SizeTargeted(bytes))
+            .await?;
+        println!("placement: SizeTargeted({mb} MiB) — heavy keys whale-split");
+    }
+
+    let before = partition_run_summary(&stack, ht).await?;
+    println!(
+        "before: {} live parts / {} day-partitions (worst {}/day)",
+        before.parts, before.partitions, before.max_per_partition
+    );
+
+    // finalize_after_secs: 0 — the loaded fixture is quiet by construction, so
+    // every partition is immediately foldable to its single terminal run.
+    let drain = Compactor::new(
+        stack.catalog.clone(),
+        stack.store.clone(),
+        CompactorConfig {
+            worker_name: "bench-hits-compact".to_string(),
+            l0_fanout: 4,
+            fanout: 10,
+            finalize_after_secs: 0,
+            ..CompactorConfig::default()
+        },
+    );
+    let comp_start = Instant::now();
+    while drain.run_once().await?.merged_groups > 0 {}
+    let compaction_secs = comp_start.elapsed().as_secs_f64();
+    let fin_start = Instant::now();
+    while drain.finalize_once().await? > 0 {}
+    let finalization_secs = fin_start.elapsed().as_secs_f64();
+
+    let after = partition_run_summary(&stack, ht).await?;
+    println!(
+        "after:  {} live parts / {} day-partitions (worst {}/day)",
+        after.parts, after.partitions, after.max_per_partition
+    );
+    println!(
+        "PERF hits/compact/compaction_secs={compaction_secs:.1}\n\
+         PERF hits/compact/finalization_secs={finalization_secs:.1}\n\
+         fan-out collapse: worst {}→{} runs/day-partition (terminal invariant: 1 cold run/partition)",
+        before.max_per_partition, after.max_per_partition
+    );
+
+    // Per-tenant fan-out collapse for the census classes, if a census exists.
+    if let Ok(f) = std::fs::File::open(results_dir().join("hits-tenants.json"))
+        && let Ok(census) = serde_json::from_reader::<_, HitsCensus>(f)
+    {
+        for (class, t) in [
+            ("heavy", &census.heavy),
+            ("median", &census.median),
+            ("light", &census.light),
+        ] {
+            let fo = stack.live_part_count(ht, Some(t.id)).await;
+            println!("  {class} tenant {} fan-out now {fo}", t.id);
+        }
+    }
     Ok(())
 }
 
