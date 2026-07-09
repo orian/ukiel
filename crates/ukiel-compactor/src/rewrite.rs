@@ -5,14 +5,12 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, RecordBatch};
-use arrow::compute::{SortColumn, concat_batches, lexsort_to_indices, take};
+use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::properties::WriterProperties;
 use ukiel_core::{Part, Placement};
 
 use crate::CompactorError;
@@ -54,26 +52,11 @@ fn adapt_to_schema(batch: RecordBatch, target: &SchemaRef) -> Result<RecordBatch
     Ok(RecordBatch::try_new(target.clone(), columns)?)
 }
 
-/// Lexicographic sort by the named columns (in order).
+/// Lexicographic sort by the named columns (in order). Delegates to the shared
+/// `ukiel_core::sorting` implementation so L0 (ingest) and L1+ (compaction)
+/// ordering — including nulls placement — can never drift.
 pub fn sort_batch(batch: &RecordBatch, sort_key: &[String]) -> Result<RecordBatch, CompactorError> {
-    let mut columns = Vec::with_capacity(sort_key.len());
-    for name in sort_key {
-        let idx = batch
-            .schema()
-            .index_of(name)
-            .map_err(|_| CompactorError::MissingColumn(name.clone()))?;
-        columns.push(SortColumn {
-            values: batch.column(idx).clone(),
-            options: None,
-        });
-    }
-    let indices = lexsort_to_indices(&columns, None)?;
-    let sorted = batch
-        .columns()
-        .iter()
-        .map(|c| take(c.as_ref(), &indices, None))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(RecordBatch::try_new(batch.schema(), sorted)?)
+    Ok(ukiel_core::sort_batch(batch, sort_key)?)
 }
 
 /// Splits a batch (already sorted with `packing_key` as primary sort column)
@@ -160,19 +143,7 @@ pub fn batch_to_parquet(
     batch: &RecordBatch,
     sort_key: &[String],
 ) -> Result<Vec<u8>, CompactorError> {
-    let sorting: Vec<parquet::file::metadata::SortingColumn> = sort_key
-        .iter()
-        .filter_map(|name| batch.schema().index_of(name).ok())
-        .map(|idx| parquet::file::metadata::SortingColumn {
-            column_idx: idx as i32,
-            descending: false,
-            nulls_first: false,
-        })
-        .collect();
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::default()))
-        .set_sorting_columns(Some(sorting))
-        .build();
+    let props = ukiel_core::sorted_writer_props(&batch.schema(), sort_key);
     let mut bytes = Vec::new();
     let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), Some(props))?;
     writer.write(batch)?;
@@ -239,6 +210,7 @@ mod tests {
             &arrow_schema,
             "tenant_id",
             "ts",
+            &["tenant_id".to_string(), "ts".to_string()],
             vec![
                 json!({"tenant_id": 2, "ts": 20, "payload": "b1"}),
                 json!({"tenant_id": 7, "ts": 10, "payload": "c1"}),
@@ -249,6 +221,7 @@ mod tests {
             &arrow_schema,
             "tenant_id",
             "ts",
+            &["tenant_id".to_string(), "ts".to_string()],
             vec![
                 json!({"tenant_id": 1, "ts": 30, "payload": "a1"}),
                 json!({"tenant_id": 7, "ts": 5,  "payload": "c0"}),

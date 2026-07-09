@@ -74,6 +74,7 @@ pub async fn setup() -> Harness {
         &schema,
         "tenant_id",
         "ts",
+        &["tenant_id".to_string(), "ts".to_string()],
         vec![
             json!({"tenant_id": 1, "ts": 100, "payload": "a1"}),
             json!({"tenant_id": 1, "ts": 200, "payload": "a2"}),
@@ -85,6 +86,7 @@ pub async fn setup() -> Harness {
         &schema,
         "tenant_id",
         "ts",
+        &["tenant_id".to_string(), "ts".to_string()],
         vec![json!({"tenant_id": 2, "ts": 300, "payload": "b2"})],
     )
     .unwrap();
@@ -379,6 +381,7 @@ async fn alias_columns_compute_at_query_time() {
         &cols,
         "tenant_id",
         "ts",
+        &["tenant_id".to_string(), "ts".to_string()],
         vec![
             json!({"tenant_id": 1, "ts": 1, "amount": 8.0}),
             json!({"tenant_id": 1, "ts": 2}),
@@ -758,6 +761,7 @@ async fn catalog_prunes_parts_by_ts_stats() {
             &schema,
             "tenant_id",
             "ts",
+            &["tenant_id".to_string(), "ts".to_string()],
             vec![json!({"tenant_id": 1, "ts": ts_base, "payload": payload})],
         )
         .unwrap();

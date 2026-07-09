@@ -68,7 +68,14 @@ pub async fn setup() -> Env {
 /// Writes one L0 part with the given rows and commits it.
 pub async fn add_l0(env: &Env, day: &str, rows: Vec<serde_json::Value>) {
     let schema = arrow_schema_from_json(&events_schema()).unwrap();
-    let encoded = rows_to_parquet(&schema, "tenant_id", "ts", rows).unwrap();
+    let encoded = rows_to_parquet(
+        &schema,
+        "tenant_id",
+        "ts",
+        &["tenant_id".to_string(), "ts".to_string()],
+        rows,
+    )
+    .unwrap();
     let path = format!("ht/{}/L0/{}.parquet", env.ht, uuid::Uuid::new_v4());
     let size = encoded.bytes.len() as i64;
     env.store

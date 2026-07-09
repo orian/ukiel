@@ -13,6 +13,21 @@ pub async fn apply(catalog: &PostgresCatalog, tables: &[TableConfig]) -> anyhow:
         ukiel_expr::validate_table_schema(&schema)
             .with_context(|| format!("invalid schema for table '{}'", table.name))?;
 
+        // Sort-order invariants (plan 27), re-checked on every boot so a config
+        // that predates the validation fails fast rather than silently letting
+        // ingest write files the query provider's declared ordering doesn't
+        // match. Covers the ts_column rule the catalog can't (ts lives here).
+        let physical = ukiel_core::TableColumns::parse(&schema)
+            .with_context(|| format!("parsing schema for table '{}'", table.name))?
+            .physical_schema();
+        ukiel_core::validate_sort_key(
+            &physical,
+            &table.sort_key,
+            &table.packing_key,
+            Some(&table.ts_column),
+        )
+        .with_context(|| format!("invalid sort_key for table '{}'", table.name))?;
+
         let hypertable = match catalog.get_hypertable(&table.name).await {
             Ok(existing) => {
                 if existing.table_schema != schema {

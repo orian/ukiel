@@ -52,6 +52,7 @@ async fn flush_writes_objects_and_commits_atomically() {
         &arrow_schema,
         "tenant_id",
         "ts",
+        &["tenant_id".to_string(), "ts".to_string()],
         vec![
             json!({"tenant_id": 1, "ts": 1000, "payload": "a"}),
             json!({"tenant_id": 2, "ts": 2000, "payload": "b"}),
@@ -62,6 +63,7 @@ async fn flush_writes_objects_and_commits_atomically() {
         &arrow_schema,
         "tenant_id",
         "ts",
+        &["tenant_id".to_string(), "ts".to_string()],
         vec![json!({"tenant_id": 1, "ts": 90_000_000, "payload": "c"})],
     )
     .unwrap();
@@ -217,6 +219,7 @@ async fn successful_flush_leaves_no_pending_intent() {
         &arrow_schema,
         "tenant_id",
         "ts",
+        &["tenant_id".to_string(), "ts".to_string()],
         vec![json!({"tenant_id": 1, "ts": 1, "payload": "a"})],
     )
     .unwrap();
@@ -275,6 +278,7 @@ async fn failed_upload_leaves_discoverable_intent() {
         &arrow_schema,
         "tenant_id",
         "ts",
+        &["tenant_id".to_string(), "ts".to_string()],
         vec![json!({"tenant_id": 1, "ts": 1, "payload": "a"})],
     )
     .unwrap();

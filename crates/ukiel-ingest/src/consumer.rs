@@ -135,6 +135,17 @@ pub(crate) fn event_time_in_bounds(ts_ms: i64, now_ms: i64, config: &IngestConfi
 impl RouteIngest {
     async fn run(&self, shutdown: CancellationToken) -> Result<(), IngestError> {
         let hypertable = self.catalog.get_hypertable(&self.route.hypertable).await?;
+        // Fail fast if this route's declared sort ordering is unsound (plan 27):
+        // packing key must lead sort_key, ts_column must be in it, all columns
+        // must exist — the query provider trusts the declared ordering, so an
+        // L0 file that doesn't physically match would give silent wrong results.
+        let physical = ukiel_core::TableColumns::parse(&hypertable.table_schema)?.physical_schema();
+        ukiel_core::validate_sort_key(
+            &physical,
+            &hypertable.sort_key,
+            &hypertable.packing_key,
+            Some(&self.route.ts_column),
+        )?;
         let consumer = self.connect(&hypertable).await?;
 
         let mut buffers = Buffers::default();
@@ -334,6 +345,7 @@ impl RouteIngest {
                 &cols,
                 &hypertable.packing_key,
                 &self.route.ts_column,
+                &hypertable.sort_key,
                 rows,
             )?;
             items.push(FlushItem {

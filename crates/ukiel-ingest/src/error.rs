@@ -14,6 +14,8 @@ pub enum IngestError {
     Kafka(#[from] rdkafka::error::KafkaError),
     #[error(transparent)]
     Expr(#[from] ukiel_expr::ExprError),
+    #[error(transparent)]
+    SortKey(#[from] ukiel_core::SortKeyError),
     #[error("row {row} is missing required i64 column '{column}'")]
     MissingColumn { row: usize, column: String },
     #[error("flush called with no rows")]

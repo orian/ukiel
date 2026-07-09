@@ -24,6 +24,13 @@ impl PostgresCatalog {
         sort_key: &[String],
         packing_key: &str,
     ) -> Result<HypertableId, CatalogError> {
+        // Registration-time invariants (plan 27): packing key leads the sort
+        // key and every sort column exists in the physical schema. ts_column
+        // lives on the ingest route, not the catalog, so its membership is
+        // re-checked at bootstrap / consumer startup.
+        let physical = ukiel_core::TableColumns::parse(table_schema)?.physical_schema();
+        ukiel_core::validate_sort_key(&physical, sort_key, packing_key, None)?;
+
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO hypertables (name, table_schema, partition_spec, sort_key, packing_key)
              VALUES ($1, $2, $3, $4, $5) RETURNING id",

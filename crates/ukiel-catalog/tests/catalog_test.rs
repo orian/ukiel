@@ -1137,3 +1137,45 @@ async fn collector_probes_report_live_counts_lag_and_backlogs() {
     assert!(size >= 1);
     assert!(idle <= size as usize);
 }
+
+#[tokio::test]
+async fn create_hypertable_rejects_unsound_sort_key() {
+    let (_pg, catalog) = common::setup().await;
+    // Packing key must lead the sort key (plan 27): ts-first is rejected.
+    let err = catalog
+        .create_hypertable(
+            "bad",
+            &events_schema(),
+            &json!({"columns": ["day"]}),
+            &["ts".to_string(), "tenant_id".to_string()],
+            "tenant_id",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CatalogError::SortKey(_)), "got {err:?}");
+
+    // A sort column absent from the schema is rejected too.
+    let err = catalog
+        .create_hypertable(
+            "bad2",
+            &events_schema(),
+            &json!({"columns": ["day"]}),
+            &["tenant_id".to_string(), "nope".to_string()],
+            "tenant_id",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CatalogError::SortKey(_)), "got {err:?}");
+
+    // The valid shape still works.
+    catalog
+        .create_hypertable(
+            "good",
+            &events_schema(),
+            &json!({"columns": ["day"]}),
+            &["tenant_id".to_string(), "ts".to_string()],
+            "tenant_id",
+        )
+        .await
+        .unwrap();
+}

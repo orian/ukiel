@@ -20,6 +20,13 @@ pub enum CatalogError {
     )]
     OffsetRace { topic: String, partition: i32 },
 
+    /// A hypertable was registered with an invalid schema or `sort_key`
+    /// (plan 27: packing key must lead the sort key, columns must exist).
+    #[error(transparent)]
+    Schema(#[from] ukiel_core::SchemaError),
+    #[error(transparent)]
+    SortKey(#[from] ukiel_core::SortKeyError),
+
     #[error(transparent)]
     Db(#[from] sqlx::Error),
 
