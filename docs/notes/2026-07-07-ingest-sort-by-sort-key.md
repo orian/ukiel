@@ -1,6 +1,18 @@
 # Ingest must sort by the declared sort_key (plan)
 
-Status: plan, not started. Follow-up to the declared-sort-order work
+Status: **executed** (plan 27, 2026-07-09). Shipped as designed: shared
+`ukiel_core::sorting` module (`sort_batch`, `sorting_columns`,
+`sorted_writer_props`, `validate_sort_key`) under one canonical convention
+(ascending, nulls-first); ingest sorts the Arrow batch by `hypertable.sort_key`
+after defaults/materialized (so `sort_key` may include computed columns);
+compactor's `rewrite.rs` delegates to the same module; invariants validated at
+`create_hypertable`, bootstrap, and consumer startup. The nulls-first metadata
+flip only affects files with nullable sort columns (none exist today). One
+deliberate simplification vs the sketch: `validate_sort_key` takes the parsed
+physical `Schema` rather than re-deriving column names, so the same call serves
+the catalog, bootstrap, and consumer paths.
+
+Follow-up to the declared-sort-order work
 (43de799). That commit made compaction sort by `hypertable.sort_key` and
 made the query provider *declare* per-file ordering from
 `hypertable.sort_key` — but ingest still sorts L0 files by the hardcoded
