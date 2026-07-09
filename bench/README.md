@@ -238,13 +238,63 @@ median ms:
 | `ts_window` | 18.9 | 15.9 | 14.8 |
 | `minutely` | 18.7 | 15.9 | 15.5 |
 
-### 10 GB tier (hits full, Bluesky 10M) — PENDING
+### 10 GB tier (hits full, Bluesky 10M) — SHA `4d5f93a`, 2026-07-09
 
-Run per the runbook on a box with the disk headroom in §1; paste the
-`hits-queries-baseline.json` medians and the `bsky-run-baseline.json`
-write-path numbers into a new subsection here, with machine spec and git SHA.
-The harness is smoke-verified; the full-tier numbers are a data-collection
-step, not a code change.
+Same machine as the smoke tier. One pass each, per the runbook (fetch ~12 min,
+load ~9 min, queries ~1 min, bluesky run ~3 min).
+
+**hits, all 100 files**: loaded 99,997,497 rows into **1,102 live L1 parts /
+6.46 GB** (the 14-column ZSTD subset of the 14.8 GB source). Census: 6,506
+tenants; heavy = 3922 (8.53M rows), median = 150550 (123 rows), light = 240030
+(1,003 rows). Warm median ms:
+
+| scenario | heavy (fan-out 67) | median (fan-out 108) | light (fan-out 82) |
+|---|---|---|---|
+| `count` | 39.5 | 51.7 | 42.4 |
+| `adv_filter` | 52.5 | 53.3 | 46.2 |
+| `distinct_users` | 78.3 | 54.0 | 46.0 |
+| `top_urls` | 363.3 | 56.6 | 51.0 |
+| `search_phrases` | 208.9 | 55.1 | 48.6 |
+| `ts_window` | 2.7 | 3.1 | 2.7 |
+| `minutely` | 4.1 | 4.1 | 4.7 |
+
+Readings:
+
+- **Key-range pruning holds up even on this overlapping layout**: fan-out
+  67–108 of 1,102 live parts — 91–94% of files never opened. The §5 overlap
+  caveat cost less than feared.
+- **Tiny tenants pay a flat ~45–55 ms floor** — a 123-row tenant costs what a
+  1k-row tenant costs. That is per-file open/footer cost × fan-out, not data:
+  direct, quantified motivation for plan 13 (Parquet metadata cache) and for
+  fan-out-shrinking compaction/coalescing (rows 29/22). Re-measure both
+  against this table.
+- **ts-stats pruning (plan 12) is decisive**: `ts_window`/`minutely` run
+  2.7–4.7 ms *regardless of tenant size* — part-level ts min/max prunes the
+  24 h window before any I/O.
+- Heavy-tenant string aggregations do real scan work (`top_urls` 363 ms over
+  8.5M rows) — the scan path, not the catalog, is the cost there.
+
+**Bluesky write path, `bluesky run --files 10`** (10,000,000 lines, 6 poison;
+production guardrail defaults):
+
+| Metric | Value |
+|---|---|
+| produce rate | 220.6k rows/s (45.3 s) |
+| ingest catch-up | 91.9 s (~109k rows/s through flush → upload → commit) |
+| stored rows | 9,999,994 (= mapped ✓ exactly-once; offsets = 10,000,000 produced ✓) |
+| compaction / finalization after drain | 0.05 s / 7.7 s |
+| final layout | 1 part at level 2, 549 MB (terminal invariant: one run) |
+| backpressure deferrals | **67** — plan 18's slowdown band engaged during catch-up |
+| capped merges | **6** — plan 28's cap fired transiently mid-run |
+| per-tenant reads (top-3 census) | `count` ~15 ms · `by_collection` ~16–18 ms · `ts_window` ~19–20 ms |
+
+Readings: **the first real-volume observation of both guardrails.** A single
+in-process compactor lags a ~220k rows/s firehose aimed at roughly one
+day-partition, live L0 crosses the slowdown threshold (30), and ingest
+self-throttles — exactly the plan-18 design. The transient plan-28 caps
+resolved as the ladder climbed, and the terminal invariant still landed
+(one run). This is the run-shape the P2 collector gauges (row 21) now make
+visible in production.
 
 ### 100M / 1B tiers — optional / stretch
 

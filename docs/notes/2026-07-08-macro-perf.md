@@ -49,7 +49,8 @@ Manual-only, never CI; always `--release`; datasets and results gitignored.
 
 ## Status
 
-Harness executed and **smoke-verified end to end** (1 file each: Bluesky 1M
-events → stored == mapped, finalized to one L2 run; hits 7-tenant read suite).
-The full 10 GB / 100M / 1B tier baselines are a data-collection step pending a
-dedicated run on a box with the disk headroom — see `bench/README.md` §1 and §6.
+Harness executed and smoke-verified end to end (2026-07-09), then the **10 GB
+tier recorded the same day** (hits: all 100 files, 100M rows, 1,102 parts,
+per-tenant suite; Bluesky: 10M events with both guardrails observed engaging
+and exactly-once asserted) — results in `bench/README.md` §6. Remaining:
+Bluesky 100M (long run) and 1B (stretch, `--wave-files`).
