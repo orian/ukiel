@@ -151,6 +151,49 @@ pub fn batch_to_parquet(
     Ok(bytes)
 }
 
+/// Like `batch_to_parquet` but with explicit layout `opts` (level → compression,
+/// delta-ts, blooms, row-group cap). One row group per write, cap-split.
+pub fn batch_to_parquet_opts(
+    batch: &RecordBatch,
+    sort_key: &[String],
+    opts: &ukiel_core::WriteOpts,
+) -> Result<Vec<u8>, CompactorError> {
+    let props = ukiel_core::writer_props(&batch.schema(), sort_key, opts);
+    let mut bytes = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), Some(props))?;
+    writer.write(batch)?;
+    writer.close()?;
+    Ok(bytes)
+}
+
+/// Writes one file whose row groups end on packing-key boundaries (Tier-3 #7):
+/// each per-key slice (from `split_by_key`, so the batch must be key-sorted)
+/// streams into one `ArrowWriter`, and the current group is flushed before a
+/// slice that would overflow `opts.max_row_group_rows`. Tiny keys share a
+/// group; a key larger than the cap spans several (the writer's own cap-split).
+/// Consecutive groups' key ranges never interleave, so per-group key stats
+/// prune exactly for the isolation predicate.
+pub fn batch_to_parquet_key_aligned(
+    batch: &RecordBatch,
+    packing_key: &str,
+    sort_key: &[String],
+    opts: &ukiel_core::WriteOpts,
+) -> Result<Vec<u8>, CompactorError> {
+    let props = ukiel_core::writer_props(&batch.schema(), sort_key, opts);
+    let mut bytes = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), Some(props))?;
+    for (_key, slice) in split_by_key(batch, packing_key)? {
+        if writer.in_progress_rows() > 0
+            && writer.in_progress_rows() + slice.num_rows() > opts.max_row_group_rows
+        {
+            writer.flush()?; // end the row group before the next key run
+        }
+        writer.write(&slice)?;
+    }
+    writer.close()?;
+    Ok(bytes)
+}
+
 pub(crate) fn int64_column<'a>(
     batch: &'a RecordBatch,
     name: &str,
@@ -173,6 +216,71 @@ mod tests {
     use serde_json::json;
     use ukiel_core::{CommitId, HypertableId, PartId, PartMeta, arrow_schema_from_json};
     use ukiel_ingest::rows_to_parquet;
+
+    #[test]
+    fn key_aligned_row_groups_end_on_key_boundaries() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::file::statistics::Statistics;
+
+        // Key runs 1×3, 2×3, 3×6, 4×1 (already key-sorted); cap 4.
+        let mut keys = Vec::new();
+        for (k, n) in [(1i64, 3), (2, 3), (3, 6), (4, 1)] {
+            keys.extend(std::iter::repeat_n(k, n));
+        }
+        let ts: Vec<i64> = (0..keys.len() as i64).collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tenant_id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(keys)),
+                Arc::new(Int64Array::from(ts)),
+            ],
+        )
+        .unwrap();
+        let sort_key = vec!["tenant_id".to_string(), "ts".to_string()];
+        let opts = ukiel_core::WriteOpts {
+            level: 1,
+            ts_column: Some("ts".to_string()),
+            bloom_columns: vec![],
+            max_row_group_rows: 4,
+        };
+        let bytes = batch_to_parquet_key_aligned(&batch, "tenant_id", &sort_key, &opts).unwrap();
+
+        let md = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+            .unwrap()
+            .metadata()
+            .clone();
+        let counts: Vec<i64> = md.row_groups().iter().map(|rg| rg.num_rows()).collect();
+        assert_eq!(counts, vec![3, 3, 4, 3], "row groups end on key boundaries");
+
+        let ranges: Vec<(i64, i64)> = md
+            .row_groups()
+            .iter()
+            .map(|rg| match rg.column(0).statistics().unwrap() {
+                Statistics::Int64(v) => (*v.min_opt().unwrap(), *v.max_opt().unwrap()),
+                _ => panic!("int64 key stats"),
+            })
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![(1, 1), (2, 2), (3, 3), (3, 4)],
+            "consecutive groups' key ranges never interleave"
+        );
+
+        // Shared opts: ZSTD (L1+), delta-ts, nulls-first stamps.
+        let rg0 = md.row_group(0);
+        assert!(matches!(
+            rg0.column(0).compression(),
+            parquet::basic::Compression::ZSTD(_)
+        ));
+        let ts_enc: Vec<_> = rg0.column(1).encodings().collect();
+        assert!(ts_enc.contains(&parquet::basic::Encoding::DELTA_BINARY_PACKED));
+        assert!(rg0.sorting_columns().unwrap().iter().all(|c| c.nulls_first));
+    }
 
     fn schema_json() -> serde_json::Value {
         json!({"fields": [

@@ -61,7 +61,16 @@ pub async fn delete_key(
             continue; // range overlapped but every row was the key's
         }
         let (key_min, key_max) = rewrite::key_range(&kept, &hypertable.packing_key)?;
-        let bytes = rewrite::batch_to_parquet(&kept, &hypertable.sort_key)?;
+        // Rewrite at the original level with key-aligned row groups (the kept
+        // batch stays sorted after the filter).
+        let opts =
+            ukiel_core::WriteOpts::from_columns(&cols, &hypertable.sort_key, part.meta.level);
+        let bytes = rewrite::batch_to_parquet_key_aligned(
+            &kept,
+            &hypertable.packing_key,
+            &hypertable.sort_key,
+            &opts,
+        )?;
         let path = format!(
             "ht/{}/L{}/{}.parquet",
             hypertable.id,

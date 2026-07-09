@@ -341,6 +341,8 @@ impl Compactor {
             &hypertable.placement,
             bytes_per_row,
         )?;
+        // Layout for the output level (delta-ts, blooms, ZSTD at L1+, cap).
+        let opts = ukiel_core::WriteOpts::from_columns(&cols, &hypertable.sort_key, output_level);
 
         // Assign paths and record upload intent before any upload: GC orphan
         // discovery is a catalog query over pending_objects (plan 9).
@@ -361,7 +363,19 @@ impl Compactor {
 
         let mut new_parts = Vec::with_capacity(outputs.len());
         for ((key_min, key_max, batch), path) in outputs.iter().zip(paths) {
-            let bytes = rewrite::batch_to_parquet(batch, &hypertable.sort_key)?;
+            // Multi-key chunks (packed / SizeTargeted shared) get row groups
+            // aligned to key boundaries so per-group key stats prune exactly;
+            // single-key chunks (separated / whale) need no alignment.
+            let bytes = if key_min != key_max {
+                rewrite::batch_to_parquet_key_aligned(
+                    batch,
+                    &hypertable.packing_key,
+                    &hypertable.sort_key,
+                    &opts,
+                )?
+            } else {
+                rewrite::batch_to_parquet_opts(batch, &hypertable.sort_key, &opts)?
+            };
             let size_bytes = bytes.len() as i64;
             self.store
                 .put(&Path::from(path.clone()), bytes.into())
