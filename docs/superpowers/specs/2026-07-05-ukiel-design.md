@@ -203,14 +203,15 @@ capability:
   write-path that asserts exactly-once at volume (runbook + baselines:
   `bench/README.md`).
 
-**Not yet** (roadmap rows; recommended order 27 → 14 → 29 → 13 →
+**Not yet** (roadmap rows; recommended order 13 → 27 → 14 → 29 →
 15 → 16 → 8, then 22 → 23 → 24; 25/26 gated on design decisions):
-ingest sort-by-sort-key
-(27, latent soundness gap),
+**Parquet metadata cache** (13, pulled first 2026-07-09 — the 10 GB-tier
+baseline measured the flat ~45–55 ms per-tenant fan-out floor it removes,
+`bench/README.md` §6), ingest sort-by-sort-key (27, latent soundness gap),
 shared writer/file layout (14), **streaming merge** (29 — issue 0005's real
 fix; bounded-memory compaction + whale-key splitting, the PB+-scale gate:
-`docs/notes/2026-07-08-streaming-merge.md`), read-side perf tiers
-(13/15/16), pipelines & MVs (8 — plan written), partition coalescing +
+`docs/notes/2026-07-08-streaming-merge.md`), remaining read-side perf tiers
+(15/16), pipelines & MVs (8 — plan written), partition coalescing +
 retention (22), feed horizon (23), egress (24), auth (25), horizontal
 ingest (26).
 
