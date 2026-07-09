@@ -440,6 +440,42 @@ Reading — **the metadata cache does exactly what plan 13 predicted**:
 Reproduce: `bench/bench.sh cache13 tuned --skip-bluesky` (loads hits, runs the
 suite under `cache13`, prints the `tuned → cache13` delta).
 
+### 10M write path — plan 27 (ingest sort by declared sort_key), 2026-07-09
+
+Same machine, tuned profile, same `bsky` schema (`sort_key = [tenant_id, ts]`).
+Plan 27 replaced the ingest pre-decode `serde_json`-row sort with a columnar
+`lexsort` on the decoded Arrow batch. `bluesky run --files 10` (10M events),
+**tuned (pre-27) → sort27**:
+
+| metric | tuned | sort27 | Δ |
+|---|---|---|---|
+| produce rate | 220.9k rows/s | 221.2k rows/s | +0.1% |
+| ingest catch-up | 81.0 s | **38.5 s** | **−52%** |
+| backpressure deferrals | 60 | 0 | −100% |
+| capped merges | 6 | 0 | −100% |
+| stored rows | 9,999,994 ✓ | 9,999,994 ✓ | exactly-once held |
+| final layout | 1 part L2, 575.60 MB | 1 part L3, 575.63 MB | ~identical |
+
+Readings:
+
+- **The write path is the real, attributable win.** The old sort did two
+  `serde_json::Value` map lookups per comparison (O(N log N) of them per
+  flush); the columnar `lexsort` on contiguous i64 arrays is far cheaper, so
+  ingest keeps up with the ~220k rows/s firehose and **never trips backpressure
+  (60 → 0 deferrals) or the merge cap (6 → 0)** — which kept compaction clean.
+- **Reads are NOT a plan-27 effect here.** For `[tenant_id, ts]` the physical
+  row order is unchanged, so the finalized files are byte-for-byte ~equal
+  (575.6 MB both, 1 part). Plan 27 only flips the sorting-column *metadata*
+  (`nulls_first`) to match the provider's declared ordering — a correctness
+  fix, not a layout change. The per-tenant read wobble seen in this A/B
+  (`count` ~12→10 ms) is run-to-run/system-state noise (tuned's reads ran right
+  after heavy backpressure + caps; sort27's on a calm system), not a real
+  read win. **Changing *how* files are laid out (a richer clustering
+  `sort_key`) is the lever that would move reads — see below.**
+
+Reproduce: `bench/bench.sh sort27 tuned --skip-bluesky` (runs the write path
+under `sort27`, prints the `tuned → sort27` delta).
+
 ### 100M / 1B tiers — optional / stretch
 
 100M Bluesky is a documented long run; 1B needs `--wave-files` and hours.
