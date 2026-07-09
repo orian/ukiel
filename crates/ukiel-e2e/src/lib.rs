@@ -97,6 +97,7 @@ impl Stack {
             store: store.clone(),
             store_url: store_url.clone(),
             statement_timeout: std::time::Duration::from_secs(300),
+            metadata_cache: Arc::new(ukiel_query::metadata_cache::ParquetMetadataCache::default()),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

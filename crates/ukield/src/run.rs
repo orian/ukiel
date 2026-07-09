@@ -15,6 +15,7 @@ use ukiel_gc::{Gc, GcConfig};
 use ukiel_ingest::config::{IngestConfig, TableRoute};
 use ukiel_ingest::consumer::IngestWorker;
 use ukiel_query::cache::CachingObjectStore;
+use ukiel_query::metadata_cache::ParquetMetadataCache;
 use ukiel_query::server::{AppState, router};
 
 use crate::config::{ObjectStoreConfig, Role, UkieldConfig};
@@ -88,6 +89,10 @@ pub async fn run_with_bound_addr(
         ))
     };
 
+    // Process-wide Parquet footer cache: parts are immutable, so entries
+    // never invalidate — the LRU bound is the only policy.
+    let metadata_cache = Arc::new(ParquetMetadataCache::default());
+
     crate::bootstrap::apply(&catalog, &cfg.tables).await?;
 
     let mut tasks: tokio::task::JoinSet<anyhow::Result<&'static str>> = tokio::task::JoinSet::new();
@@ -138,6 +143,7 @@ pub async fn run_with_bound_addr(
             store: store.clone(),
             store_url: store_url.clone(),
             statement_timeout: std::time::Duration::from_secs(cfg.query.statement_timeout_secs),
+            metadata_cache: metadata_cache.clone(),
         };
         let listener = tokio::net::TcpListener::bind(&cfg.query.listen)
             .await

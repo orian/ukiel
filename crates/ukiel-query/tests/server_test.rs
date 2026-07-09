@@ -17,6 +17,9 @@ async fn spawn_server_with_timeout(
         store: h.store.clone(),
         store_url: url::Url::parse(STORE_URL).unwrap(),
         statement_timeout,
+        metadata_cache: std::sync::Arc::new(
+            ukiel_query::metadata_cache::ParquetMetadataCache::default(),
+        ),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

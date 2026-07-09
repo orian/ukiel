@@ -169,6 +169,10 @@ async fn ctx_with_provider(h: &Harness, namespace: i64) -> SessionContext {
         ht,
         namespace,
         ObjectStoreUrl::parse(STORE_URL).unwrap(),
+        Arc::new(CachingParquetFileReaderFactory::new(
+            h.store.clone(),
+            test_metadata_cache(),
+        )),
     )
     .unwrap();
     ctx.register_table("events", Arc::new(provider)).unwrap();
@@ -248,9 +252,15 @@ async fn session_resolves_tables_by_namespace() {
     let h = setup().await;
     let store_url = url::Url::parse(STORE_URL).unwrap();
 
-    let ctx = session_for_namespace(&h.catalog, NamespaceId(1), h.store.clone(), &store_url)
-        .await
-        .unwrap();
+    let ctx = session_for_namespace(
+        &h.catalog,
+        NamespaceId(1),
+        h.store.clone(),
+        &store_url,
+        test_metadata_cache(),
+    )
+    .await
+    .unwrap();
     let batches = ctx
         .sql("SELECT payload FROM events ORDER BY ts")
         .await
@@ -264,9 +274,15 @@ async fn session_resolves_tables_by_namespace() {
     assert!(ctx.sql("SELECT * FROM nope").await.is_err());
 
     // A namespace without that logical table cannot see it at all.
-    let ctx = session_for_namespace(&h.catalog, NamespaceId(42), h.store.clone(), &store_url)
-        .await
-        .unwrap();
+    let ctx = session_for_namespace(
+        &h.catalog,
+        NamespaceId(42),
+        h.store.clone(),
+        &store_url,
+        test_metadata_cache(),
+    )
+    .await
+    .unwrap();
     assert!(ctx.sql("SELECT * FROM events").await.is_err());
 }
 
@@ -282,9 +298,15 @@ async fn cache_serves_reads_after_inner_store_loses_the_object() {
     ));
     let store_url = url::Url::parse(STORE_URL).unwrap();
 
-    let ctx = session_for_namespace(&h.catalog, NamespaceId(1), cached.clone(), &store_url)
-        .await
-        .unwrap();
+    let ctx = session_for_namespace(
+        &h.catalog,
+        NamespaceId(1),
+        cached.clone(),
+        &store_url,
+        test_metadata_cache(),
+    )
+    .await
+    .unwrap();
     let batches = ctx
         .sql("SELECT payload FROM events ORDER BY ts")
         .await
@@ -305,9 +327,15 @@ async fn cache_serves_reads_after_inner_store_loses_the_object() {
         h.store.delete(&obj.location).await.unwrap();
     }
 
-    let ctx = session_for_namespace(&h.catalog, NamespaceId(1), cached, &store_url)
-        .await
-        .unwrap();
+    let ctx = session_for_namespace(
+        &h.catalog,
+        NamespaceId(1),
+        cached,
+        &store_url,
+        test_metadata_cache(),
+    )
+    .await
+    .unwrap();
     let batches = ctx
         .sql("SELECT payload FROM events ORDER BY ts")
         .await
@@ -389,6 +417,7 @@ async fn alias_columns_compute_at_query_time() {
         NamespaceId(1),
         h.store.clone(),
         &store_url,
+        test_metadata_cache(),
     )
     .await
     .unwrap();
@@ -447,6 +476,7 @@ async fn information_schema_lists_namespace_tables_and_columns() {
             NamespaceId(ns),
             h.store.clone(),
             store_url,
+            test_metadata_cache(),
         )
         .await
         .unwrap();
@@ -486,6 +516,7 @@ async fn information_schema_lists_namespace_tables_and_columns() {
         NamespaceId(1),
         h.store.clone(),
         &store_url,
+        test_metadata_cache(),
     )
     .await
     .unwrap();
@@ -619,9 +650,15 @@ async fn pushdown_prunes_row_groups_in_packed_files() {
         .unwrap();
 
     let store_url = url::Url::parse(STORE_URL).unwrap();
-    let ctx = session_for_namespace(&h.catalog, NamespaceId(1), h.store.clone(), &store_url)
-        .await
-        .unwrap();
+    let ctx = session_for_namespace(
+        &h.catalog,
+        NamespaceId(1),
+        h.store.clone(),
+        &store_url,
+        test_metadata_cache(),
+    )
+    .await
+    .unwrap();
 
     // Correctness: namespace 1 sees exactly its 4 rows.
     let batches = ctx
@@ -757,6 +794,7 @@ async fn catalog_prunes_parts_by_ts_stats() {
         NamespaceId(1),
         h.store.clone(),
         &store_url,
+        test_metadata_cache(),
     )
     .await
     .unwrap();
@@ -789,5 +827,78 @@ async fn catalog_prunes_parts_by_ts_stats() {
     assert!(
         !plan.contains("late.parquet"),
         "late part must be pruned in the catalog, not scanned:\n{plan}"
+    );
+}
+
+use ukiel_query::metadata_cache::{CachingParquetFileReaderFactory, ParquetMetadataCache};
+
+/// A fresh cache for tests that don't assert on cache behavior. (In a real
+/// process there is exactly one, shared; tests isolate by making their own.)
+pub fn test_metadata_cache() -> Arc<ParquetMetadataCache> {
+    Arc::new(ParquetMetadataCache::default())
+}
+
+#[tokio::test]
+async fn metadata_cache_hits_across_queries_with_identical_results() {
+    let h = setup().await;
+    let store_url = url::Url::parse(STORE_URL).unwrap();
+    let cache = Arc::new(ParquetMetadataCache::default());
+
+    // First query: cold cache — every footer read is a miss.
+    let ctx = session_for_namespace(
+        &h.catalog,
+        NamespaceId(1),
+        h.store.clone(),
+        &store_url,
+        cache.clone(),
+    )
+    .await
+    .unwrap();
+    let first = ctx
+        .sql("SELECT payload FROM events ORDER BY ts")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(all_strings(&first, "payload"), vec!["a1", "a2"]);
+    assert!(cache.misses() > 0, "cold cache: first query must miss");
+    assert!(!cache.is_empty(), "first query must populate the cache");
+    let misses_after_first = cache.misses();
+    let hits_after_first = cache.hits();
+
+    // Second query, new session, same process-wide cache: footers are served
+    // from memory (hits), no new misses, identical results.
+    let ctx = session_for_namespace(
+        &h.catalog,
+        NamespaceId(1),
+        h.store.clone(),
+        &store_url,
+        cache.clone(),
+    )
+    .await
+    .unwrap();
+    let second = ctx
+        .sql("SELECT payload FROM events ORDER BY ts")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        all_strings(&second, "payload"),
+        all_strings(&first, "payload"),
+        "results must be identical with and without a warm cache"
+    );
+    assert!(
+        cache.hits() > hits_after_first,
+        "warm cache: second query must hit (hits {} -> {})",
+        hits_after_first,
+        cache.hits()
+    );
+    assert_eq!(
+        cache.misses(),
+        misses_after_first,
+        "an identical second query must add no misses"
     );
 }

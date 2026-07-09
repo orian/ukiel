@@ -184,6 +184,7 @@ async fn build_and_session(h: &Harness, ds: &Dataset) -> SessionContext {
         NamespaceId(ds.query_ns),
         h.store.clone(),
         &store_url,
+        query_test::test_metadata_cache(),
     )
     .await
     .unwrap()

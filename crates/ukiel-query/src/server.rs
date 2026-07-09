@@ -17,6 +17,7 @@ use ukiel_catalog::PostgresCatalog;
 use ukiel_core::NamespaceId;
 
 use crate::context::session_for_namespace;
+use crate::metadata_cache::ParquetMetadataCache;
 use crate::results::{self, ARROW_STREAM_CONTENT_TYPE, ResultFormat};
 
 #[derive(Clone)]
@@ -28,6 +29,8 @@ pub struct AppState {
     /// guarantee (deployment invariant: this < gc.tombstone_grace). Also the
     /// runaway-query rail for a tenant-facing SQL endpoint.
     pub statement_timeout: std::time::Duration,
+    /// Process-wide Parquet footer cache, shared by every request's session.
+    pub metadata_cache: Arc<ParquetMetadataCache>,
 }
 
 #[derive(serde::Deserialize)]
@@ -132,6 +135,7 @@ async fn run_query_inner(
             NamespaceId(req.namespace_id),
             state.store.clone(),
             &state.store_url,
+            state.metadata_cache.clone(),
         )
         .await
         .map_err(bad_request)?;

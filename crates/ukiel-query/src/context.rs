@@ -16,6 +16,7 @@ use ukiel_catalog::{CatalogError, PostgresCatalog};
 use ukiel_core::NamespaceId;
 
 use crate::QueryError;
+use crate::metadata_cache::{CachingParquetFileReaderFactory, ParquetMetadataCache};
 use crate::provider::UkielTableProvider;
 
 pub async fn session_for_namespace(
@@ -23,6 +24,7 @@ pub async fn session_for_namespace(
     namespace: NamespaceId,
     store: Arc<dyn ObjectStore>,
     store_url: &url::Url,
+    metadata_cache: Arc<ParquetMetadataCache>,
 ) -> Result<SessionContext, QueryError> {
     let table_names: Vec<String> = catalog
         .list_logical_tables(namespace)
@@ -38,13 +40,18 @@ pub async fn session_for_namespace(
         .with_default_catalog_and_schema("ukiel", "public")
         .with_information_schema(true);
     let ctx = SessionContext::new_with_config(config);
-    ctx.register_object_store(store_url, store);
+    ctx.register_object_store(store_url, store.clone());
+
+    // One factory per session over the process-wide metadata cache. Sessions
+    // are cheap and per-request; the cache is the long-lived part.
+    let reader_factory = Arc::new(CachingParquetFileReaderFactory::new(store, metadata_cache));
 
     let schema = Arc::new(UkielSchemaProvider {
         catalog: catalog.clone(),
         namespace,
         table_names,
         store_url: ObjectStoreUrl::parse(store_url.as_str())?,
+        reader_factory,
     });
     ctx.register_catalog("ukiel", Arc::new(UkielCatalogProvider { schema }));
     Ok(ctx)
@@ -70,6 +77,7 @@ struct UkielSchemaProvider {
     /// Names snapshot taken at session build (used for sync `table_exist`).
     table_names: Vec<String>,
     store_url: ObjectStoreUrl,
+    reader_factory: Arc<CachingParquetFileReaderFactory>,
 }
 
 impl std::fmt::Debug for UkielSchemaProvider {
@@ -103,6 +111,7 @@ impl SchemaProvider for UkielSchemaProvider {
             hypertable,
             self.namespace.0, // v1 convention: table slice = packing_key == namespace id
             self.store_url.clone(),
+            self.reader_factory.clone(),
         )
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(Some(Arc::new(provider)))

@@ -27,6 +27,7 @@ use ukiel_catalog::PostgresCatalog;
 use ukiel_core::{Hypertable, TableColumns};
 
 use crate::QueryError;
+use crate::metadata_cache::CachingParquetFileReaderFactory;
 
 /// Extracts per-column Int64 bounds from pushed-down filters for catalog
 /// part pruning. Conservative by construction: anything unrecognized simply
@@ -99,6 +100,7 @@ pub struct UkielTableProvider {
     columns: TableColumns,
     packing_key_value: i64,
     store_url: ObjectStoreUrl,
+    reader_factory: Arc<CachingParquetFileReaderFactory>,
 }
 
 impl fmt::Debug for UkielTableProvider {
@@ -116,6 +118,7 @@ impl UkielTableProvider {
         hypertable: Hypertable,
         packing_key_value: i64,
         store_url: ObjectStoreUrl,
+        reader_factory: Arc<CachingParquetFileReaderFactory>,
     ) -> Result<Self, QueryError> {
         let columns = TableColumns::parse(&hypertable.table_schema)?;
         let physical_schema = Arc::new(columns.physical_schema());
@@ -128,6 +131,7 @@ impl UkielTableProvider {
             columns,
             packing_key_value,
             store_url,
+            reader_factory,
         })
     }
 }
@@ -240,7 +244,8 @@ impl TableProvider for UkielTableProvider {
             ParquetSource::new(self.physical_schema.clone())
                 .with_predicate(pushdown)
                 .with_pushdown_filters(true)
-                .with_reorder_filters(true),
+                .with_reorder_filters(true)
+                .with_parquet_file_reader_factory(self.reader_factory.clone()),
         );
         // One group per file: each file is internally sorted, but files may
         // overlap in key ranges — concatenating them into one group would
