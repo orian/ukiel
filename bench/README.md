@@ -12,12 +12,14 @@ components the e2e suite proves correct.
 
 - **Manual-only** — never runs in CI (it moves tens of GB and runs for minutes
   to hours).
-- **Build profile.** `--release` resolves to a tuned profile (fat LTO +
-  `codegen-units = 1`, root `Cargo.toml`) — cross-crate inlining across the
-  whole graph (datafusion/arrow/parquet included), at the cost of much slower
-  compiles. For the absolute fastest numbers also pass architecture-specific
-  SIMD: `RUSTFLAGS="-C target-cpu=native" cargo run --release …` (non-portable,
-  so opt-in rather than baked in). **State the profile with any numbers you
+- **Build profile.** `--release` resolves to a tuned profile (ThinLTO, root
+  `Cargo.toml`) — cross-crate inlining across the whole graph
+  (datafusion/arrow/parquet included) while keeping the compile *parallel*
+  (ThinLTO's optimization and per-crate codegen both multithread; fat LTO +
+  `codegen-units = 1` would serialize the datafusion link). For the absolute
+  fastest numbers also pass architecture-specific SIMD:
+  `RUSTFLAGS="-C target-cpu=native" cargo run --release …` (non-portable, so
+  opt-in rather than baked in). **State the profile with any numbers you
   record.**
 - Datasets and results are **gitignored** (`bench/datasets/`, `bench/results/`).
 - This README is the single source of truth for the runbook and the recorded
@@ -208,11 +210,11 @@ subsequent bench runs reuse it.
 Warm medians (one warm-up, then median of N). Micro-tier medians live in
 `docs/notes/2026-07-06-parquet-read-performance.md`.
 
-> **Profile note.** The tables below were measured under the *default* release
-> profile (LTO off, `codegen-units = 16`), before the tuned `[profile.release]`
-> (fat LTO + one codegen unit) landed. Re-runs under the tuned profile — more so
-> with `-C target-cpu=native` — will be faster across the board; re-capture and
-> label the profile when you next run.
+> **Profile note.** Each result block below states the build profile it was
+> measured under. The **default** profile is stock `--release` (LTO off,
+> `codegen-units = 16`); the **tuned** profile is the ThinLTO
+> `[profile.release]` in the root `Cargo.toml`, optionally with
+> `-C target-cpu=native`. Always label the profile with new numbers.
 
 ### Smoke tier (1 file each) — SHA `f565c46`, 2026-07-09
 
@@ -312,6 +314,55 @@ self-throttles — exactly the plan-18 design. The transient plan-28 caps
 resolved as the ladder climbed, and the terminal invariant still landed
 (one run). This is the run-shape the P2 collector gauges (row 21) now make
 visible in production.
+
+### 10 GB tier — tuned profile (ThinLTO + `-C target-cpu=native`), 2026-07-09
+
+Same machine and same workload as the default-profile block above, rerun on a
+clean stack under the tuned build (see **Build profile**). Identical census
+(heavy = 3922 / 8.53M rows, median = 150550 / 123 rows, light = 240030 / 1,003
+rows; fan-out 67 / 108 / 82), so the two blocks are directly comparable.
+
+hits read, warm median ms — **default → tuned**:
+
+| scenario | heavy | median | light |
+|---|---|---|---|
+| `count` | 39.5 → 40.4 | 51.7 → 48.5 | 42.4 → 42.3 |
+| `adv_filter` | 52.5 → 51.2 | 53.3 → 60.7 | 46.2 → 47.5 |
+| `distinct_users` | 78.3 → 67.5 | 54.0 → 52.7 | 46.0 → 45.7 |
+| `top_urls` | 363.3 → 366.2 | 56.6 → 52.4 | 51.0 → 50.8 |
+| `search_phrases` | 208.9 → 182.9 | 55.1 → 54.5 | 48.6 → 50.3 |
+| `ts_window` | 2.7 → 2.5 | 3.1 → 2.3 | 2.7 → 2.6 |
+| `minutely` | 4.1 → 3.7 | 4.1 → 3.9 | 4.7 → 3.8 |
+
+Bluesky write path, `bluesky run --files 10` — **default → tuned**:
+
+| Metric | default | tuned |
+|---|---|---|
+| produce rate | 220.6k rows/s | 220.9k rows/s |
+| ingest catch-up | 91.9 s (~109k rows/s) | **81.0 s (~123k rows/s)** |
+| stored rows | 9,999,994 ✓ | 9,999,994 ✓ |
+| compaction / finalization | 0.05 s / 7.7 s | 0.05 s / 7.5 s |
+| final layout | 1 part L2, 549 MB | 1 part L2, 576 MB |
+| deferrals / capped merges | 67 / 6 | 60 / 6 |
+| per-tenant reads (count / by_collection / ts_window) | ~15 / ~16–18 / ~19–20 ms | ~13 / ~15–17 / ~18–21 ms |
+
+Comparison readings:
+
+- **Ingest is the clear winner: catch-up ~12% faster** (91.9 → 81.0 s, 109k →
+  123k rows/s). The ingest hot path — JSON decode, per-batch lexsort, Parquet
+  encode — is CPU-bound, so cross-crate inlining + native SIMD land directly.
+- **Read path is largely flat** — DataFusion is already heavily optimized and
+  the numbers sit in run-to-run noise, with small heavy-tenant wins where the
+  scan does the most CPU work (`distinct_users` 78 → 68 ms, `search_phrases`
+  209 → 183 ms). `ts_window`/`minutely` stay 2–4 ms (stats-pruning, not CPU).
+- **Producer and finalization unchanged** — the producer is Kafka-bound and
+  finalization is object-store-I/O-bound, neither CPU-limited.
+- Guardrails engaged the same way (deferrals ~60–67, caps 6); exactly-once held
+  (stored == mapped, offsets == produced). The final-layout byte difference
+  (549 vs 576 MB) is merge row-group/ordering variance, not a row-count change.
+
+Net: the tuned profile pays off most on the **write/ingest CPU path**; the read
+path is I/O- and DataFusion-bound and barely moves.
 
 ### 100M / 1B tiers — optional / stretch
 
