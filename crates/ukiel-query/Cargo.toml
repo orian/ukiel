@@ -8,6 +8,7 @@ ukiel-core = { workspace = true }
 ukiel-catalog = { workspace = true }
 ukiel-expr = { workspace = true }
 datafusion = { workspace = true }
+lru = { workspace = true }
 object_store = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
