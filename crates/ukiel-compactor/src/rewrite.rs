@@ -8,15 +8,19 @@ use arrow::array::{Array, Int64Array, RecordBatch};
 use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
-use ukiel_core::{Part, Placement, TableColumns};
+use parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObjectWriter};
+use ukiel_core::stats::Int64StatsAccumulator;
+use ukiel_core::{Part, Placement, TableColumns, WriteOpts};
 
 use crate::CompactorError;
+use futures::Stream;
 
 /// Batch size for merge input streams: small enough that K streams stay cheap,
 /// large enough to amortize decode (K × `MERGE_BATCH_ROWS` rows resident).
@@ -254,6 +258,219 @@ pub fn batch_to_parquet_key_aligned(
     Ok(bytes)
 }
 
+/// Callback fired before an output file's first byte — the caller registers
+/// upload intent here (plan-9 flow, now per file).
+pub type OnOpen = Box<dyn FnMut(String) -> BoxFuture<'static, Result<(), CompactorError>> + Send>;
+/// Generates the next output file's object-store path.
+pub type NextPath = Box<dyn FnMut() -> String + Send>;
+
+/// One written output file's catalog metadata.
+#[derive(Debug)]
+pub struct ChunkOutput {
+    pub path: String,
+    pub key_min: i64,
+    pub key_max: i64,
+    pub row_count: i64,
+    pub size_bytes: i64,
+    pub column_stats: Option<serde_json::Value>,
+}
+
+/// One open output file being streamed to the object store.
+struct OpenFile {
+    writer: AsyncArrowWriter<ParquetObjectWriter>,
+    path: String,
+    key_min: i64,
+    key_max: i64,
+    current_key: i64,
+    rows: i64,
+    stats: Int64StatsAccumulator,
+    /// A `SizeTargeted` whale continuation: a single-key dedicated file that
+    /// must not absorb a following different key.
+    dedicated: bool,
+}
+
+impl OpenFile {
+    async fn write_slice(&mut self, key: i64, slice: &RecordBatch) -> Result<(), CompactorError> {
+        self.writer.write(slice).await?;
+        self.key_max = self.key_max.max(key);
+        self.current_key = key;
+        self.rows += slice.num_rows() as i64;
+        self.stats.update(slice);
+        Ok(())
+    }
+
+    /// Encoded bytes so far (flushed row groups + buffered) — actual size, not
+    /// the retired `bytes_per_row` estimate.
+    fn encoded_size(&self) -> usize {
+        self.writer.bytes_written() + self.writer.in_progress_size()
+    }
+
+    async fn close(self, store: &Arc<dyn ObjectStore>) -> Result<ChunkOutput, CompactorError> {
+        let OpenFile {
+            writer,
+            path,
+            key_min,
+            key_max,
+            rows,
+            stats,
+            ..
+        } = self;
+        writer.close().await?;
+        let size_bytes = store.head(&Path::from(path.clone())).await?.size as i64;
+        Ok(ChunkOutput {
+            path,
+            key_min,
+            key_max,
+            row_count: rows,
+            size_bytes,
+            column_stats: stats.finish(),
+        })
+    }
+}
+
+/// Consumes a sorted batch stream and writes placement-shaped output files via
+/// multipart uploads, cutting on the writer's **actual encoded size** (not the
+/// old `bytes_per_row` estimate). `SizeTargeted` shares small keys and
+/// **whale-splits** a single key whose run exceeds the target into ts-sliced
+/// dedicated files (`key_min == key_max`), which plan-12 ts stats then prune
+/// and `delete_key` drops metadata-only. Every file uses plan-14
+/// `writer_props` and the key-aligned row-group flush rule.
+pub struct StreamingChunkWriter {
+    store: Arc<dyn ObjectStore>,
+    schema: SchemaRef,
+    opts: WriteOpts,
+    placement: Placement,
+    packing_key: String,
+    sort_key: Vec<String>,
+    next_path: NextPath,
+    on_open: OnOpen,
+    /// The `current_key` of the last file closed — a same-key continuation is a
+    /// whale slice (opened `dedicated`).
+    last_closed_key: Option<i64>,
+}
+
+impl StreamingChunkWriter {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        store: Arc<dyn ObjectStore>,
+        schema: SchemaRef,
+        opts: WriteOpts,
+        placement: Placement,
+        packing_key: String,
+        sort_key: Vec<String>,
+        next_path: NextPath,
+        on_open: OnOpen,
+    ) -> Self {
+        Self {
+            store,
+            schema,
+            opts,
+            placement,
+            packing_key,
+            sort_key,
+            next_path,
+            on_open,
+            last_closed_key: None,
+        }
+    }
+
+    async fn open_file(&mut self, key: i64, dedicated: bool) -> Result<OpenFile, CompactorError> {
+        let path = (self.next_path)();
+        (self.on_open)(path.clone()).await?;
+        let props = ukiel_core::writer_props(&self.schema, &self.sort_key, &self.opts);
+        let obj = ParquetObjectWriter::new(self.store.clone(), Path::from(path.clone()));
+        let writer = AsyncArrowWriter::try_new(obj, self.schema.clone(), Some(props))?;
+        Ok(OpenFile {
+            writer,
+            path,
+            key_min: key,
+            key_max: key,
+            current_key: key,
+            rows: 0,
+            stats: Int64StatsAccumulator::default(),
+            dedicated,
+        })
+    }
+
+    pub async fn write(
+        mut self,
+        stream: impl Stream<Item = Result<RecordBatch, CompactorError>>,
+    ) -> Result<Vec<ChunkOutput>, CompactorError> {
+        futures::pin_mut!(stream);
+        let mut outputs = Vec::new();
+        let mut open: Option<OpenFile> = None;
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            for (k, run) in split_by_key(&batch, &self.packing_key)? {
+                self.consume_key_run(&mut open, &mut outputs, k, run)
+                    .await?;
+            }
+        }
+        if let Some(f) = open.take() {
+            outputs.push(f.close(&self.store).await?);
+        }
+        Ok(outputs)
+    }
+
+    async fn consume_key_run(
+        &mut self,
+        open: &mut Option<OpenFile>,
+        outputs: &mut Vec<ChunkOutput>,
+        k: i64,
+        run: RecordBatch,
+    ) -> Result<(), CompactorError> {
+        // Cut before a new key when placement demands it.
+        if let Some(f) = open.as_ref() {
+            let cut = match &self.placement {
+                Placement::Packed => false,
+                Placement::Separated => f.current_key != k,
+                // Cut at the key boundary when the file is full, or when it is a
+                // dedicated whale file (which must not absorb a different key).
+                Placement::SizeTargeted(n) => {
+                    f.current_key != k && (f.encoded_size() >= *n as usize || f.dedicated)
+                }
+            };
+            if cut {
+                let f = open.take().unwrap();
+                self.last_closed_key = Some(f.current_key);
+                outputs.push(f.close(&self.store).await?);
+            }
+        }
+
+        let cap = self.opts.max_row_group_rows.max(1);
+        let run_rows = run.num_rows();
+        let mut start = 0;
+        while start < run_rows {
+            if open.is_none() {
+                let dedicated = self.last_closed_key == Some(k);
+                *open = Some(self.open_file(k, dedicated).await?);
+            }
+            let f = open.as_mut().unwrap();
+            // Key-aligned row groups: end the current group before this run
+            // would overflow the cap (plan-14 rule, streaming form).
+            if f.writer.in_progress_rows() > 0
+                && f.writer.in_progress_rows() + (run_rows - start) > cap
+            {
+                f.writer.flush().await?;
+            }
+            let take = (run_rows - start).min(cap);
+            f.write_slice(k, &run.slice(start, take)).await?;
+            start += take;
+
+            // SizeTargeted: cut once the file reaches the target (small keys
+            // share until here; a whale key cuts mid-run into dedicated slices).
+            if let Placement::SizeTargeted(n) = &self.placement
+                && f.encoded_size() >= *n as usize
+            {
+                let f = open.take().unwrap();
+                self.last_closed_key = Some(f.current_key);
+                outputs.push(f.close(&self.store).await?);
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn int64_column<'a>(
     batch: &'a RecordBatch,
     name: &str,
@@ -272,10 +489,272 @@ pub(crate) fn int64_column<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
     use object_store::memory::InMemory;
     use serde_json::json;
     use ukiel_core::{CommitId, HypertableId, PartId, PartMeta, arrow_schema_from_json};
     use ukiel_ingest::rows_to_parquet;
+
+    // --- StreamingChunkWriter (Task 4) test helpers -------------------------
+
+    fn kv_schema() -> SchemaRef {
+        use arrow::datatypes::{DataType, Field, Schema};
+        Arc::new(Schema::new(vec![
+            Field::new("tenant_id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, true),
+        ]))
+    }
+
+    /// A key-sorted batch: `key` repeated `n` times with ts = 0..n.
+    fn kv_run(key: i64, n: usize) -> RecordBatch {
+        RecordBatch::try_new(
+            kv_schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![key; n])),
+                Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn one_stream(
+        batches: Vec<RecordBatch>,
+    ) -> impl Stream<Item = Result<RecordBatch, CompactorError>> {
+        futures::stream::iter(batches.into_iter().map(Ok))
+    }
+
+    /// Builds a writer that records `on_open` paths (asserting the file does not
+    /// yet exist) and generates sequential paths.
+    fn writer_over(
+        store: &Arc<dyn ObjectStore>,
+        placement: Placement,
+        opts: WriteOpts,
+        opened: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> StreamingChunkWriter {
+        let mut counter = 0;
+        let next_path: NextPath = Box::new(move || {
+            counter += 1;
+            format!("out/{counter}.parquet")
+        });
+        let store_c = store.clone();
+        let on_open: OnOpen = Box::new(move |path| {
+            let opened = opened.clone();
+            let store = store_c.clone();
+            async move {
+                assert!(
+                    store.head(&Path::from(path.clone())).await.is_err(),
+                    "on_open must fire before the file exists"
+                );
+                opened.lock().unwrap().push(path);
+                Ok(())
+            }
+            .boxed()
+        });
+        StreamingChunkWriter::new(
+            store.clone(),
+            kv_schema(),
+            opts,
+            placement,
+            "tenant_id".to_string(),
+            vec!["tenant_id".to_string(), "ts".to_string()],
+            next_path,
+            on_open,
+        )
+    }
+
+    #[tokio::test]
+    async fn separated_writes_one_file_per_key() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let opened = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let w = writer_over(
+            &store,
+            Placement::Separated,
+            WriteOpts::for_level(1),
+            opened.clone(),
+        );
+        // A key spanning two batches must still land in ONE file.
+        let out = w
+            .write(one_stream(vec![kv_run(1, 3), kv_run(1, 2), kv_run(2, 4)]))
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 2, "one file per key");
+        assert_eq!((out[0].key_min, out[0].key_max), (1, 1));
+        assert_eq!(out[0].row_count, 5);
+        assert_eq!((out[1].key_min, out[1].key_max), (2, 2));
+        assert_eq!(opened.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn packed_writes_one_file_with_key_aligned_groups() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let opened = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut opts = WriteOpts::for_level(1);
+        opts.max_row_group_rows = 4;
+        opts.ts_column = Some("ts".to_string());
+        let w = writer_over(&store, Placement::Packed, opts, opened.clone());
+        let out = w
+            .write(one_stream(vec![kv_run(1, 3), kv_run(2, 3), kv_run(3, 6)]))
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1, "packed: one file");
+        assert_eq!(out[0].row_count, 12);
+        assert_eq!((out[0].key_min, out[0].key_max), (1, 3));
+
+        let bytes = store
+            .get(&Path::from(out[0].path.clone()))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let md = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .unwrap()
+            .metadata()
+            .clone();
+        let rg0 = md.row_group(0);
+        assert!(matches!(
+            rg0.column(0).compression(),
+            parquet::basic::Compression::ZSTD(_)
+        ));
+        assert!(rg0.sorting_columns().unwrap().iter().all(|c| c.nulls_first));
+        // Row groups end on key boundaries (no group interleaves keys).
+        for rg in md.row_groups() {
+            if let parquet::file::statistics::Statistics::Int64(v) =
+                rg.column(0).statistics().unwrap()
+            {
+                assert_eq!(v.min_opt(), v.max_opt(), "row group spans one key");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn size_targeted_whale_splits_big_key_into_dedicated_slices() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        // Distinct payloads so encoded size grows ~with rows (limits compression).
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("tenant_id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, true),
+            Field::new("payload", DataType::Utf8, true),
+        ]));
+        let run = |key: i64, n: usize| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(vec![key; n])),
+                    Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+                    Arc::new(StringArray::from(
+                        (0..n)
+                            .map(|i| format!("{key}-{i}-payload-{}", i * 7 + 3))
+                            .collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap()
+        };
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let sk = vec!["tenant_id".to_string(), "ts".to_string()];
+        let mut opts = WriteOpts::for_level(1);
+        opts.max_row_group_rows = 128;
+        let whale = run(3, 3000);
+        let whale_bytes = batch_to_parquet_opts(&whale, &sk, &opts).unwrap().len();
+        let target = (whale_bytes / 6).max(1) as i64;
+
+        let mut counter = 0;
+        let next_path: NextPath = Box::new(move || {
+            counter += 1;
+            format!("w/{counter}.parquet")
+        });
+        let on_open: OnOpen =
+            Box::new(|_p: String| async move { Ok::<(), CompactorError>(()) }.boxed());
+        let w = StreamingChunkWriter::new(
+            store.clone(),
+            schema.clone(),
+            opts,
+            Placement::SizeTargeted(target),
+            "tenant_id".to_string(),
+            sk.clone(),
+            next_path,
+            on_open,
+        );
+        let out = w
+            .write(one_stream(vec![
+                run(1, 200),
+                run(2, 200),
+                whale,
+                run(4, 200),
+            ]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out.iter().map(|c| c.row_count).sum::<i64>(),
+            200 + 200 + 3000 + 200
+        );
+
+        let whale_slices: Vec<_> = out
+            .iter()
+            .filter(|c| c.key_min == 3 && c.key_max == 3)
+            .collect();
+        assert!(
+            whale_slices.len() >= 2,
+            "whale split into ≥2 dedicated slices: {out:?}"
+        );
+        // Dedicated slices tile key 3's ts range without overlap.
+        let mut ranges: Vec<(i64, i64)> = whale_slices
+            .iter()
+            .map(|c| {
+                let s = c.column_stats.as_ref().unwrap();
+                (
+                    s["ts"]["min"].as_i64().unwrap(),
+                    s["ts"]["max"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        ranges.sort();
+        assert!(
+            ranges.windows(2).all(|w| w[0].1 < w[1].0),
+            "slices tile ts without overlap: {ranges:?}"
+        );
+        // Key 4 lands in its own file, never mixed into a key-3 slice.
+        let k4 = out.iter().find(|c| c.key_max == 4).unwrap();
+        assert_eq!((k4.key_min, k4.key_max), (4, 4));
+    }
+
+    #[tokio::test]
+    async fn mid_stream_error_propagates_leaving_completed_files() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let opened = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let w = writer_over(
+            &store,
+            Placement::Separated,
+            WriteOpts::for_level(1),
+            opened.clone(),
+        );
+        // Separated closes file 1 at the key-2 boundary, before the error hits.
+        let stream = futures::stream::iter(vec![
+            Ok(kv_run(1, 40)),
+            Ok(kv_run(2, 40)),
+            Err(CompactorError::MissingColumn("boom".into())),
+        ]);
+        let err = w.write(stream).await;
+        assert!(
+            matches!(err, Err(CompactorError::MissingColumn(_))),
+            "error propagates"
+        );
+        let paths = opened.lock().unwrap().clone();
+        assert_eq!(
+            paths.len(),
+            2,
+            "two files opened via on_open before the error"
+        );
+        assert!(
+            store.head(&Path::from(paths[0].clone())).await.is_ok(),
+            "the completed file survives as an intent-covered object"
+        );
+    }
 
     #[test]
     fn key_aligned_row_groups_end_on_key_boundaries() {
