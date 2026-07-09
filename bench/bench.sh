@@ -37,8 +37,12 @@ esac; done
 
 [ "$NATIVE" = 1 ] && export RUSTFLAGS="-C target-cpu=native"
 BIN=(cargo run --release -j "$(nproc)" -p ukiel-e2e --bin bench --)
-HITS_PRESENT=$(ls bench/datasets/hits/*.parquet 2>/dev/null | wc -l)
-BSKY_PRESENT=$(ls bench/datasets/bluesky/*.json.gz 2>/dev/null | wc -l)
+# Count datasets glob-safely (a non-matching glob under `set -o pipefail`
+# would otherwise fail `ls` and kill the script).
+shopt -s nullglob
+_hits=(bench/datasets/hits/*.parquet); HITS_PRESENT=${#_hits[@]}
+_bsky=(bench/datasets/bluesky/*.json.gz); BSKY_PRESENT=${#_bsky[@]}
+shopt -u nullglob
 
 echo ">> building bench (release${RUSTFLAGS:+, $RUSTFLAGS})"
 cargo build --release -j "$(nproc)" -p ukiel-e2e --bin bench

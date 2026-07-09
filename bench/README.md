@@ -405,6 +405,41 @@ Comparison readings:
 Net: the tuned profile pays off most on the **write/ingest CPU path**; the read
 path is I/O- and DataFusion-bound and barely moves.
 
+### 10 GB tier — plan 13 (Parquet metadata cache), 2026-07-09
+
+Same machine, tuned profile, identical fixture (census heavy = 3922 / 8.53M
+rows, median = 150550 / 123 rows, light = 240030 / 1,003 rows; fan-out
+67 / 108 / 82 — identical to the `tuned` block, so the cache is the only
+variable). hits read, warm median ms — **tuned (no cache) → cache13**:
+
+| scenario | heavy | median | light |
+|---|---|---|---|
+| `count` | 40.4 → 24.1 (−40%) | 48.5 → 32.1 (−34%) | 42.3 → 27.1 (−36%) |
+| `adv_filter` | 51.2 → 36.0 (−30%) | 60.7 → 37.4 (−38%) | 47.5 → 29.8 (−37%) |
+| `distinct_users` | 67.5 → 52.9 (−21%) | 52.7 → 35.6 (−33%) | 45.7 → 27.8 (−39%) |
+| `top_urls` | 366.2 → 366.8 (+0%) | 52.4 → 38.0 (−27%) | 50.8 → 31.8 (−37%) |
+| `search_phrases` | 182.9 → 181.4 (−1%) | 54.5 → 43.1 (−21%) | 50.3 → 32.6 (−35%) |
+| `ts_window` | 2.5 → 2.7 | 2.3 → 2.8 | 2.6 → 2.5 |
+| `minutely` | 3.7 → 3.8 | 3.9 → 4.4 | 3.8 → 3.9 |
+
+Reading — **the metadata cache does exactly what plan 13 predicted**:
+
+- **The per-tenant fan-out floor collapses ~30–40%.** Every query paid
+  67–108 footer reads (2 object-store roundtrips each) before touching data;
+  caching those parsed footers process-wide removes that fixed cost. `count`,
+  the filters, and the small/median-tenant aggregations — all dominated by the
+  floor — drop a third or more.
+- **Scan-bound queries are correctly unaffected.** The two heavy-tenant string
+  aggregations (`top_urls` 367 ms, `search_phrases` 181 ms over 8.5M rows) are
+  dominated by actual scan work, not footer reads, so they stay flat (within
+  noise) — the cache never touches the scan path.
+- **Already-pruned queries stay near-zero.** `ts_window`/`minutely` were 2–4 ms
+  via plan-12 stats pruning (no fan-out to pay), so there was nothing to save;
+  the ±0.5 ms wiggle is run-to-run noise.
+
+Reproduce: `bench/bench.sh cache13 tuned --skip-bluesky` (loads hits, runs the
+suite under `cache13`, prints the `tuned → cache13` delta).
+
 ### 100M / 1B tiers — optional / stretch
 
 100M Bluesky is a documented long run; 1B needs `--wave-files` and hours.
