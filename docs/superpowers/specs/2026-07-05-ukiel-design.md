@@ -201,7 +201,7 @@ capability:
   harness with committed baselines (plan 11); macro perf harness (plan 30) —
   the `bench` binary running ClickBench `hits` reads and a Bluesky ndjson
   write-path that asserts exactly-once at volume (runbook + baselines:
-  `docs/notes/2026-07-08-macro-perf.md`).
+  `bench/README.md`).
 
 **Not yet** (roadmap rows; recommended order 27 → 14 → 29 → 13 →
 15 → 16 → 8, then 22 → 23 → 24; 25/26 gated on design decisions):
