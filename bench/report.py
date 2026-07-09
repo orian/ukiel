@@ -82,7 +82,6 @@ def compare_bsky(base, cand):
         ("finalization_secs", "finalization s"),
         ("stored_rows", "stored rows"),
         ("backpressure_deferrals", "deferrals"),
-        ("capped_merges", "capped merges"),
     ]
     print(f"{'metric':<22}{'baseline':>16}{'candidate':>16}{'Δ':>10}")
     for key, name in metrics:
@@ -195,7 +194,7 @@ function tableFor(name, run){
   } else {
     const m=[['produce_rows_per_s','produce rows/s'],['ingest_catchup_secs','ingest catch-up s'],
       ['compaction_secs','compaction s'],['finalization_secs','finalization s'],['stored_rows','stored'],
-      ['mapped','mapped'],['poison','poison'],['backpressure_deferrals','deferrals'],['capped_merges','capped']];
+      ['mapped','mapped'],['poison','poison'],['backpressure_deferrals','deferrals']];
     const tbl=el('table');
     m.forEach(([k,n])=>{if(run[k]==null)return;const r=el('tr');r.append(el('td',{},n));
       r.append(el('td',{},typeof run[k]=='number'&&!Number.isInteger(run[k])?run[k].toFixed(1):run[k]));tbl.append(r);});
@@ -230,7 +229,7 @@ function deltaTable(base,cand){
   } else {
     const m=[['produce_rows_per_s','produce rows/s'],['ingest_catchup_secs','ingest catch-up s'],
       ['compaction_secs','compaction s'],['finalization_secs','finalization s'],
-      ['backpressure_deferrals','deferrals'],['capped_merges','capped']];
+      ['backpressure_deferrals','deferrals']];
     const tbl=el('table');const hr=el('tr');['metric','baseline','candidate','Δ'].forEach(h=>hr.append(el('th',{},h)));tbl.append(hr);
     m.forEach(([k,n])=>{if(b[k]==null||c[k]==null)return;const p=pct(b[k],c[k]);const r=el('tr');
       r.append(el('td',{},n));r.append(el('td',{},b[k].toFixed?b[k].toFixed(1):b[k]));

@@ -38,23 +38,29 @@ metadata-only (`delete_key` already branches on part shape).
 
 ## Read amplification
 
-Files within a run are key-disjoint, so a point query for key k touches at
-most one file per run (catalog range pruning) — plus every live L0 file,
-which no key pruning can skip. Hot partition: <= l0_fanout unpruned L0
-files + fanout x log_fanout(N) pruned files. Cold partition: exactly one
-file chain (<= 1 file for small keys). The sparse-range false positives that remain are
-plan 16's target (roaring key bitmaps).
+Files within a run are pairwise disjoint on *(key, ts-slice)*, so a point
+query for key k touches at most one file per run for small keys (catalog
+range pruning) — plus every live L0 file, which no key pruning can skip. A
+**whale key** split across several dedicated slices (plan 29) is the one
+refinement of the run invariant: k's slices tile its ts range without
+overlap, so a query for k may touch several files *per run*, but only those
+whose ts range matches (plan-12 ts stats prune the rest) — the disjointness
+that keeps pruning exact is now on (key, ts-slice), not key alone. Hot
+partition: <= l0_fanout unpruned L0 files + fanout x log_fanout(N) pruned
+files. Cold partition: exactly one file chain (<= 1 file for small keys; a
+tiled slice set for a whale). The sparse-range false positives that remain
+are plan 16's target (roaring key bitmaps).
 
 ## Non-goals / deferred
 
-- Whole-partition merges stream through RAM (same as v1 packed merges);
-  streaming merge is deferred. Issue 0005: finalization makes this the
-  compactor's peak-memory event — interim merge-input size cap shipped
-  (plan 28); the real fix is designed as roadmap row 29
-  (`docs/notes/2026-07-08-streaming-merge.md`: k-way merge over sorted
-  inputs, whale-key splitting, slice sealing).
+- ~~Whole-partition merges stream through RAM~~ **Done (plan 29).** Merges
+  now stream — k-way merge over sorted inputs in O(K·batch + row-group) RAM,
+  whale-key splitting into ts-sliced dedicated files — so finalization is no
+  longer the compactor's peak-memory event and the plan-28 cap is retired
+  (issue 0005 Resolved; `docs/notes/2026-07-08-streaming-merge.md`).
 - Split points are recomputed per merge (no remembered boundaries); stable
-  cut keys would tighten pre-finalization overlap and are deferred —
-  concretized as row 29's slice sealing.
+  cut keys would tighten pre-finalization overlap and let sealed whale
+  history skip rewrites — deferred to roadmap row 31 (streaming-merge phase 2,
+  slice sealing).
 - Retention-aware compaction and L2+ scheduling niceties ride the same
   machinery later.

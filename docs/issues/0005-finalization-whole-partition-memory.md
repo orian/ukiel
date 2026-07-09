@@ -1,7 +1,7 @@
 # 0005 — Whole-partition merges are in-memory; finalization makes them the peak-memory event
 
 - **Severity:** Medium (scaling ceiling, not a correctness bug — degrades to OOM crash loop under partition growth)
-- **Status:** Interim cap shipped (plan 28) — `max_merge_input_bytes` skips oversized merges (warn + `compactor_capped_merges_total`) instead of OOM-crash-looping. Real fix designed: streaming merge + whale-key splitting + slice sealing (`docs/notes/2026-07-08-streaming-merge.md`, roadmap row 29, after 27/14) — the cap must not be the steady state at PB+ scale
+- **Status:** **Resolved (plan 29, 2026-07-09).** `Compactor::merge_parts` now streams — `part_streams` → k-way `merge_streams` → `StreamingChunkWriter` — with O(K·batch + row-group) RAM instead of O(decoded partition); whale keys split into ts-sliced dedicated files. The plan-28 interim cap (`max_merge_input_bytes`, `merge_capped`, `compactor_capped_merges_total`) is retired: there is no longer a partition too big to finalize. Phase 2 (slice sealing, write-amp O(1) per byte) is scoped to roadmap row 31
 - **Components:** `crates/ukiel-compactor`
 - **Found by:** post-landing review of plans 17/18, 2026-07-08 (`docs/notes/2026-07-08-plan17-18-review.md`)
 
@@ -38,17 +38,19 @@ too, since a single level's runs can also grow arbitrarily large. The
 `size_bytes` stats needed are already on `PartMeta` (the same numbers drive
 `plan_chunks`' `bytes_per_row` estimate).
 
-**Real fix (roadmap row 29, designed 2026-07-08):**
+**Real fix (roadmap row 29, executed 2026-07-09):**
 `docs/notes/2026-07-08-streaming-merge.md`. The cap must not be the steady
 state: at target scale (PB+, 100–500 GB partitions and keys common), capped
 partitions would be the norm and the terminal invariant would stop holding
-exactly where read amp hurts most. The design: k-way streaming merge over
+exactly where read amp hurts most. Shipped: k-way streaming merge over
 already-sorted inputs (O(K·batch + row-group) RAM; plan 27 is the ordering
-trust anchor), incremental chunk cutting on actual encoded size, whale-key
+trust anchor, guarded by a loud drift check that never falls back to
+sorting), incremental chunk cutting on actual encoded size, whale-key
 splitting into ts-sliced dedicated files (a 500 GB key must not be one
-file), and phase-2 slice sealing so sealed whale history is never rewritten
-(write amp O(1) per byte). After plans 27 and 14; retires or repurposes the
-cap.
+file), and per-file multipart streaming uploads with per-file upload-intent
+registration. The cap is retired outright (not repurposed). Phase 2 slice
+sealing — so sealed whale history is never rewritten (write amp O(1) per
+byte) — is roadmap row 31.
 
 ## Notes
 

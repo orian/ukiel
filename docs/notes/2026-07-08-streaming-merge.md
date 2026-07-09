@@ -1,5 +1,12 @@
 # Streaming merge — bounded-memory compaction at PB+ scale
 
+> **Status (2026-07-09):** Phase 1 (§§1–4) **executed as plan 29** —
+> `part_streams` + `merge_streams` + `StreamingChunkWriter` ship in
+> `ukiel-compactor`; the plan-28 cap is retired; issue 0005 is Resolved.
+> Phase 2 (§5 slice sealing) is deliberately **split to roadmap row 31**:
+> its catalog-model question (`sealed` flag vs metadata carry) deserves its
+> own just-in-time plan. The rest of this note is the as-shipped design.
+
 Issue 0005's real fix. The plan-28 `max_merge_input_bytes` cap keeps the
 compactor alive, but at target scale (PB+ lakes, 100–500 GB partitions and
 single keys being *common*, not outliers) it inverts into a policy failure:

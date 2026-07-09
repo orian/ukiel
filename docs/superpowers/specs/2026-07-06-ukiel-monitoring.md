@@ -73,7 +73,6 @@ alert traces back to an invariant or an SLO.
 |---|---|---|
 | `compactor_merges_total` / `compactor_parts_in_total` / `parts_out_total` | counter | throughput and effectiveness (in/out ratio) |
 | `compactor_conflicts_total` | counter | losing every race = starvation with a healthy-looking loop |
-| `compactor_capped_merges_total` | counter (call-site) | merges skipped because inputs exceed `max_merge_input_bytes` (issue 0005 interim cap, plan 28) — the visibility signal that a partition is stuck multi-run because it's too big to merge in RAM; nonzero means the streaming-merge fix is now load-bearing for that deployment |
 | `compactor_pass_duration_seconds` | histogram | pass time approaching the poll interval = falling behind |
 | `compactor_backlog_groups` | gauge | partitions with a level at/over its merge trigger (`l0_fanout` / `fanout` runs, plan 17) — the direct "is compaction keeping up" signal |
 | `compactor_unfinalized_partitions` / `compactor_oldest_unfinalized_age_seconds` | gauge | partitions past `finalize_after_secs` still holding >1 run — the plan-17 terminal invariant ("cold partition = one run") as a production signal; age growth = finalization starving |

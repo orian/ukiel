@@ -102,7 +102,7 @@ Custom DataFusion `CatalogProvider`/`TableProvider`: resolve tenant's logical ta
 Per-customer data deletion (GDPR) and per-customer retention favor physical separation; the small-file problem at 1M tiny tenants favors packing. Resolution: **placement is a per-hypertable policy, not an architecture choice**, and the catalog supports both shapes natively (a separated file is just a part with `packing_key_min == packing_key_max`).
 
 - **L0 is always packed** — ingest at a 10–20s flush cadence cannot maintain a million open writers. L0 files are short-lived (minutes–hours until compaction).
-- **At rest (L1+), policy per hypertable** — one knob, `hypertables.target_file_bytes` (plan 17; engine default packed): `packed` (NULL) — each merge output is one file, sorted by packing key so each key's rows occupy contiguous row groups; `separated` (0) — compaction splits every packing key into its own files; **size-targeted** (N bytes) — merge outputs are cut at key boundaries into ~N-byte files, so small keys share files and a key bigger than N gets dedicated `min == max` files (never split mid-key). Size-targeted subsumes both extremes (packed = ∞, separated = 0) and is the recommended SaaS setting: heavy tenants separate *organically, in proportion to their size*, and their deletion/retention becomes metadata-only without paying the small-file cost for the long tail.
+- **At rest (L1+), policy per hypertable** — one knob, `hypertables.target_file_bytes` (plan 17; engine default packed): `packed` (NULL) — each merge output is one file, sorted by packing key so each key's rows occupy contiguous row groups; `separated` (0) — compaction splits every packing key into its own files; **size-targeted** (N bytes) — merge outputs are cut on *actual encoded size* (plan 29 retired the pre-encode `bytes_per_row` estimate), so small keys share ~N-byte files and a key bigger than N gets dedicated `min == max` files. A **whale key** whose single run exceeds N splits *mid-key* into several ts-sliced dedicated files (plan 29): consecutive slices tile the key's ts range without overlap, so plan-12 ts stats prune them, retention drops aged slices metadata-only, and `delete_key` drops every `min == max == k` slice — a 500 GB key never becomes one file. Size-targeted subsumes both extremes (packed = ∞, separated = 0) and is the recommended SaaS setting: heavy tenants separate *organically, in proportion to their size*, and their deletion/retention becomes metadata-only without paying the small-file cost for the long tail.
 - **Levels & runs** (plan 17): a *run* = one merge commit's key-disjoint output set (derived from `created_by_commit` — each L0 file is its own run). When a partition holds enough runs at a level they merge into one run a level up (~log_fanout(flushes) depth, emergent). The trigger is **two-tier** because the levels are asymmetric: a low `l0_fanout` (~4) for level 0 — L0 files span all tenants, so no key pruning applies and read amp is linear in their count, while the files are tiny and cheap to merge — and a higher `fanout` (~10) for L1+, where runs are internally key-disjoint (a query touches ≤ 1 file per run) but merges move real bytes (write amp ≈ ladder depth per byte). Same shape as RocksDB's L0-trigger vs level-multiplier split and lazy leveling's tier-young/level-last. A partition with no L0 arrivals for `finalize_after_secs` and >1 run is *finalized* into a single run one level above its max — the "level the last one" half. Terminal invariant: **a cold partition is one run** — all files pairwise key-disjoint. Read amp for one key: ≤ l0_fanout unpruned L0 files + fanout × depth pruned files hot, ~1 file per cold partition. Per-file key coverage *inverts* with depth: it widens only until accumulated bytes cross the size target, then narrows as capped files tile an ever-thinner key slice.
 - **Deletion of key k**: separated files → metadata-only DELETE commit (drop k's files); packed L0/L1 files overlapping k → REPLACE-rewrite without k's rows. Sorted packing makes rewrites cheap: untouched row groups are copied byte-wise, no decode. Worst-case rewrite scope = the hot window, not the lake.
 - **Retention**: policy per logical table (namespace). Separated + time-partitioned data → expiry is metadata-only drops of aged parts. Packed data → retention-aware compaction filters expired rows on every pass, plus a sweep worker that rewrites any file whose expired fraction crosses a threshold.
@@ -116,6 +116,7 @@ Writers upload objects **before** committing, and REPLACE tombstones catalog row
 - **Reaper**: deletes objects of tombstoned parts once safe — after a `tombstone_grace` (protects queries planned just before the REPLACE; see issue 0002 for the `query_timeout < grace` invariant) and only when every registered worker cursor has passed the deleting commit (protects lagging feed consumers, precisely). Purged parts keep their catalog rows (`purged_at`) so the change feed replays forever.
 - **Orphan sweep**: objects whose commit never landed (crashed writers, lost REPLACE races). Discovery is a catalog query via **write-ahead upload intent** (`pending_objects`: writers register a path before uploading; the referencing commit clears it in the same transaction) — zero object-store `LIST` on the hot path. A rare `reconcile` listing pass is the backstop for objects uploaded without registration.
 - Grace periods make both safe against in-flight work; they are time-window guarantees (same trade-off as Iceberg snapshot expiration / Delta VACUUM), not reference counting.
+- **Multipart lifecycle (plan 29 streaming writer)**: a streaming merge emits several output files, each an `AsyncArrowWriter` multipart upload, and registers each path's intent *before its first part* (`on_open`, not once per merge). A crash mid-merge therefore leaves (a) `pending_objects` rows the orphan sweep reaps, and (b) any incomplete S3 multipart uploads — set a bucket **`AbortIncompleteMultipartUpload` lifecycle rule** (e.g. 1–7 days) so the store discards unfinished parts the sweep can't see. The end-of-merge commit is still a single REPLACE over the completed outputs; a lost race replans, unchanged.
 
 ### Pipelines (ingest routing, MVs, egress)
 
@@ -134,7 +135,7 @@ ClickHouse's parts/partition limits exist because parts are *physical residents*
 
 **Guardrails (plan 18, `2026-07-06-ukiel-guardrails.md` — implemented).** ClickHouse *enforces* its limits (delays, then rejects inserts under parts pressure); ukiel v1 trusted compaction to keep up. Plan 18 adds: **ingest backpressure** — the flusher checks the live L0 count of its target partitions and defers flushes past a slowdown threshold (halving flush rate ⇒ fewer, bigger L0 files — exactly the corrective), stopping past a stop threshold with a memory safety valve; safe because Kafka offsets only advance with flushes. Plus the **partition-spread warning** and the **SQL-side finalization candidates** query. The alarms standing in for hard limits live in the monitoring spec: live parts per level, backlog runs, backpressure deferrals, oldest unfinalized partition.
 
-Partition granularity itself is a maintenance knob, not a query commitment (planning prunes by key range + part stats, never partition equality). Day is right for the events workload — finalization latency, merge RAM (merges hold a group in memory until streaming merge lands), retention granularity. The per-partition file floor is answered by **partition coalescing** (future plan): rewrite aged fine partitions into coarse ones on the same REPLACE machinery — the time-axis analog of the plan-17 key-axis ladder. Per the time-agnostic-core invariant, the worker never parses partition values: the hypertable declares a **coarsening mapping** (an expression from fine to coarse partition values — `day → month` being one deployment's choice), and coalescing just applies it, exactly as compaction applies the declared packing key without knowing it means "tenant". Fully dynamic layout (parts as key × time rectangles, no calendar boxes — possible precisely because partitions are tags) is deliberately deferred: it complicates ingest buffering and merge planning for marginal benefit over coalescing.
+Partition granularity itself is a maintenance knob, not a query commitment (planning prunes by key range + part stats, never partition equality). Day is right for the events workload — finalization latency, merge RAM (bounded since plan 29: merges stream in O(K·batch + row-group), no longer holding a group in memory), retention granularity. The per-partition file floor is answered by **partition coalescing** (future plan): rewrite aged fine partitions into coarse ones on the same REPLACE machinery — the time-axis analog of the plan-17 key-axis ladder. Per the time-agnostic-core invariant, the worker never parses partition values: the hypertable declares a **coarsening mapping** (an expression from fine to coarse partition values — `day → month` being one deployment's choice), and coalescing just applies it, exactly as compaction applies the declared packing key without knowing it means "tenant". Fully dynamic layout (parts as key × time rectangles, no calendar boxes — possible precisely because partitions are tags) is deliberately deferred: it complicates ingest buffering and merge planning for marginal benefit over coalescing.
 
 ## Backup & disaster recovery
 
@@ -206,16 +207,16 @@ capability:
 Read/write perf tiers 13 (Parquet metadata cache), 27 (ingest sort-by-declared-
 sort_key), and 14 (Tier-3 file layout: key-aligned row groups, per-level
 compression, delta-ts, opt-in blooms) all executed 2026-07-09 — the 10 GB-tier
-baselines drove their ordering (`bench/README.md` §6).
+baselines drove their ordering (`bench/README.md` §6). **Streaming merge** (29)
+executed 2026-07-09 — bounded-memory compaction (O(K·batch + row-group) RAM)
+with whale-key splitting; the plan-28 cap is retired and issue 0005 is Resolved.
 
-**Not yet** (roadmap rows; recommended order 29 →
-15 → 16 → 8, then 22 → 23 → 24; 25/26 gated on design decisions):
-**streaming merge** (29 — issue 0005's real
-fix; bounded-memory compaction + whale-key splitting, the PB+-scale gate:
-`docs/notes/2026-07-08-streaming-merge.md`), remaining read-side perf tiers
-(15/16), pipelines & MVs (8 — plan written), partition coalescing +
-retention (22), feed horizon (23), egress (24), auth (25), horizontal
-ingest (26).
+**Not yet** (roadmap rows; recommended order 32 →
+15 → 16 → 8, then 31 → 22 → 23 → 24; 25/26 gated on design decisions):
+official benchmark suites (32), remaining read-side perf tiers (15/16),
+pipelines & MVs (8 — plan written), streaming-merge phase 2 / slice sealing
+(31), partition coalescing + retention (22), feed horizon (23), egress (24),
+auth (25), horizontal ingest (26).
 
 Verification philosophy and the scenario catalog (S0–S8, invariants I1–I8)
 live in `docs/superpowers/specs/2026-07-05-ukiel-testing-design.md`; the e2e
@@ -253,17 +254,20 @@ GC hygiene.
   `docs/superpowers/plans/2026-07-06-ukiel-guardrails.md`)*: ingest
   backpressure with memory valve, partition-spread warning, SQL-side
   finalization candidates (see "Limits & guardrails").
+- **Streaming merge & whale-key splitting** — *implemented (plan 29,
+  `docs/notes/2026-07-08-streaming-merge.md`; issue 0005 Resolved)*:
+  `merge_parts` streams (`part_streams` → k-way `merge_streams` →
+  `StreamingChunkWriter`) in O(K·batch + row-group) RAM instead of
+  O(decoded partition); an ordering-drift guard fails loud rather than
+  falling back to sorting; a key whose run exceeds the target splits into
+  ts-sliced dedicated files; outputs stream via multipart uploads with
+  per-file upload-intent. The plan-28 input-size cap is retired. Phase 2
+  (slice sealing, write-amp O(1) per byte) is roadmap row 31.
 - Deferred, designed-for: distributed cache tier, tombstone merge-on-read,
   MV service productization, per-tenant quotas/billing, retention sweep,
   Arrow Flight SQL, catalog DB sharding (schema is shard-ready),
   `alter_hypertable_add_column` API (storage layer already handles additive
-  evolution via schema-adapting rewrites), streaming merges (compaction
-  currently holds a whole merge group in RAM — issue 0005: finalization
-  makes this the peak-memory event; interim input-size cap shipped in
-  plan 28, real fix designed as roadmap row 29 —
-  `docs/notes/2026-07-08-streaming-merge.md`: k-way merge over sorted
-  inputs, whale-key splitting into ts-sliced dedicated files, slice
-  sealing; subsumes the old "stable split points" item), **partition coalescing** (rewrite aged fine partitions into
+  evolution via schema-adapting rewrites), **partition coalescing** (rewrite aged fine partitions into
   coarse ones via a per-hypertable declared coarsening mapping, e.g.
   day → month — the answer to the per-partition file floor; the worker
   applies the mapping, never parses partition values), **change
