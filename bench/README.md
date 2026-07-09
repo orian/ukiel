@@ -12,7 +12,13 @@ components the e2e suite proves correct.
 
 - **Manual-only** — never runs in CI (it moves tens of GB and runs for minutes
   to hours).
-- **Always `--release`.**
+- **Build profile.** `--release` resolves to a tuned profile (fat LTO +
+  `codegen-units = 1`, root `Cargo.toml`) — cross-crate inlining across the
+  whole graph (datafusion/arrow/parquet included), at the cost of much slower
+  compiles. For the absolute fastest numbers also pass architecture-specific
+  SIMD: `RUSTFLAGS="-C target-cpu=native" cargo run --release …` (non-portable,
+  so opt-in rather than baked in). **State the profile with any numbers you
+  record.**
 - Datasets and results are **gitignored** (`bench/datasets/`, `bench/results/`).
 - This README is the single source of truth for the runbook and the recorded
   results. Design rationale and provenance: `docs/notes/2026-07-08-macro-perf.md`.
@@ -166,6 +172,11 @@ make e2e-down                                            # wipe volumes
 Big tiers: `bluesky run --files 100 --wave-files 10` (100M with bounded Kafka
 disk); `--files 1000 --wave-files 10` for the 1B stretch (hours).
 
+Fastest numbers: prefix each `cargo run` with `RUSTFLAGS="-C target-cpu=native"`
+(the tuned LTO profile is already applied by `--release`). The first
+`--release` build after enabling LTO is slow (minutes, datafusion included);
+subsequent bench runs reuse it.
+
 ---
 
 ## 5. Run-semantics caveats
@@ -196,6 +207,12 @@ disk); `--files 1000 --wave-files 10` for the 1B stretch (hours).
 
 Warm medians (one warm-up, then median of N). Micro-tier medians live in
 `docs/notes/2026-07-06-parquet-read-performance.md`.
+
+> **Profile note.** The tables below were measured under the *default* release
+> profile (LTO off, `codegen-units = 16`), before the tuned `[profile.release]`
+> (fat LTO + one codegen unit) landed. Re-runs under the tuned profile — more so
+> with `-C target-cpu=native` — will be faster across the board; re-capture and
+> label the profile when you next run.
 
 ### Smoke tier (1 file each) — SHA `f565c46`, 2026-07-09
 

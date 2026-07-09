@@ -42,3 +42,13 @@ ukiel-compactor = { path = "crates/ukiel-compactor" }
 ukiel-gc = { path = "crates/ukiel-gc" }
 ukiel-expr = { path = "crates/ukiel-expr" }
 ukield = { path = "crates/ukield" }
+
+# Maximally-optimized release build (used by `--release`, incl. the macro
+# perf bench and `ukield`). Fat LTO + one codegen unit give cross-crate
+# inlining across the whole graph (datafusion/arrow/parquet included) at the
+# cost of much slower compiles — the right trade for a performance build.
+# Portable: architecture-specific SIMD is opt-in via `-C target-cpu=native`
+# (see bench/README.md), not baked in here.
+[profile.release]
+lto = "fat"
+codegen-units = 1
