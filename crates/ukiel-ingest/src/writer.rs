@@ -32,7 +32,10 @@ pub fn rows_to_parquet(
 ) -> Result<EncodedPart, IngestError> {
     let batch = decode_rows(schema, packing_key, ts_column, rows)?;
     let batch = ukiel_core::sort_batch(&batch, sort_key)?;
-    finish_batch(batch, packing_key, sort_key)
+    // Plain-schema path (no column specs): the ts column is known, no blooms.
+    let mut opts = ukiel_core::WriteOpts::for_level(0);
+    opts.ts_column = Some(ts_column.to_string());
+    finish_batch(batch, packing_key, sort_key, opts)
 }
 
 /// Column-spec-aware encoding: decode against the physical schema (materialized
@@ -52,7 +55,9 @@ pub fn encode_rows(
     let batch = decode_rows(&physical, packing_key, ts_column, rows)?;
     let batch = ukiel_expr::apply_defaults_and_materialized(batch, cols)?;
     let batch = ukiel_core::sort_batch(&batch, sort_key)?;
-    finish_batch(batch, packing_key, sort_key)
+    // L0 layout derived from the schema: delta-ts, opt-in blooms.
+    let opts = ukiel_core::WriteOpts::from_columns(cols, sort_key, 0);
+    finish_batch(batch, packing_key, sort_key, opts)
 }
 
 /// Validates the packing key + ts are present as i64 (needed for the packing-key
@@ -86,14 +91,16 @@ fn decode_rows(
     decoder.flush()?.ok_or(IngestError::EmptyFlush)
 }
 
-/// Computes the packing-key range from the already-sorted batch and writes ZSTD
-/// Parquet, declaring `sort_key` as the file's sorting columns via the shared
-/// `ukiel_core::sorted_writer_props` — the exact order the batch was sorted by,
-/// so readers can trust the declared ordering.
+/// Computes the packing-key range from the already-sorted batch and writes
+/// Parquet using the shared `ukiel_core::writer_props(opts)` — L0 layout
+/// (LZ4_RAW, delta-packed ts, opt-in blooms, row-group cap) plus the `sort_key`
+/// sorting-column stamps, the exact order the batch was sorted by, so readers
+/// can trust the declared ordering.
 fn finish_batch(
     batch: RecordBatch,
     packing_key: &str,
     sort_key: &[String],
+    opts: ukiel_core::WriteOpts,
 ) -> Result<EncodedPart, IngestError> {
     let key_idx = batch
         .schema()
@@ -114,7 +121,7 @@ fn finish_batch(
     let key_max = arrow::compute::max(keys).ok_or(IngestError::EmptyFlush)?;
     let column_stats = ukiel_core::stats::int64_column_stats(&batch);
 
-    let props = ukiel_core::sorted_writer_props(&batch.schema(), sort_key);
+    let props = ukiel_core::writer_props(&batch.schema(), sort_key, &opts);
     let mut bytes = Vec::new();
     let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), Some(props))?;
     writer.write(&batch)?;
@@ -258,5 +265,50 @@ mod tests {
             &[2.0, 6.0, 10.0],
             "rows are ordered by the computed column, not input order"
         );
+    }
+
+    #[test]
+    fn l0_layout_lz4_delta_ts_optin_bloom_and_stats_survive() {
+        let cols = ukiel_core::TableColumns::parse(&json!({"fields": [
+            {"name": "tenant_id", "type": "int64"},
+            {"name": "ts", "type": "timestamp_ms"},
+            {"name": "url", "type": "utf8", "bloom_filter": true}
+        ]}))
+        .unwrap();
+        let rows: Vec<_> = (0..8i64)
+            .map(|i| json!({"tenant_id": i % 3, "ts": i, "url": format!("u{i}")}))
+            .collect();
+        let sort_key = vec!["tenant_id".to_string(), "ts".to_string()];
+        let part = encode_rows(&cols, "tenant_id", "ts", &sort_key, rows).unwrap();
+        // Plan-12 regression guard: the props swap must not drop column stats.
+        assert!(part.column_stats.is_some(), "column_stats must survive");
+
+        let md = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(part.bytes))
+            .unwrap()
+            .metadata()
+            .clone();
+        let rg = md.row_group(0);
+        for c in rg.columns() {
+            assert!(
+                matches!(c.compression(), parquet::basic::Compression::LZ4_RAW),
+                "L0 must be LZ4_RAW, got {:?}",
+                c.compression()
+            );
+        }
+        let ts_enc: Vec<_> = rg.column(1).encodings().collect();
+        assert!(ts_enc.contains(&parquet::basic::Encoding::DELTA_BINARY_PACKED));
+        assert!(
+            rg.column(1).dictionary_page_offset().is_none(),
+            "ts dict off"
+        );
+        let sc = rg.sorting_columns().expect("stamps present");
+        assert_eq!(sc.len(), 2);
+        assert!(sc.iter().all(|c| c.nulls_first && !c.descending));
+        assert!(
+            rg.column(2).bloom_filter_offset().is_some(),
+            "url bloom missing"
+        );
+        assert!(rg.column(0).bloom_filter_offset().is_none());
+        assert!(rg.column(1).bloom_filter_offset().is_none());
     }
 }
