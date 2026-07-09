@@ -4,6 +4,7 @@ pub mod commit;
 pub mod ids;
 pub mod part;
 pub mod schema;
+pub mod sorting;
 pub mod stats;
 pub mod table;
 
@@ -14,6 +15,7 @@ pub use schema::{
     ColumnKind, ColumnSpec, SchemaError, TableColumns, UKIEL_TYPE_META, arrow_schema_from_json,
     ukiel_type_of,
 };
+pub use sorting::{SortKeyError, sort_batch, sorted_writer_props, validate_sort_key};
 pub use table::{Hypertable, LogicalTable, Placement};
 
 #[cfg(test)]
