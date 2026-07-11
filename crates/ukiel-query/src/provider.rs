@@ -1,6 +1,12 @@
 //! A DataFusion TableProvider that plans scans from the Ukiel catalog and
 //! enforces namespace isolation by injecting `packing_key = value` into the
 //! physical plan, upstream of any projection.
+//!
+//! The isolation slice is explicit: `Some(key)` is the product path (every
+//! namespace session), `None` is the unscoped operator path (benchmarks —
+//! see [`crate::context::operator_session`]), which scans every live part with
+//! no isolation predicate. Everything else — catalog pruning, stats pruning,
+//! the footer cache, the declared output ordering — is identical in both modes.
 
 use std::fmt;
 use std::sync::Arc;
@@ -98,7 +104,9 @@ pub struct UkielTableProvider {
     /// physical + alias — what SQL sees.
     query_schema: SchemaRef,
     columns: TableColumns,
-    packing_key_value: i64,
+    /// The isolation slice: `Some(packing_key)` scopes the table to one
+    /// namespace; `None` is the unscoped operator mode (no isolation).
+    slice: Option<i64>,
     store_url: ObjectStoreUrl,
     reader_factory: Arc<CachingParquetFileReaderFactory>,
 }
@@ -107,16 +115,19 @@ impl fmt::Debug for UkielTableProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("UkielTableProvider")
             .field("hypertable", &self.hypertable.name)
-            .field("packing_key_value", &self.packing_key_value)
+            .field("slice", &self.slice)
             .finish()
     }
 }
 
 impl UkielTableProvider {
+    /// `slice`: `Some(packing_key)` for a namespace-scoped table (the product
+    /// path — the only one the HTTP server ever builds); `None` for the
+    /// unscoped operator/bench path, which reads every namespace's rows.
     pub fn try_new(
         catalog: PostgresCatalog,
         hypertable: Hypertable,
-        packing_key_value: i64,
+        slice: Option<i64>,
         store_url: ObjectStoreUrl,
         reader_factory: Arc<CachingParquetFileReaderFactory>,
     ) -> Result<Self, QueryError> {
@@ -129,7 +140,7 @@ impl UkielTableProvider {
             physical_schema,
             query_schema,
             columns,
-            packing_key_value,
+            slice,
             store_url,
             reader_factory,
         })
@@ -161,12 +172,13 @@ impl TableProvider for UkielTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        // Catalog-pruned file list: only parts whose packing-key range
-        // contains this namespace's key. Never lists the object store.
+        // Catalog-pruned file list: only parts whose packing-key range contains
+        // this namespace's key (every live part when unscoped). Never lists the
+        // object store.
         let ranges = extract_int64_ranges(filters, &self.physical_schema);
         let parts = self
             .catalog
-            .live_parts_pruned(self.hypertable.id, Some(self.packing_key_value), &ranges)
+            .live_parts_pruned(self.hypertable.id, self.slice, &ranges)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let files: Vec<PartitionedFile> = parts
@@ -181,9 +193,15 @@ impl TableProvider for UkielTableProvider {
         };
 
         // Physical columns the scan must read: requested physical columns,
-        // columns referenced by requested alias expressions, and the packing
-        // key (the isolation filter needs it even when projected away).
-        let mut needed: Vec<String> = vec![self.hypertable.packing_key.clone()];
+        // columns referenced by requested alias expressions, and — when scoped —
+        // the packing key (the isolation filter needs it even when projected
+        // away). Unscoped, the packing key is just another column: reading it
+        // unconditionally would tax every operator query with a column it never
+        // asked for.
+        let mut needed: Vec<String> = match self.slice {
+            Some(_) => vec![self.hypertable.packing_key.clone()],
+            None => Vec::new(),
+        };
         for &i in &indices {
             let spec = &self.columns.specs[i];
             match &spec.kind {
@@ -203,18 +221,12 @@ impl TableProvider for UkielTableProvider {
         scan_projection.dedup();
         let scanned_schema = Arc::new(self.physical_schema.project(&scan_projection)?);
 
-        // Pushdown predicate for the Parquet reader: isolation AND every user
-        // filter that converts cleanly. Built against the FILE schema
+        // Pushdown predicate for the Parquet reader: isolation (when scoped) AND
+        // every user filter that converts cleanly. Built against the FILE schema
         // (physical_schema) — pushdown may reference unprojected columns.
         // Best-effort by design: anything skipped is re-applied by DataFusion
         // above (Inexact), and the FilterExec below remains the security
         // boundary regardless.
-        let file_isolation = binary(
-            col(&self.hypertable.packing_key, &self.physical_schema)?,
-            Operator::Eq,
-            lit(ScalarValue::Int64(Some(self.packing_key_value))),
-            &self.physical_schema,
-        )?;
         let physical_names: std::collections::HashSet<&str> = self
             .physical_schema
             .fields()
@@ -223,7 +235,15 @@ impl TableProvider for UkielTableProvider {
             .collect();
         let df_schema =
             datafusion::common::DFSchema::try_from(self.physical_schema.as_ref().clone())?;
-        let mut pushdown = file_isolation;
+        let mut pushdown: Option<Arc<dyn PhysicalExpr>> = match self.slice {
+            Some(key) => Some(binary(
+                col(&self.hypertable.packing_key, &self.physical_schema)?,
+                Operator::Eq,
+                lit(ScalarValue::Int64(Some(key))),
+                &self.physical_schema,
+            )?),
+            None => None,
+        };
         for filter in filters {
             let refs = filter.column_refs();
             if !refs
@@ -234,19 +254,23 @@ impl TableProvider for UkielTableProvider {
             }
             match state.create_physical_expr(filter.clone(), &df_schema) {
                 Ok(expr) => {
-                    pushdown = binary(pushdown, Operator::And, expr, &self.physical_schema)?;
+                    pushdown = Some(match pushdown {
+                        Some(prev) => binary(prev, Operator::And, expr, &self.physical_schema)?,
+                        None => expr,
+                    });
                 }
                 Err(_) => continue, // unconvertible filter: DataFusion re-applies it
             }
         }
 
-        let source = Arc::new(
-            ParquetSource::new(self.physical_schema.clone())
-                .with_predicate(pushdown)
-                .with_pushdown_filters(true)
-                .with_reorder_filters(true)
-                .with_parquet_file_reader_factory(self.reader_factory.clone()),
-        );
+        let mut source = ParquetSource::new(self.physical_schema.clone())
+            .with_pushdown_filters(true)
+            .with_reorder_filters(true)
+            .with_parquet_file_reader_factory(self.reader_factory.clone());
+        if let Some(predicate) = pushdown {
+            source = source.with_predicate(predicate);
+        }
+        let source = Arc::new(source);
         // One group per file: each file is internally sorted, but files may
         // overlap in key ranges — concatenating them into one group would
         // falsely claim a total order. Separate groups also parallelize.
@@ -280,14 +304,20 @@ impl TableProvider for UkielTableProvider {
         let scan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
 
         // Mandatory namespace isolation, before projection can drop the column.
-        // Built against the scanned (projected) schema.
-        let predicate = binary(
-            col(&self.hypertable.packing_key, &scanned_schema)?,
-            Operator::Eq,
-            lit(ScalarValue::Int64(Some(self.packing_key_value))),
-            &scanned_schema,
-        )?;
-        let filtered: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(predicate, scan)?);
+        // Built against the scanned (projected) schema. Absent only in unscoped
+        // operator mode, which by definition has no namespace to isolate.
+        let filtered: Arc<dyn ExecutionPlan> = match self.slice {
+            Some(key) => {
+                let predicate = binary(
+                    col(&self.hypertable.packing_key, &scanned_schema)?,
+                    Operator::Eq,
+                    lit(ScalarValue::Int64(Some(key))),
+                    &scanned_schema,
+                )?;
+                Arc::new(FilterExec::try_new(predicate, scan)?)
+            }
+            None => scan,
+        };
 
         // Final projection maps requested query-schema columns onto the scanned
         // schema (alias-referenced columns are present by construction). Runs

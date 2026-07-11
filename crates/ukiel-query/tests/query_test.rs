@@ -169,7 +169,7 @@ async fn ctx_with_provider(h: &Harness, namespace: i64) -> SessionContext {
     let provider = UkielTableProvider::try_new(
         h.catalog.clone(),
         ht,
-        namespace,
+        Some(namespace),
         ObjectStoreUrl::parse(STORE_URL).unwrap(),
         Arc::new(CachingParquetFileReaderFactory::new(
             h.store.clone(),
@@ -904,5 +904,98 @@ async fn metadata_cache_hits_across_queries_with_identical_results() {
         cache.misses(),
         misses_after_first,
         "an identical second query must add no misses"
+    );
+}
+
+/// The operator (unscoped) session sees every namespace's rows in one table —
+/// what the whole-table benchmark suites need — while the namespace session it
+/// sits next to keeps isolating. The security posture is a *construction*
+/// invariant, re-asserted here in prose because it cannot be asserted in code:
+/// `operator_session` is referenced by the bench binary and this test only, and
+/// `ukiel_query::server` must never call it (issue 0001 — the server's
+/// `namespace_id` is caller-supplied, so an unscoped route would leak every
+/// tenant's data). The `server_never_references_operator_session` test below
+/// holds that line mechanically.
+#[tokio::test]
+async fn operator_session_sees_every_namespace_while_scoped_sessions_isolate() {
+    let h = setup().await;
+    let store_url = url::Url::parse(STORE_URL).unwrap();
+
+    // Scoped: namespace 1 still sees only its own rows, packed file and all.
+    let scoped = session_for_namespace(
+        &h.catalog,
+        NamespaceId(1),
+        h.store.clone(),
+        &store_url,
+        test_metadata_cache(),
+    )
+    .await
+    .unwrap();
+    let batches = scoped
+        .sql("SELECT payload FROM events ORDER BY ts")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(all_strings(&batches, "payload"), vec!["a1", "a2"]);
+
+    // Unscoped: the hypertable is registered under its *hypertable* name and
+    // every namespace's rows are visible — across the packed and dedicated file.
+    let operator = ukiel_query::context::operator_session(
+        &h.catalog,
+        h.store.clone(),
+        &store_url,
+        test_metadata_cache(),
+    )
+    .await
+    .unwrap();
+    let batches = operator
+        .sql("SELECT payload FROM events ORDER BY tenant_id, ts")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        all_strings(&batches, "payload"),
+        vec!["a1", "a2", "b1", "b2"],
+        "unscoped session must see both namespaces"
+    );
+
+    // The aggregate the official suites are made of: a whole-table count, with
+    // the packing key projected away entirely.
+    let batches = operator
+        .sql("SELECT count(*) AS n FROM events")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(all_i64(&batches, "n"), vec![4]);
+
+    // Grouping by the packing key recovers the per-namespace split — proof the
+    // rows are genuinely commingled rather than one namespace's leaking through.
+    let batches = operator
+        .sql("SELECT tenant_id, count(*) AS n FROM events GROUP BY tenant_id ORDER BY tenant_id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(all_i64(&batches, "tenant_id"), vec![1, 2]);
+    assert_eq!(all_i64(&batches, "n"), vec![2, 2]);
+}
+
+/// The unscoped session must stay unreachable from the HTTP server. This is the
+/// one invariant a runtime test cannot express (you cannot assert the absence of
+/// a route that was never written), so assert it against the source itself.
+#[test]
+fn server_never_references_operator_session() {
+    let server = include_str!("../src/server.rs");
+    assert!(
+        !server.contains("operator_session"),
+        "server.rs must never build an unscoped session (issue 0001): every \
+         HTTP path is namespace-scoped, and the namespace is caller-supplied"
     );
 }

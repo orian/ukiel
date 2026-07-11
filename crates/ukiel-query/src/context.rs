@@ -1,5 +1,9 @@
 //! Builds a per-namespace SessionContext: custom catalog/schema providers
 //! resolve table names through the Ukiel catalog, scoped to one namespace.
+//!
+//! [`operator_session`] is the deliberate exception — an unscoped, whole-table
+//! session for benchmarks and operator tooling. It is never reachable from the
+//! HTTP server; see its doc comment.
 
 use std::sync::Arc;
 
@@ -57,6 +61,48 @@ pub async fn session_for_namespace(
     Ok(ctx)
 }
 
+/// An **unscoped** session: every hypertable registered under its hypertable
+/// name, each provider reading *all* namespaces' rows.
+///
+/// There is no tenant isolation here — that is the entire point. The whole-table
+/// benchmark suites (ClickBench, JSONBench) are defined over one global table,
+/// and Ukiel's product path is namespace-scoped by construction, so measuring
+/// the read stack against the official suites needs a door around the scoping.
+/// Every *other* layer is untouched: catalog pruning, stats pruning, the footer
+/// cache and the declared output ordering all behave exactly as in a namespace
+/// session, so what this measures is the real stack minus the slice predicate.
+///
+/// **Operator/bench use only. Never wire this into the HTTP server** — the
+/// server's caller-supplied `namespace_id` is unauthenticated today (issue
+/// 0001), and an unscoped route would hand any caller every tenant's data.
+/// Nothing in `server.rs` references this function, and nothing should.
+pub async fn operator_session(
+    catalog: &PostgresCatalog,
+    store: Arc<dyn ObjectStore>,
+    store_url: &url::Url,
+    metadata_cache: Arc<ParquetMetadataCache>,
+) -> Result<SessionContext, QueryError> {
+    let config = SessionConfig::new().with_information_schema(true);
+    let ctx = SessionContext::new_with_config(config);
+    ctx.register_object_store(store_url, store.clone());
+
+    let reader_factory = Arc::new(CachingParquetFileReaderFactory::new(store, metadata_cache));
+    let url = ObjectStoreUrl::parse(store_url.as_str())?;
+
+    for hypertable in catalog.list_hypertables().await? {
+        let name = hypertable.name.clone();
+        let provider = UkielTableProvider::try_new(
+            catalog.clone(),
+            hypertable,
+            None, // unscoped: no isolation predicate, all live parts
+            url.clone(),
+            reader_factory.clone(),
+        )?;
+        ctx.register_table(&name, Arc::new(provider))?;
+    }
+    Ok(ctx)
+}
+
 #[derive(Debug)]
 struct UkielCatalogProvider {
     schema: Arc<UkielSchemaProvider>,
@@ -109,7 +155,7 @@ impl SchemaProvider for UkielSchemaProvider {
         let provider = UkielTableProvider::try_new(
             self.catalog.clone(),
             hypertable,
-            self.namespace.0, // v1 convention: table slice = packing_key == namespace id
+            Some(self.namespace.0), // v1 convention: slice = packing_key == namespace id
             self.store_url.clone(),
             self.reader_factory.clone(),
         )
