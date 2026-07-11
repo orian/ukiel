@@ -9,9 +9,11 @@
 //!   bench clickbench load [--files N]           load the verbatim-named hits_cb fixture
 //!   bench bluesky produce --files N [...]        stream Bluesky ndjson to Kafka
 //!   bench bluesky run --files N [...]            full ingest→ladder→finalization run
+//!   bench bluesky jsonbench [--iters N]          official JSONBench 5-query suite
 //!
-//! The `hits*` suites are ukiel's own per-tenant SaaS scenarios (plan 30); the
-//! `clickbench` suite is the *official* 43-query file run verbatim (plan 32).
+//! The `hits*`/`bluesky run` suites are ukiel's own per-tenant SaaS scenarios
+//! (plan 30); `clickbench` and `bluesky jsonbench` are the *official* suites,
+//! vendored with a per-query adaptation log (plan 32).
 //!
 //! Datasets and results live under the gitignored `bench/` directory.
 
@@ -21,6 +23,7 @@ mod bluesky;
 mod clickbench;
 mod hits;
 mod report;
+mod suite;
 
 const USAGE: &str = "\
 bench — ukiel macro perf harness (plan 30, manual-only, run with --release)
@@ -35,6 +38,7 @@ USAGE:
     bench clickbench compare --ukiel LABEL --raw LABEL      per-query overhead ratios
     bench bluesky produce --files N [--topic T] [--wave-files W]
     bench bluesky run --files N [--wave-files W] [--flush-ms MS] [--label LABEL]
+    bench bluesky jsonbench [--iters N] [--label LABEL]     official JSONBench 5 queries
 
 Datasets: bench/datasets/{hits,bluesky}/ (fetch via `make bench-fetch-{hits,bluesky}`).
 Queries:  bench/queries/{clickbench,jsonbench}/ (vendored + ADAPTATIONS.md).
@@ -103,6 +107,11 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
             let flush_ms = opt_usize(args, "--flush-ms")?.unwrap_or(10_000) as u64;
             let label = opt_str(args, "--label").unwrap_or("baseline");
             bluesky::run(files, wave_files, flush_ms, label).await
+        }
+        (Some("bluesky"), Some("jsonbench")) => {
+            let iters = opt_usize(args, "--iters")?.unwrap_or(3);
+            let label = opt_str(args, "--label").unwrap_or("baseline");
+            bluesky::jsonbench(iters, label).await
         }
         (Some("bluesky"), sub) => anyhow::bail!("unknown `bluesky` subcommand {sub:?}\n\n{USAGE}"),
         (Some(other), _) => anyhow::bail!("unknown command '{other}'\n\n{USAGE}"),

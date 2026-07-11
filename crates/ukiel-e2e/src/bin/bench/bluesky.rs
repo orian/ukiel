@@ -31,10 +31,18 @@ fn dataset_dir() -> PathBuf {
 }
 
 /// The ukiel `bsky` table schema (JSON, `TableColumns` format).
+///
+/// `did` (plan 32) is the Bluesky account identifier stored **verbatim**, next
+/// to the `tenant_id` it hashes to. JSONBench's q2/q4/q5 group by it, and
+/// grouping by the fnv1a hash instead would be collision-equivalent but
+/// unreadable — the suite should return actual dids. Fixture-schema addition:
+/// a `bsky` fixture produced before this exists cannot serve the official suite;
+/// re-produce it (`bench bluesky run`).
 pub fn bsky_schema_json() -> serde_json::Value {
     json!({"fields": [
         {"name": "tenant_id", "type": "int64"},
         {"name": "ts", "type": "timestamp_ms"},
+        {"name": "did", "type": "utf8"},
         {"name": "kind", "type": "utf8"},
         {"name": "operation", "type": "utf8"},
         {"name": "collection", "type": "utf8"},
@@ -77,6 +85,7 @@ fn map_bluesky_event(line: &str) -> Option<Value> {
     Some(json!({
         "tenant_id": fnv1a64(did),
         "ts": time_us / 1000,
+        "did": did,
         "kind": kind,
         "operation": field("operation"),
         "collection": field("collection"),
@@ -539,6 +548,48 @@ pub async fn run(
     Ok(())
 }
 
+/// JSONBench is 5 queries. A file that parses to any other count is a mis-edit.
+const JSONBENCH_QUERIES: usize = 5;
+
+/// `bench bluesky jsonbench [--iters N] [--label L]`: the official JSONBench
+/// suite over whatever `bench bluesky run` last ingested — whole-table, so via
+/// the unscoped operator session.
+///
+/// The `bsky` fixture must carry the `did` column (plan 32): a fixture produced
+/// before that schema addition cannot answer q2/q4/q5, and the run says so
+/// rather than silently reporting on four columns.
+pub async fn jsonbench(iters: usize, label: &str) -> anyhow::Result<()> {
+    let stack = Stack::start().await;
+    let ht = stack
+        .catalog
+        .get_hypertable("bsky")
+        .await
+        .context("bsky not loaded — run `bench bluesky run --files N` first")?;
+    if !ht.table_schema.to_string().contains("\"did\"") {
+        bail!(
+            "the loaded `bsky` fixture predates the `did` column (plan 32) — JSONBench's \
+             q2/q4/q5 group by the account. Re-produce it: `make e2e-down && bench bluesky run --files N`"
+        );
+    }
+    let parts = stack.catalog.live_parts(ht.id, None).await?;
+    let table_rows: i64 = parts.iter().map(|p| p.meta.row_count).sum();
+    println!(
+        "bsky: {table_rows} rows in {} live parts (the fixture the suite describes)",
+        parts.len()
+    );
+
+    let queries = crate::suite::load_queries(
+        &PathBuf::from("bench/queries/jsonbench/queries.sql"),
+        JSONBENCH_QUERIES,
+    )?;
+    let report = crate::suite::run_suite("ukiel", label, iters, table_rows, &queries, || {
+        crate::suite::cold_ukiel_session(&stack)
+    })
+    .await?;
+    crate::suite::finish(report, &format!("jsonbench-ukiel-{label}.json"))?;
+    Ok(())
+}
+
 /// Polls the ingest offset sum until it reaches `target` or the deadline.
 async fn wait_offset(
     stack: &Stack,
@@ -593,6 +644,29 @@ mod tests {
         assert_eq!(v["operation"], "create");
         assert_eq!(v["collection"], "app.bsky.feed.post");
         assert!(v["payload"].as_str().unwrap().contains("\"text\":\"hi\""));
+    }
+
+    /// Plan 32: JSONBench q2/q4/q5 group by the account, so the `did` is stored
+    /// verbatim *alongside* the packing key it hashes to — not instead of it.
+    #[test]
+    fn maps_did_verbatim_beside_its_hash() {
+        let line = r#"{"did":"did:plc:u1","time_us":1700000000000000,"kind":"commit","commit":{"operation":"create","collection":"app.bsky.feed.post"}}"#;
+        let v = map_bluesky_event(line).unwrap();
+        assert_eq!(v["did"], "did:plc:u1", "the did is stored as itself");
+        assert_eq!(
+            v["tenant_id"],
+            json!(fnv1a64("did:plc:u1")),
+            "and still hashes to the same packing key as before"
+        );
+        // Both the schema and the mapper must carry it, or ingest drops it.
+        let fields = bsky_schema_json();
+        let names: Vec<&str> = fields["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"did"), "did missing from the bsky schema");
     }
 
     #[test]
