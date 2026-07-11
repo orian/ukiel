@@ -1,15 +1,24 @@
-//! ClickBench `hits` read-benchmark fixture (plan 30, Task 2/3).
+//! ClickBench read-benchmark fixtures (plan 30 Task 2/3; plan 32 Task 2).
 //!
-//! Loads the partitioned ClickBench parquet files into ukiel parts: a 14-column
-//! lowercase subset of the ~100-column source, cast to supported types
-//! (`int64`/`timestamp_ms`/`utf8`), day-split, sorted by `(counter_id, ts)`, and
-//! committed one-commit-per-file at level 1 with column stats populated. The
-//! source files are row-range slices, so their `counter_id` ranges overlap and
-//! the loaded fixture measures pruning against ~file-count fan-out per tenant.
-//! `bench hits compact` collapses that into one run per day-partition: since
-//! plan 29 (streaming merge, O(K·batch + row-group) RAM) the ~15 GB fold no
-//! longer trips the retired plan-28 cap — running the read suite before and
-//! after quantifies the fan-out collapse (bench §5 caveat lifted).
+//! Two hypertables are loaded from the same partitioned ClickBench parquet
+//! files, by one loader parameterized on a [`Dataset`] descriptor:
+//!
+//! * **`hits`** (plan 30) — a 14-column *lowercase* subset for the per-tenant
+//!   SaaS scenario suite (`counter_id` = tenant, `ts` = epoch-ms).
+//! * **`hits_cb`** (plan 32) — the 25 columns the official 43-query ClickBench
+//!   suite touches, named **verbatim** (`"CounterID"`, `"EventTime"`, …) so the
+//!   upstream file's quoted CamelCase identifiers resolve against it.
+//!
+//! Both are cast to ukiel's supported types (`int64`/`timestamp_ms`/`utf8` —
+//! the source's Int16/Int32/UInt16 widen to int64 and its Binary strings become
+//! utf8), day-split, sorted by their sort key, and committed one-commit-per-file
+//! at level 1 with column stats populated. The source files are row-range
+//! slices, so their `CounterID` ranges overlap and the loaded fixture measures
+//! pruning against ~file-count fan-out per tenant. `bench hits compact` collapses
+//! that into one run per day-partition: since plan 29 (streaming merge,
+//! O(K·batch + row-group) RAM) the ~15 GB fold no longer trips the retired
+//! plan-28 cap — running the read suite before and after quantifies the fan-out
+//! collapse (bench §5 caveat lifted).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,61 +38,357 @@ use ukiel_compactor::compactor::{Compactor, CompactorConfig};
 use ukiel_core::{CommitOp, HypertableId, NamespaceId, PartMeta};
 use ukiel_e2e::Stack;
 
-/// (ukiel column, ClickBench source column) for the Int64 subset. `counter_id`
-/// (the packing key) and `ts` (from `EventTime`) are handled explicitly.
-const INT_COLS: &[(&str, &str)] = &[
-    ("watch_id", "WatchID"),
-    ("user_id", "UserID"),
-    ("region_id", "RegionID"),
-    ("adv_engine_id", "AdvEngineID"),
-    ("is_refresh", "IsRefresh"),
-    ("resolution_width", "ResolutionWidth"),
-    ("os", "OS"),
-    ("user_agent", "UserAgent"),
-];
-const UTF8_COLS: &[(&str, &str)] = &[
-    ("url", "URL"),
-    ("referer", "Referer"),
-    ("title", "Title"),
-    ("search_phrase", "SearchPhrase"),
-];
+/// How a source column becomes a ukiel column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cast {
+    /// Arrow-cast to Int64 (Int16/Int32/UInt16 all widen losslessly).
+    Int64,
+    /// Arrow-cast to Int64, then scale — `hits.ts` is `EventTime` × 1000
+    /// (ClickBench stores unix *seconds*; ukiel's `timestamp_ms` is epoch-ms).
+    Int64Scaled(i64),
+    /// Arrow-cast to Utf8 (the source stores strings as Binary).
+    Utf8,
+}
+
+/// One column of a fixture: where it comes from and what it becomes.
+#[derive(Debug, Clone, Copy)]
+pub struct ColSpec {
+    /// Column name in the ukiel table (verbatim-CamelCase for `hits_cb`).
+    pub ukiel: &'static str,
+    /// Column name in the ClickBench source parquet.
+    pub src: &'static str,
+    pub cast: Cast,
+    /// Declared ukiel type — drives the writer's encoding hints.
+    pub ukiel_type: &'static str,
+}
+
+/// A fixture: one hypertable loaded from the ClickBench parquet files.
+pub struct Dataset {
+    pub table: &'static str,
+    pub cols: &'static [ColSpec],
+    pub packing_key: &'static str,
+    pub sort_key: &'static [&'static str],
+    /// The ukiel column the day partition is derived from, and the factor that
+    /// converts its stored value to epoch-ms (`hits.ts` is already ms → 1;
+    /// `hits_cb."EventTime"` stays in seconds → 1000).
+    pub day_from: (&'static str, i64),
+}
+
+impl Dataset {
+    pub fn sort_key_vec(&self) -> Vec<String> {
+        self.sort_key.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The ukiel table schema (JSON, `TableColumns` format).
+    pub fn schema_json(&self) -> serde_json::Value {
+        let fields: Vec<serde_json::Value> = self
+            .cols
+            .iter()
+            .map(|c| json!({"name": c.ukiel, "type": c.ukiel_type}))
+            .collect();
+        json!({ "fields": fields })
+    }
+
+    /// Target arrow schema for the written parts. `timestamp_ms` is physically
+    /// Int64 (epoch-ms), so every non-utf8 column lands as Int64.
+    fn target_schema(&self) -> Arc<Schema> {
+        Arc::new(Schema::new(
+            self.cols
+                .iter()
+                .map(|c| {
+                    let dt = match c.cast {
+                        Cast::Utf8 => DataType::Utf8,
+                        _ => DataType::Int64,
+                    };
+                    Field::new(c.ukiel, dt, true)
+                })
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    /// The source columns to project when reading a ClickBench file.
+    fn source_columns(&self) -> Vec<&'static str> {
+        let mut v: Vec<&'static str> = self.cols.iter().map(|c| c.src).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+}
+
+/// Plan 30's per-tenant SaaS fixture: a lowercase 14-column subset.
+pub const HITS: Dataset = Dataset {
+    table: "hits",
+    cols: &[
+        ColSpec {
+            ukiel: "counter_id",
+            src: "CounterID",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        // ClickBench's EventTime is unix seconds; ukiel's timestamp_ms is epoch-ms.
+        ColSpec {
+            ukiel: "ts",
+            src: "EventTime",
+            cast: Cast::Int64Scaled(1000),
+            ukiel_type: "timestamp_ms",
+        },
+        ColSpec {
+            ukiel: "watch_id",
+            src: "WatchID",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "user_id",
+            src: "UserID",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "region_id",
+            src: "RegionID",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "adv_engine_id",
+            src: "AdvEngineID",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "is_refresh",
+            src: "IsRefresh",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "resolution_width",
+            src: "ResolutionWidth",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "os",
+            src: "OS",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "user_agent",
+            src: "UserAgent",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "url",
+            src: "URL",
+            cast: Cast::Utf8,
+            ukiel_type: "utf8",
+        },
+        ColSpec {
+            ukiel: "referer",
+            src: "Referer",
+            cast: Cast::Utf8,
+            ukiel_type: "utf8",
+        },
+        ColSpec {
+            ukiel: "title",
+            src: "Title",
+            cast: Cast::Utf8,
+            ukiel_type: "utf8",
+        },
+        ColSpec {
+            ukiel: "search_phrase",
+            src: "SearchPhrase",
+            cast: Cast::Utf8,
+            ukiel_type: "utf8",
+        },
+    ],
+    packing_key: "counter_id",
+    sort_key: &["counter_id", "ts"],
+    day_from: ("ts", 1),
+};
+
+/// Plan 32's official-suite fixture: the 25 columns the 43 ClickBench queries
+/// reference, **named verbatim** so the upstream file runs unmodified.
+///
+/// Type deltas from the source (each an entry in
+/// `bench/queries/clickbench/ADAPTATIONS.md`): every integer widens to int64
+/// (ukiel has no narrower integer type); Binary strings become utf8 — the same
+/// thing upstream's own `create.sql` does with `binary_as_string=true`;
+/// `"EventDate"` (UInt16 day number) stays a **day number** as int64 rather than
+/// becoming a DATE, since ukiel has no date type — the only adaptation that
+/// touches query *text*.
+///
+/// `"EventTime"` stays unix **seconds** (the queries call
+/// `to_timestamp_seconds` on it), so it is declared `int64`, not `timestamp_ms`
+/// — which costs the delta-packed-ts encoding hint but keeps the column's
+/// meaning honest.
+pub const HITS_CB: Dataset = Dataset {
+    table: "hits_cb",
+    cols: &[
+        ColSpec {
+            ukiel: "CounterID",
+            src: "CounterID",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "EventTime",
+            src: "EventTime",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "EventDate",
+            src: "EventDate",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "UserID",
+            src: "UserID",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "WatchID",
+            src: "WatchID",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "ClientIP",
+            src: "ClientIP",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "URLHash",
+            src: "URLHash",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "RefererHash",
+            src: "RefererHash",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "AdvEngineID",
+            src: "AdvEngineID",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "ResolutionWidth",
+            src: "ResolutionWidth",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "RegionID",
+            src: "RegionID",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "MobilePhone",
+            src: "MobilePhone",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "SearchEngineID",
+            src: "SearchEngineID",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "IsRefresh",
+            src: "IsRefresh",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "DontCountHits",
+            src: "DontCountHits",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "IsLink",
+            src: "IsLink",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "IsDownload",
+            src: "IsDownload",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "TraficSourceID",
+            src: "TraficSourceID",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "WindowClientWidth",
+            src: "WindowClientWidth",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "WindowClientHeight",
+            src: "WindowClientHeight",
+            cast: Cast::Int64,
+            ukiel_type: "int64",
+        },
+        ColSpec {
+            ukiel: "MobilePhoneModel",
+            src: "MobilePhoneModel",
+            cast: Cast::Utf8,
+            ukiel_type: "utf8",
+        },
+        ColSpec {
+            ukiel: "SearchPhrase",
+            src: "SearchPhrase",
+            cast: Cast::Utf8,
+            ukiel_type: "utf8",
+        },
+        ColSpec {
+            ukiel: "URL",
+            src: "URL",
+            cast: Cast::Utf8,
+            ukiel_type: "utf8",
+        },
+        ColSpec {
+            ukiel: "Title",
+            src: "Title",
+            cast: Cast::Utf8,
+            ukiel_type: "utf8",
+        },
+        ColSpec {
+            ukiel: "Referer",
+            src: "Referer",
+            cast: Cast::Utf8,
+            ukiel_type: "utf8",
+        },
+    ],
+    packing_key: "CounterID",
+    sort_key: &["CounterID", "EventTime"],
+    day_from: ("EventTime", 1000),
+};
 
 fn dataset_dir() -> PathBuf {
     PathBuf::from("bench/datasets/hits")
 }
 fn results_dir() -> PathBuf {
     PathBuf::from("bench/results")
-}
-
-/// The ukiel `hits` table schema (JSON, `TableColumns` format).
-pub fn hits_schema_json() -> serde_json::Value {
-    let mut fields = vec![
-        json!({"name": "counter_id", "type": "int64"}),
-        json!({"name": "ts", "type": "timestamp_ms"}),
-    ];
-    for (name, _) in INT_COLS {
-        fields.push(json!({"name": name, "type": "int64"}));
-    }
-    for (name, _) in UTF8_COLS {
-        fields.push(json!({"name": name, "type": "utf8"}));
-    }
-    json!({ "fields": fields })
-}
-
-/// Target arrow schema for the written parts (`ts` is Int64 epoch-ms, matching
-/// the physical schema `timestamp_ms` maps to).
-fn target_schema() -> Arc<Schema> {
-    let mut fields = vec![
-        Field::new("counter_id", DataType::Int64, true),
-        Field::new("ts", DataType::Int64, true),
-    ];
-    for (name, _) in INT_COLS {
-        fields.push(Field::new(*name, DataType::Int64, true));
-    }
-    for (name, _) in UTF8_COLS {
-        fields.push(Field::new(*name, DataType::Utf8, true));
-    }
-    Arc::new(Schema::new(fields))
 }
 
 /// Day partition string (`YYYY-MM-DD`) for an epoch-ms value — the same
@@ -100,36 +405,45 @@ fn source_col<'a>(input: &'a RecordBatch, name: &str) -> anyhow::Result<&'a Arra
     Ok(input.column(idx))
 }
 
-/// Casts the ClickBench subset to the ukiel `hits` schema and splits by day.
-/// Pure: the sole transform under test. `EventTime` (unix seconds) becomes
-/// `ts` epoch-ms; every Int64 source is cast via the arrow kernel.
-fn cast_hits_batch(input: &RecordBatch) -> anyhow::Result<Vec<(String, RecordBatch)>> {
-    let schema = target_schema();
+/// Casts a ClickBench batch to `dataset`'s ukiel schema and splits it by day.
+/// Pure: the sole transform under test, shared by both fixtures.
+fn cast_batch(
+    dataset: &Dataset,
+    input: &RecordBatch,
+) -> anyhow::Result<Vec<(String, RecordBatch)>> {
+    let schema = dataset.target_schema();
     let n = input.num_rows();
 
-    // ts = EventTime (seconds) * 1000.
-    let evt = cast(source_col(input, "EventTime")?, &DataType::Int64)?;
-    let evt = evt
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .context("EventTime not castable to Int64")?;
-    let ts: Int64Array = evt.iter().map(|v| v.map(|s| s * 1000)).collect();
-
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-    columns.push(cast(source_col(input, "CounterID")?, &DataType::Int64)?);
-    columns.push(Arc::new(ts.clone()) as ArrayRef);
-    for (_, src) in INT_COLS {
-        columns.push(cast(source_col(input, src)?, &DataType::Int64)?);
-    }
-    for (_, src) in UTF8_COLS {
-        columns.push(cast(source_col(input, src)?, &DataType::Utf8)?);
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(dataset.cols.len());
+    for c in dataset.cols {
+        let src = source_col(input, c.src)?;
+        let arr: ArrayRef = match c.cast {
+            Cast::Int64 => cast(src, &DataType::Int64)?,
+            Cast::Int64Scaled(factor) => {
+                let ints = cast(src, &DataType::Int64)?;
+                let ints = ints
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .with_context(|| format!("{} not castable to Int64", c.src))?;
+                let scaled: Int64Array = ints.iter().map(|v| v.map(|x| x * factor)).collect();
+                Arc::new(scaled) as ArrayRef
+            }
+            Cast::Utf8 => cast(src, &DataType::Utf8)?,
+        };
+        columns.push(arr);
     }
     let full = RecordBatch::try_new(schema.clone(), columns)?;
 
     // Group row indices by day, then `take` each column per day.
+    let (day_col, to_ms) = dataset.day_from;
+    let time = int64_col(&full, day_col)?;
     let mut by_day: HashMap<String, Vec<u32>> = HashMap::new();
     for row in 0..n {
-        if let Some(day) = ts.is_valid(row).then(|| day_of_ms(ts.value(row))).flatten() {
+        if let Some(day) = time
+            .is_valid(row)
+            .then(|| day_of_ms(time.value(row) * to_ms))
+            .flatten()
+        {
             by_day.entry(day).or_default().push(row as u32);
         }
     }
@@ -200,17 +514,12 @@ fn pick_tenants(counts: &HashMap<i64, i64>) -> anyhow::Result<HitsCensus> {
     })
 }
 
-/// Reads one ClickBench parquet file (projecting only the subset columns),
+/// Reads one ClickBench parquet file (projecting only the dataset's columns),
 /// concatenating its row groups into one batch.
-fn read_hits_file(path: &Path) -> anyhow::Result<RecordBatch> {
+fn read_hits_file(dataset: &Dataset, path: &Path) -> anyhow::Result<RecordBatch> {
     let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let needed: Vec<&str> = std::iter::once("CounterID")
-        .chain(std::iter::once("EventTime"))
-        .chain(INT_COLS.iter().map(|(_, s)| *s))
-        .chain(UTF8_COLS.iter().map(|(_, s)| *s))
-        .collect();
-    let mask = ProjectionMask::columns(builder.parquet_schema(), needed.iter().copied());
+    let mask = ProjectionMask::columns(builder.parquet_schema(), dataset.source_columns());
     let reader = builder
         .with_projection(mask)
         .with_batch_size(65_536)
@@ -222,41 +531,37 @@ fn read_hits_file(path: &Path) -> anyhow::Result<RecordBatch> {
     Ok(concat_batches(&batches[0].schema(), &batches)?)
 }
 
-/// `bench hits load [--files N]`: loads present ClickBench files into the
-/// `hits` hypertable and writes the tenant census.
-pub async fn load(files: Option<usize>) -> anyhow::Result<()> {
-    let inputs = present_files(&dataset_dir(), files)?;
-    if inputs.is_empty() {
-        bail!(
-            "no hits parquet files under {} — run `make bench-fetch-hits`",
-            dataset_dir().display()
-        );
-    }
-    let stack = Stack::start().await;
-    let ht = match stack.catalog.get_hypertable("hits").await {
+/// Loads the present ClickBench files into `dataset`'s hypertable: day-split,
+/// sorted, one L1 commit per input file. Returns the per-packing-key row census.
+async fn load_dataset(
+    stack: &Stack,
+    dataset: &Dataset,
+    inputs: &[PathBuf],
+) -> anyhow::Result<HashMap<i64, i64>> {
+    let ht = match stack.catalog.get_hypertable(dataset.table).await {
         Ok(h) => h.id,
         Err(_) => stack
             .catalog
             .create_hypertable(
-                "hits",
-                &hits_schema_json(),
+                dataset.table,
+                &dataset.schema_json(),
                 &json!({ "columns": ["day"] }),
-                &["counter_id".to_string(), "ts".to_string()],
-                "counter_id",
+                &dataset.sort_key_vec(),
+                dataset.packing_key,
             )
             .await
-            .context("create hits hypertable")?,
+            .with_context(|| format!("create {} hypertable", dataset.table))?,
     };
 
     let mut census: HashMap<i64, i64> = HashMap::new();
-    let sort_key = vec!["counter_id".to_string(), "ts".to_string()];
+    let sort_key = dataset.sort_key_vec();
     for (i, path) in inputs.iter().enumerate() {
-        let batch = read_hits_file(path)?;
-        let day_groups = cast_hits_batch(&batch)?;
+        let batch = read_hits_file(dataset, path)?;
+        let day_groups = cast_batch(dataset, &batch)?;
         let mut parts = Vec::with_capacity(day_groups.len());
         for (day, group) in day_groups {
             let sorted = ukiel_compactor::rewrite::sort_batch(&group, &sort_key)?;
-            let keys = int64_col(&sorted, "counter_id")?;
+            let keys = int64_col(&sorted, dataset.packing_key)?;
             for k in keys.iter().flatten() {
                 *census.entry(k).or_default() += 1;
             }
@@ -288,8 +593,52 @@ pub async fn load(files: Option<usize>) -> anyhow::Result<()> {
             .commit(ht, CommitOp::Add { parts }, None)
             .await
             .with_context(|| format!("commit file {}", path.display()))?;
-        println!("loaded {}/{}: {}", i + 1, inputs.len(), path.display());
+        println!(
+            "{}: loaded {}/{}: {}",
+            dataset.table,
+            i + 1,
+            inputs.len(),
+            path.display()
+        );
     }
+    Ok(census)
+}
+
+/// The ClickBench files to load, or a loud error pointing at the fetch target.
+fn require_inputs(files: Option<usize>) -> anyhow::Result<Vec<PathBuf>> {
+    let inputs = present_files(&dataset_dir(), files)?;
+    if inputs.is_empty() {
+        bail!(
+            "no hits parquet files under {} — run `make bench-fetch-hits`",
+            dataset_dir().display()
+        );
+    }
+    Ok(inputs)
+}
+
+/// `bench clickbench load [--files N]`: loads the official-suite fixture
+/// (`hits_cb`, verbatim column names). No census and no logical tables — the
+/// 43 queries are whole-table and run through the unscoped operator session.
+pub async fn load_clickbench(files: Option<usize>) -> anyhow::Result<()> {
+    let inputs = require_inputs(files)?;
+    let stack = Stack::start().await;
+    let census = load_dataset(&stack, &HITS_CB, &inputs).await?;
+    let rows: i64 = census.values().sum();
+    println!(
+        "hits_cb: {rows} rows over {} CounterIDs from {} file(s) — run `bench clickbench run`",
+        census.len(),
+        inputs.len()
+    );
+    Ok(())
+}
+
+/// `bench hits load [--files N]`: loads present ClickBench files into the
+/// `hits` hypertable and writes the tenant census.
+pub async fn load(files: Option<usize>) -> anyhow::Result<()> {
+    let inputs = require_inputs(files)?;
+    let stack = Stack::start().await;
+    let census = load_dataset(&stack, &HITS, &inputs).await?;
+    let ht = stack.catalog.get_hypertable(HITS.table).await?.id;
 
     let picked = pick_tenants(&census)?;
     // Census tenants get a logical `hits` table in their namespace (= counter_id).
@@ -565,45 +914,76 @@ fn present_files(dir: &Path, limit: Option<usize>) -> anyhow::Result<Vec<PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int32Array, StringArray};
+    use arrow::array::{BinaryArray, Int16Array, Int32Array, UInt16Array};
 
-    /// A tiny ClickBench-shaped batch: two rows on two different days.
-    fn sample_input() -> RecordBatch {
-        let mut fields = vec![
-            Field::new("CounterID", DataType::Int32, false),
-            Field::new("EventTime", DataType::Int64, false),
-        ];
-        for (_, src) in INT_COLS {
-            fields.push(Field::new(*src, DataType::Int32, false));
+    /// 2013-07-01 and 2013-07-02, in ClickBench's unix seconds.
+    const T1: i64 = 1_372_680_000;
+    const T2: i64 = 1_372_770_000;
+
+    /// A ClickBench-shaped source batch for `dataset`, with the source's real
+    /// types: narrow signed ints, `EventDate` as UInt16, strings as Binary.
+    /// `times` are unix seconds; every other column is filler.
+    fn sample_input(dataset: &Dataset, keys: Vec<i64>, times: Vec<i64>) -> RecordBatch {
+        let n = keys.len();
+        let mut fields = Vec::new();
+        let mut cols: Vec<ArrayRef> = Vec::new();
+        for c in dataset.source_columns() {
+            let (dt, arr): (DataType, ArrayRef) = match c {
+                "CounterID" => (
+                    DataType::Int32,
+                    Arc::new(Int32Array::from(
+                        keys.iter().map(|k| *k as i32).collect::<Vec<_>>(),
+                    )),
+                ),
+                "EventTime" => (DataType::Int64, Arc::new(Int64Array::from(times.clone()))),
+                // UInt16 day number, as in the source parquet.
+                "EventDate" => (
+                    DataType::UInt16,
+                    Arc::new(UInt16Array::from(
+                        times
+                            .iter()
+                            .map(|t| (t / 86_400) as u16)
+                            .collect::<Vec<_>>(),
+                    )),
+                ),
+                other => {
+                    let is_utf8 = dataset
+                        .cols
+                        .iter()
+                        .any(|c| c.src == other && c.cast == Cast::Utf8);
+                    if is_utf8 {
+                        (
+                            DataType::Binary,
+                            Arc::new(BinaryArray::from_iter_values(
+                                (0..n).map(|i| format!("s{i}").into_bytes()),
+                            )),
+                        )
+                    } else {
+                        (
+                            DataType::Int16,
+                            Arc::new(Int16Array::from(
+                                (0..n).map(|i| i as i16).collect::<Vec<_>>(),
+                            )),
+                        )
+                    }
+                }
+            };
+            fields.push(Field::new(c, dt, false));
+            cols.push(arr);
         }
-        for (_, src) in UTF8_COLS {
-            fields.push(Field::new(*src, DataType::Utf8, false));
-        }
-        let schema = Arc::new(Schema::new(fields));
-        let mut cols: Vec<ArrayRef> = vec![
-            Arc::new(Int32Array::from(vec![42, 42])),
-            // 2013-07-01 and 2013-07-02 (unix seconds).
-            Arc::new(Int64Array::from(vec![1_372_680_000, 1_372_770_000])),
-        ];
-        for _ in INT_COLS {
-            cols.push(Arc::new(Int32Array::from(vec![1, 2])));
-        }
-        for _ in UTF8_COLS {
-            cols.push(Arc::new(StringArray::from(vec!["a", "b"])));
-        }
-        RecordBatch::try_new(schema, cols).unwrap()
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap()
     }
 
     #[test]
     fn cast_subset_types_and_ms_conversion() {
-        let out = cast_hits_batch(&sample_input()).unwrap();
+        let input = sample_input(&HITS, vec![42, 42], vec![T1, T2]);
+        let out = cast_batch(&HITS, &input).unwrap();
         // Two distinct days → two groups, one row each.
         assert_eq!(out.len(), 2);
         let total: usize = out.iter().map(|(_, b)| b.num_rows()).sum();
         assert_eq!(total, 2);
         for (day, b) in &out {
-            // Target schema: 14 columns, ts is Int64 = seconds*1000.
-            assert_eq!(b.num_columns(), 2 + INT_COLS.len() + UTF8_COLS.len());
+            assert_eq!(b.num_columns(), HITS.cols.len());
             assert_eq!(b.column(0).data_type(), &DataType::Int64); // counter_id
             assert_eq!(b.column(1).data_type(), &DataType::Int64); // ts
             let ts = int64_col(b, "ts").unwrap().value(0);
@@ -614,32 +994,63 @@ mod tests {
 
     #[test]
     fn day_split_groups_same_day() {
-        // Both rows same day → one group of two.
-        let mut fields = vec![
-            Field::new("CounterID", DataType::Int32, false),
-            Field::new("EventTime", DataType::Int64, false),
-        ];
-        for (_, src) in INT_COLS {
-            fields.push(Field::new(*src, DataType::Int32, false));
-        }
-        for (_, src) in UTF8_COLS {
-            fields.push(Field::new(*src, DataType::Utf8, false));
-        }
-        let schema = Arc::new(Schema::new(fields));
-        let mut cols: Vec<ArrayRef> = vec![
-            Arc::new(Int32Array::from(vec![7, 7])),
-            Arc::new(Int64Array::from(vec![1_372_680_000, 1_372_680_100])),
-        ];
-        for _ in INT_COLS {
-            cols.push(Arc::new(Int32Array::from(vec![1, 1])));
-        }
-        for _ in UTF8_COLS {
-            cols.push(Arc::new(StringArray::from(vec!["x", "y"])));
-        }
-        let batch = RecordBatch::try_new(schema, cols).unwrap();
-        let out = cast_hits_batch(&batch).unwrap();
+        // Both rows the same day → one group of two.
+        let input = sample_input(&HITS, vec![7, 7], vec![T1, T1 + 100]);
+        let out = cast_batch(&HITS, &input).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].1.num_rows(), 2);
+    }
+
+    /// The official-suite fixture is what makes the vendored queries runnable
+    /// verbatim: ClickBench's own column names, `EventTime` still in *seconds*
+    /// (the queries wrap it in `to_timestamp_seconds`), and `EventDate` as the
+    /// raw day number — while the day partition is still derived correctly.
+    #[test]
+    fn clickbench_descriptor_keeps_verbatim_names_and_seconds() {
+        // Names are verbatim ClickBench, and every query column is present.
+        let names: Vec<&str> = HITS_CB.cols.iter().map(|c| c.ukiel).collect();
+        assert_eq!(names.len(), 25);
+        for required in [
+            "CounterID",
+            "EventTime",
+            "EventDate",
+            "UserID",
+            "SearchPhrase",
+            "URL",
+            "Title",
+            "Referer",
+            "MobilePhoneModel",
+            "WindowClientHeight",
+        ] {
+            assert!(names.contains(&required), "{required} missing from hits_cb");
+        }
+        // The packing key leads the sort key (plan-27 registration invariant).
+        assert_eq!(HITS_CB.sort_key[0], HITS_CB.packing_key);
+
+        let input = sample_input(&HITS_CB, vec![62, 62], vec![T1, T2]);
+        let out = cast_batch(&HITS_CB, &input).unwrap();
+        assert_eq!(out.len(), 2, "two days → two partitions");
+
+        for (day, b) in &out {
+            assert_eq!(b.num_columns(), 25);
+            let evt = int64_col(b, "EventTime").unwrap().value(0);
+            assert!(
+                evt == T1 || evt == T2,
+                "EventTime must stay unix seconds, got {evt}"
+            );
+            // The day partition still derives correctly, from seconds.
+            assert_eq!(&day_of_ms(evt * 1000).unwrap(), day);
+            // EventDate is the raw day number, consistent with EventTime.
+            let date = int64_col(b, "EventDate").unwrap().value(0);
+            assert_eq!(date, evt / 86_400);
+            // Strings survive the Binary → Utf8 cast.
+            assert_eq!(
+                b.column(b.schema().index_of("URL").unwrap()).data_type(),
+                &DataType::Utf8
+            );
+        }
+        // 2013-07-01 is day 15887 — the literal the adapted queries use.
+        assert_eq!(T1 / 86_400, 15_887);
     }
 
     #[test]

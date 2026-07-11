@@ -6,8 +6,12 @@
 //!   bench hits load [--files N]                 load ClickBench hits into ukiel parts
 //!   bench hits compact [--target-mb N]          fold the fixture (SizeTargeted whale-split)
 //!   bench hits queries [--iters N] [--label L]  run the per-tenant read suite
+//!   bench clickbench load [--files N]           load the verbatim-named hits_cb fixture
 //!   bench bluesky produce --files N [...]        stream Bluesky ndjson to Kafka
 //!   bench bluesky run --files N [...]            full ingest→ladder→finalization run
+//!
+//! The `hits*` suites are ukiel's own per-tenant SaaS scenarios (plan 30); the
+//! `clickbench` suite is the *official* 43-query file run verbatim (plan 32).
 //!
 //! Datasets and results live under the gitignored `bench/` directory.
 
@@ -24,6 +28,7 @@ USAGE:
     bench hits load [--files N]
     bench hits compact [--target-mb N]
     bench hits queries [--iters N] [--label LABEL]
+    bench clickbench load [--files N]
     bench bluesky produce --files N [--topic T] [--wave-files W]
     bench bluesky run --files N [--wave-files W] [--flush-ms MS] [--label LABEL]
 
@@ -50,6 +55,12 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
         (None, _) | (Some("--help"), _) | (Some("-h"), _) => {
             println!("{USAGE}");
             Ok(())
+        }
+        (Some("clickbench"), Some("load")) => {
+            hits::load_clickbench(opt_usize(args, "--files")?).await
+        }
+        (Some("clickbench"), sub) => {
+            anyhow::bail!("unknown `clickbench` subcommand {sub:?}\n\n{USAGE}")
         }
         (Some("hits"), Some("load")) => hits::load(opt_usize(args, "--files")?).await,
         (Some("hits"), Some("compact")) => hits::compact(opt_usize(args, "--target-mb")?).await,
