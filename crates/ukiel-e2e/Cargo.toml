@@ -26,6 +26,9 @@ axum = { workspace = true }
 # Macro perf bench binary (plan 30) — manual-only, never CI.
 arrow = { workspace = true }
 parquet = { workspace = true }
+# Plan 32: the official suites run SQL directly on a SessionContext (ukiel's
+# operator session, and a bare DataFusion one for the raw reference runner).
+datafusion = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 metrics = { workspace = true }

@@ -18,6 +18,7 @@
 use std::process::ExitCode;
 
 mod bluesky;
+mod clickbench;
 mod hits;
 mod report;
 
@@ -29,10 +30,14 @@ USAGE:
     bench hits compact [--target-mb N]
     bench hits queries [--iters N] [--label LABEL]
     bench clickbench load [--files N]
+    bench clickbench run [--iters N] [--label LABEL]        official 43 queries, ukiel stack
+    bench clickbench raw [--iters N] [--label LABEL]        same 43, bare DataFusion
+    bench clickbench compare --ukiel LABEL --raw LABEL      per-query overhead ratios
     bench bluesky produce --files N [--topic T] [--wave-files W]
     bench bluesky run --files N [--wave-files W] [--flush-ms MS] [--label LABEL]
 
 Datasets: bench/datasets/{hits,bluesky}/ (fetch via `make bench-fetch-{hits,bluesky}`).
+Queries:  bench/queries/{clickbench,jsonbench}/ (vendored + ADAPTATIONS.md).
 Results:  bench/results/*.json (gitignored).";
 
 #[tokio::main]
@@ -58,6 +63,21 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
         }
         (Some("clickbench"), Some("load")) => {
             hits::load_clickbench(opt_usize(args, "--files")?).await
+        }
+        (Some("clickbench"), Some("run")) => {
+            let iters = opt_usize(args, "--iters")?.unwrap_or(3);
+            let label = opt_str(args, "--label").unwrap_or("baseline");
+            clickbench::run(iters, label).await
+        }
+        (Some("clickbench"), Some("raw")) => {
+            let iters = opt_usize(args, "--iters")?.unwrap_or(3);
+            let label = opt_str(args, "--label").unwrap_or("baseline");
+            clickbench::raw(iters, label).await
+        }
+        (Some("clickbench"), Some("compare")) => {
+            let ukiel = opt_str(args, "--ukiel").unwrap_or("baseline");
+            let raw = opt_str(args, "--raw").unwrap_or("baseline");
+            clickbench::compare(ukiel, raw).await
         }
         (Some("clickbench"), sub) => {
             anyhow::bail!("unknown `clickbench` subcommand {sub:?}\n\n{USAGE}")
