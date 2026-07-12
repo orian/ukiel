@@ -99,6 +99,21 @@ impl Stack {
                 }
             };
 
+        // UKIEL_E2E_CACHE_DIR wraps the store in the plan-15 cache tier
+        // (read-through + write-through prewarm, chunked large objects) —
+        // bench attribution: prices the MinIO transport share with the
+        // production cache in front. Unset = bare store, the e2e default.
+        let store: Arc<dyn ObjectStore> = match std::env::var("UKIEL_E2E_CACHE_DIR") {
+            Ok(dir) if !dir.is_empty() => {
+                std::fs::create_dir_all(&dir).expect("create cache dir");
+                Arc::new(ukiel_query::cache::CachingObjectStore::new(
+                    store,
+                    std::path::PathBuf::from(dir),
+                ))
+            }
+            _ => store,
+        };
+
         let producer: FutureProducer = ClientConfig::new()
             .set("bootstrap.servers", &brokers)
             .set("message.timeout.ms", "10000")
