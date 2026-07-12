@@ -8,18 +8,40 @@ thing the plan convention exists to prevent. Row 38 therefore sits **blocked
 upstream**, and this note is the standing recipe for whoever writes the plan
 when the trigger fires.
 
+## Already in 54 — sort-pushdown Phase 1 (correction, 2026-07-13)
+
+[PR #19064] ("Establish the high level API for sort pushdown and the optimizer
+rule…", merged 2025-12-17, released in **DataFusion 52**) is *not* a watch
+item — it is in our pin. Verified in the vendored 54 sources:
+`enable_sort_pushdown: bool, default = true`
+(`datafusion-common-54.0.0/src/config.rs:1289`) — the `PushdownSort` rule runs
+by default in every ukiel session today — and `try_pushdown_sort` trait hooks
+on `FileSource`/`DataSource` (`datafusion-datasource-54.0.0/src/file.rs:260`,
+`src/source.rs:215,499`), with `reverse_scan_inexact` for reversed
+file/row-group order (Inexact: the `SortExec` stays for correctness, TopK
+terminates early). Two consequences, neither belonging to row 38:
+
+- **Row 37**: the rule is a *named candidate mechanism* for the unexplained
+  declared-ordering concurrency effect (identical plans, different achieved
+  parallelism — sort-aware machinery keying off declared orderings would look
+  exactly like that), and the config flag is a clean same-binary A/B lever.
+  Recorded in plan 37's hypothesis table.
+- **Opportunity on 54, no upgrade needed**: the provider could implement
+  `try_pushdown_sort` (ORDER-BY-ts TopK over ts-sliced/dedicated files is the
+  product-shaped beneficiary). If row 37's attribution or the product suite
+  motivates it, that is a new row — not a reason to hold row 38 open.
+
 ## Watch triggers (any one re-opens the row)
 
 1. **A DataFusion release newer than 54.0.0 on crates.io** — check
    `https://crates.io/api/v1/crates/datafusion` (`max_stable_version`).
-2. **The ordering/pushdown work landing upstream**: the sort-pushdown epic
-   [apache/datafusion#17348] and [PR #17337] (`preferred_ordering` on
-   `TableScan`) are active as of this audit and target the family of problems
-   we measured on 54: predicate pushdown rebuilding the scan and clearing the
-   declared output ordering (plan-11 sort-elimination block; the plan-32-era
-   predicate-gate workaround in `provider.rs`), and the unexplained
-   scan-concurrency effect (gap-note §declared-ordering; row 37's H5 may pin
-   more). When a release note mentions these, audit that release first.
+2. **Sort-pushdown later phases landing in a release beyond 54**: the epic
+   [apache/datafusion#17348] tracks what Phase 1 left out (exact row-level
+   reversal; [PR #17337]'s `preferred_ordering` on `TableScan`). Relevant to
+   the problems we measured on 54: predicate pushdown rebuilding the scan and
+   clearing the declared output ordering (plan-11 sort-elimination block; the
+   plan-32-era predicate-gate workaround in `provider.rs`). When a release
+   note mentions these, audit that release first.
 3. **Row 37's H5 disposition** naming a DF code path fixed in a newer release.
 
 ## What the eventual plan must contain (pre-written checklist)
@@ -82,3 +104,4 @@ splitting read-side and write-side into two rows rather than one mega-plan.
 
 [apache/datafusion#17348]: https://github.com/apache/datafusion/issues/17348
 [PR #17337]: https://github.com/apache/datafusion/pull/17337
+[PR #19064]: https://github.com/apache/datafusion/pull/19064
