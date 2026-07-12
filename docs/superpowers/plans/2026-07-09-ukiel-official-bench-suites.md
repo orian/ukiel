@@ -2,6 +2,25 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **EXECUTED 2026-07-12** (commits `f11c7bd`…`cb72033`). All six tasks landed. Results in `bench/README.md` §6.
+>
+> **Headline: ukiel costs ~2.1x bare DataFusion 54 on the official ClickBench suite, and beats it on nothing.**
+> (100M rows: raw 24.7s / loaded 2.16x / packed 2.12x / SizeTargeted 2.14x.)
+>
+> Deviations from this plan, all deliberate:
+> - **25 columns, not 24** — the 43 queries reference 25 distinct columns (recounted from the fetched file).
+> - **The raw reference had to be *fixed*, not just written.** As first built it ran DataFusion's stock
+>   `pushdown_filters=false` while ukiel's provider sets it `true`; that flag alone was worth **14.8x on q24**
+>   and had fabricated a "10x faster than DataFusion" result. The reference now mirrors ukiel's reader settings.
+>   This plan's framing ("raw DataFusion is the ceiling") only holds if the ceiling is configured like the thing
+>   being measured — a lesson worth more than the numbers.
+> - **Task 6 recorded three layouts, not one** (loaded / packed / SizeTargeted): packed compaction turned out to
+>   *regress* 15 of 43 queries by destroying scan parallelism and packing-key part pruning, and SizeTargeted
+>   repairs all of them. "State which layout" became "no layout dominates, and here is why."
+> - **Two findings filed**: issue 0010 (aggregates rescan min/max + row_count that Postgres already holds — q07
+>   is 78x slower than raw for this reason); and the `did` column costs 5.8% write throughput (fixture, not code).
+> - A shared `suite.rs` harness was extracted so both official suites share the cold/hot methodology.
+
 **Goal:** Run the *official* benchmark query suites against Ukiel — not just plan 30's per-tenant adaptations: (a) **ClickBench's 43 queries** in their DataFusion variant (verified: 43 queries, 24 distinct columns, quoted-CamelCase identifiers, DataFusion-compatible functions — the same file behind DataFusion's published ClickBench numbers, which makes our results directly comparable to the engine's own ceiling); (b) **JSONBench's 5 Bluesky queries** (verified: they touch `data.commit.collection`, `data.kind`, `data.commit.operation`, `data.did`, `data.time_us` — all present in our flattened `bsky` schema); (c) a **raw-DataFusion reference runner** over the same parquet on the same machine, so every query gets an `ukiel / raw-DataFusion` ratio — the measured cost of Ukiel's stack (catalog planning, provider, cache) versus the bare engine.
 
 **Architecture:** Both official suites are **whole-table**, and Ukiel's product path is namespace-scoped by construction — so the one piece of product code this plan adds is an **operator (unscoped) session** in `ukiel-query`: `operator_session(catalog, store, store_url)` registers every hypertable by name with a provider in unscoped mode (catalog pruning and caches fully active; **no packing-key isolation predicate**). It is a library function with a loud issue-0001-adjacent warning, used by the bench binary only — never constructed by the HTTP server. Everything else lives in the bench: a second hits fixture (`hits_cb`) loaded with **verbatim ClickBench column names** so the official file runs with only documented type-level deltas (renaming our existing lowercase `hits` fixture would break plan 30's append-only scenario history — a new dataset is the append-only-compatible move), vendored query files with a per-query adaptation log, ClickBench's own run methodology (cold + 3 hot runs) alongside house warm-medians, and side-by-side reports.
@@ -33,9 +52,9 @@
 - The provider's tenant slice becomes explicit: `Option<i64>` — `Some(key)` is today's behavior exactly (catalog `live_parts(ht, Some(key))` + the plan-time isolation predicate); `None` scans all live parts with **no isolation predicate** (catalog pruning, stats pruning, footer cache, output ordering all unchanged — this benchmarks the real read stack minus scoping). Adapt to the provider's actual construction (`context.rs:112` is where the v1 slice convention is applied today).
 - `pub async fn operator_session(catalog, store, store_url) -> Result<SessionContext>` — registers every hypertable (`list_hypertables`) by its hypertable name via `ctx.register_table`, providers unscoped. Doc comment: *operator/bench only; no tenant isolation; never wire into the HTTP server (issue 0001)*.
 
-- [ ] **Step 1: Write the failing test** — two namespaces' rows in one packed hypertable: the namespace session sees only its own (existing behavior, re-asserted next to the new path), `operator_session` sees both and the total count; the server router still has no unscoped route (assert by construction: `operator_session` is not referenced from `server.rs` — a comment in the test states the review invariant).
-- [ ] **Step 2: Verify it fails; implement; verify** — `cargo test -p ukiel-query -- --test-threads=2`.
-- [ ] **Step 3: Lint and commit**
+- [x] **Step 1: Write the failing test** — two namespaces' rows in one packed hypertable: the namespace session sees only its own (existing behavior, re-asserted next to the new path), `operator_session` sees both and the total count; the server router still has no unscoped route (assert by construction: `operator_session` is not referenced from `server.rs` — a comment in the test states the review invariant).
+- [x] **Step 2: Verify it fails; implement; verify** — `cargo test -p ukiel-query -- --test-threads=2`.
+- [x] **Step 3: Lint and commit**
 
 ```bash
 cargo fmt && cargo clippy --all-targets -- -D warnings
@@ -54,9 +73,9 @@ git commit -m "feat: operator (unscoped) session for benchmarks - full-table sca
 - `bench clickbench load [--files N]` → hypertable `hits_cb`: the 24 columns the 43 queries reference, **names verbatim** (`"CounterID"`, `"EventTime"`, …) so quoted identifiers resolve; types mapped to ukiel's system — ints → `int64` (including `EventTime`, kept as **unix seconds**, since the queries call `to_timestamp_seconds("EventTime")`), strings → `utf8`, `EventDate` → `int64` (raw Date32 day number; queries comparing it to dates get a documented adaptation in Task 3). Packing key `CounterID`, sort key `["CounterID", "EventTime"]` (plan-27 validation: packing key leads — holds). Day partition derived from `EventDate` at load; per-file L1 commits; census not needed (global suite).
 - Implementation is the existing loader generalized: the `(ukiel name, source column, cast)` table becomes a parameter, `cast_hits_batch`/upload/commit logic shared between `hits` and `hits_cb` — one loader, two dataset descriptors (the plan-30 pure-fn tests keep covering the shared path; add one descriptor test for verbatim names + seconds-not-ms).
 
-- [ ] **Step 1: Failing unit test** (descriptor: verbatim names, EventTime seconds preserved, EventDate day number, day split from EventDate).
-- [ ] **Step 2: Implement; verify** — unit tests; smoke `--files 2` against the compose stack (count via `operator_session` equals the two files' row count).
-- [ ] **Step 3: Lint and commit**
+- [x] **Step 1: Failing unit test** (descriptor: verbatim names, EventTime seconds preserved, EventDate day number, day split from EventDate).
+- [x] **Step 2: Implement; verify** — unit tests; smoke `--files 2` against the compose stack (count via `operator_session` equals the two files' row count).
+- [x] **Step 3: Lint and commit**
 
 ```bash
 git commit -m "feat: bench clickbench fixture - verbatim-named 24-column hits_cb hypertable"
@@ -74,9 +93,9 @@ git commit -m "feat: bench clickbench fixture - verbatim-named 24-column hits_cb
 - Vendor ClickBench's `datafusion/queries.sql` (43 queries; the file behind DataFusion's published numbers). Adapt **minimally and loggedly**: expected deltas are only around `EventDate` (int64 day number vs date literal — rewrite the comparison to the day number, one ADAPTATIONS.md entry per query touched) and any function drift against DataFusion 54 (the upstream file targets newer DataFusion; on a parse error, adapt with an entry). Everything else runs verbatim — that is the point of the verbatim column names.
 - `bench clickbench run [--iters 3] [--label L]` — via `operator_session`, ClickBench's own methodology per query: one **cold** run (fresh session; the NVMe cache persists — note it, ClickBench's "cold" is also OS-cache-warm on repeat runs) + 3 **hot** runs; report `min`, `median`, and the raw triple. Output: `PERF clickbench/q{NN}={hot_min_ms}` lines + `bench/results/clickbench-{label}.json` (per query: cold, hot runs, row count returned). A query that errors is reported as failed in the JSON and fails the run at the end (after running the rest) — partial coverage must be loud, not silent.
 
-- [ ] **Step 1: Vendor the file, write ADAPTATIONS.md entries as they surface.**
-- [ ] **Step 2: Implement the runner; verify on the `--files 2` smoke fixture** — all 43 parse and execute (row counts sane), report written.
-- [ ] **Step 3: Lint and commit**
+- [x] **Step 1: Vendor the file, write ADAPTATIONS.md entries as they surface.**
+- [x] **Step 2: Implement the runner; verify on the `--files 2` smoke fixture** — all 43 parse and execute (row counts sane), report written.
+- [x] **Step 3: Lint and commit**
 
 ```bash
 git commit -m "feat: official ClickBench 43-query suite over hits_cb via the operator session"
@@ -93,8 +112,8 @@ git commit -m "feat: official ClickBench 43-query suite over hits_cb via the ope
 - `bench clickbench raw [--iters 3] [--label L]` — plain DataFusion 54 `SessionContext` with `register_parquet`/listing over `bench/datasets/hits/hits_*.parquet` **directly** (no Ukiel anywhere), same 43 queries (the raw files have the original columns, so the upstream file applies with only the same EventDate-class adaptations), same methodology. Report shape identical.
 - `bench clickbench compare --ukiel <label> --raw <label>` (or fold into `run`'s report): per-query `ukiel_ms / raw_ms` ratio table — the stack-overhead number. This is the honest frame: raw DataFusion is the ceiling (same engine, zero catalog/provider/cache), and published ClickBench-DataFusion numbers cross-check the raw runner itself (same file, same engine family — sanity, not identity: hardware and version differ).
 
-- [ ] **Step 1: Implement; verify on the smoke fixture** (ratios computed, report written).
-- [ ] **Step 2: Lint and commit**
+- [x] **Step 1: Implement; verify on the smoke fixture** (ratios computed, report written).
+- [x] **Step 2: Lint and commit**
 
 ```bash
 git commit -m "feat: raw-DataFusion reference runner and per-query overhead ratios"
@@ -113,9 +132,9 @@ git commit -m "feat: raw-DataFusion reference runner and per-query overhead rati
 - The 5 queries adapted from JSON-path form to the flattened columns (each an ADAPTATIONS.md entry — this suite is *structurally* adapted by design, since Ukiel flattened at ingest what JSONBench queries as raw JSON; that is a legitimate system difference every JSONBench participant handles in its own dialect): q1 counts by `collection`; q2 count + `count(DISTINCT did)` where `kind='commit' AND operation='create'` by `collection`; q3 hourly (`ts` epoch-ms arithmetic) distribution for posts/reposts/likes; q4 earliest post `ts` per `did`, top 3; q5 `max(ts)-min(ts)` activity span per `did`, top 3.
 - `bench bluesky jsonbench [--iters 3] [--label L]` — operator session, same methodology/report shape. Runbook: run after `bluesky run --files N` (the fixture is whatever was ingested — the suite reports the fixture row count so results are self-describing).
 
-- [ ] **Step 1: Failing mapper test** (`did` present verbatim + hash unchanged); vendor + adapt queries.
-- [ ] **Step 2: Implement runner; verify** — `--files 1` fixture, all 5 execute with sane shapes (q1 collection counts sum to commit-kind events, q4/q5 return 3 rows).
-- [ ] **Step 3: Lint and commit**
+- [x] **Step 1: Failing mapper test** (`did` present verbatim + hash unchanged); vendor + adapt queries.
+- [x] **Step 2: Implement runner; verify** — `--files 1` fixture, all 5 execute with sane shapes (q1 collection counts sum to commit-kind events, q4/q5 return 3 rows).
+- [x] **Step 3: Lint and commit**
 
 ```bash
 git commit -m "feat: JSONBench 5-query suite over the flattened bsky schema"
@@ -128,9 +147,9 @@ git commit -m "feat: JSONBench 5-query suite over the flattened bsky schema"
 **Files:**
 - Modify: `bench/README.md` (§3 commands, §4 runbook, §6 results, adaptation-log pointers), `docs/notes/2026-07-08-macro-perf.md` (design note: the two-suite structure), `docs/superpowers/plans/2026-07-05-ukiel-v1-roadmap.md` (row 32 → Executed)
 
-- [ ] **Step 1: Full verification** — `cargo fmt --check && cargo clippy --all-targets -- -D warnings && make test`; bench builds in release.
-- [ ] **Step 2: Record the first official numbers** — `clickbench load` (all 100 files) + `clickbench run --label baseline` + `clickbench raw --label baseline` + the ratio table; `bluesky run --files 10` (new fixture with `did`) + `bluesky jsonbench --label baseline`. Machine spec + SHA + **layout state** (compacted or not — post-29 this matters; state which) in the results section, per the bench README's profile-stating rule.
-- [ ] **Step 3: Docs + roadmap row 32 → Executed; commit**
+- [x] **Step 1: Full verification** — `cargo fmt --check && cargo clippy --all-targets -- -D warnings && make test`; bench builds in release.
+- [x] **Step 2: Record the first official numbers** — `clickbench load` (all 100 files) + `clickbench run --label baseline` + `clickbench raw --label baseline` + the ratio table; `bluesky run --files 10` (new fixture with `did`) + `bluesky jsonbench --label baseline`. Machine spec + SHA + **layout state** (compacted or not — post-29 this matters; state which) in the results section, per the bench README's profile-stating rule.
+- [x] **Step 3: Docs + roadmap row 32 → Executed; commit**
 
 ```bash
 git add bench/ docs/ crates/
