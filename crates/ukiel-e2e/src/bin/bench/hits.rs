@@ -692,19 +692,24 @@ async fn partition_run_summary(stack: &Stack, ht: HypertableId) -> anyhow::Resul
     })
 }
 
-/// `bench hits compact [--target-mb N]`: drives compaction + finalization to
-/// quiescence over the loaded `hits` fixture, folding the per-file L1 runs into
-/// one run per day-partition (the plan-17 terminal invariant). This is the
-/// plan-29 exercise at volume — the ~15 GB fold streams in bounded memory where
-/// the retired plan-28 cap once forbade it. With `--target-mb N` the hypertable
-/// switches to `SizeTargeted(N MiB)` placement first, so heavy keys **whale-split**
-/// into dedicated files instead of collapsing into one big packed file per day
-/// (restoring scan parallelism for the whale while the tail still shrinks). Run
-/// `bench hits queries` before and after to quantify the fan-out collapse
-/// (lifts the bench §5 caveat).
-pub async fn compact(target_mb: Option<usize>) -> anyhow::Result<()> {
+/// `bench {hits,clickbench} compact [--target-mb N]`: drives compaction +
+/// finalization to quiescence over `dataset`'s loaded fixture, folding the
+/// per-file L1 runs into one run per day-partition (the plan-17 terminal
+/// invariant). This is the plan-29 exercise at volume — the ~15 GB fold streams
+/// in bounded memory where the retired plan-28 cap once forbade it. With
+/// `--target-mb N` the hypertable switches to `SizeTargeted(N MiB)` placement
+/// first, so heavy keys **whale-split** into dedicated files instead of
+/// collapsing into one big packed file per day (restoring scan parallelism for
+/// the whale while the tail still shrinks). Run the matching read suite before
+/// and after to quantify the fan-out collapse (lifts the bench §5 caveat).
+pub async fn compact(dataset: &Dataset, target_mb: Option<usize>) -> anyhow::Result<()> {
     let stack = Stack::start().await;
-    let ht = stack.catalog.get_hypertable("hits").await?.id;
+    let ht = stack
+        .catalog
+        .get_hypertable(dataset.table)
+        .await
+        .with_context(|| format!("{} not loaded — load it first", dataset.table))?
+        .id;
 
     if let Some(mb) = target_mb {
         let bytes = (mb * 1024 * 1024) as i64;
@@ -717,8 +722,8 @@ pub async fn compact(target_mb: Option<usize>) -> anyhow::Result<()> {
 
     let before = partition_run_summary(&stack, ht).await?;
     println!(
-        "before: {} live parts / {} day-partitions (worst {}/day)",
-        before.parts, before.partitions, before.max_per_partition
+        "{}: before: {} live parts / {} day-partitions (worst {}/day)",
+        dataset.table, before.parts, before.partitions, before.max_per_partition
     );
 
     // finalize_after_secs: 0 — the loaded fixture is quiet by construction, so
@@ -743,12 +748,13 @@ pub async fn compact(target_mb: Option<usize>) -> anyhow::Result<()> {
 
     let after = partition_run_summary(&stack, ht).await?;
     println!(
-        "after:  {} live parts / {} day-partitions (worst {}/day)",
-        after.parts, after.partitions, after.max_per_partition
+        "{}: after:  {} live parts / {} day-partitions (worst {}/day)",
+        dataset.table, after.parts, after.partitions, after.max_per_partition
     );
+    let t = dataset.table;
     println!(
-        "PERF hits/compact/compaction_secs={compaction_secs:.1}\n\
-         PERF hits/compact/finalization_secs={finalization_secs:.1}\n\
+        "PERF {t}/compact/compaction_secs={compaction_secs:.1}\n\
+         PERF {t}/compact/finalization_secs={finalization_secs:.1}\n\
          fan-out collapse: worst {}→{} runs/day-partition (terminal invariant: 1 cold run/partition)",
         before.max_per_partition, after.max_per_partition
     );

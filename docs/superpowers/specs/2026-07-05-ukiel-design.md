@@ -211,12 +211,16 @@ baselines drove their ordering (`bench/README.md` §6). **Streaming merge** (29)
 executed 2026-07-09 — bounded-memory compaction (O(K·batch + row-group) RAM)
 with whale-key splitting; the plan-28 cap is retired and issue 0005 is Resolved.
 
-**Not yet** (roadmap rows; recommended order 32 →
-15 → 16 → 8, then 31 → 22 → 23 → 24; 25/26 gated on design decisions):
-official benchmark suites (32), remaining read-side perf tiers (15/16),
-pipelines & MVs (8 — plan written), streaming-merge phase 2 / slice sealing
-(31), partition coalescing + retention (22), feed horizon (23), egress (24),
-auth (25), horizontal ingest (26).
+**Official benchmark suites** (32) executed 2026-07-12 — ClickBench's 43
+queries and JSONBench's 5, vendored and run whole-table through a new
+**operator (unscoped) session**, with a raw-DataFusion reference runner giving
+every query a `ukiel / raw` ratio (`bench/README.md` §6).
+
+**Not yet** (roadmap rows; recommended order 15 →
+16 → 8, then 31 → 22 → 23 → 24; 25/26 gated on design decisions):
+remaining read-side perf tiers (15/16), pipelines & MVs (8 — plan written),
+streaming-merge phase 2 / slice sealing (31), partition coalescing + retention
+(22), feed horizon (23), egress (24), auth (25), horizontal ingest (26).
 
 Verification philosophy and the scenario catalog (S0–S8, invariants I1–I8)
 live in `docs/superpowers/specs/2026-07-05-ukiel-testing-design.md`; the e2e
@@ -229,6 +233,23 @@ GC hygiene.
 - **Auth on the query endpoint** — `namespace_id` is caller-supplied
   (issue 0001); do not expose to untrusted callers until an authenticated
   principal supplies it.
+- **The operator (unscoped) session** — *added by plan 32*: a library-only
+  `ukiel_query::context::operator_session` builds the ordinary table provider
+  with its isolation slice set to `None`: every live part, **no packing-key
+  predicate**. Catalog pruning, stats pruning, the footer cache, and the
+  declared output ordering are all unchanged — the only difference from a
+  namespace session is the absent isolation filter. It exists because the
+  official benchmark suites (ClickBench, JSONBench) are whole-table while
+  ukiel's product path is namespace-scoped by construction, and bending the
+  benchmarks would have measured something other than what they measure. It is
+  **not reachable from the HTTP server**, and must not become so while issue
+  0001 stands: an unscoped route over a caller-supplied namespace would hand
+  any caller every tenant's data. The invariant is enforced by construction
+  (nothing in `server.rs` references it) and pinned by a test asserting the
+  server source never names it — the one property a runtime test cannot express,
+  since the absence of an unwritten route is not observable at runtime. If
+  operator tooling is ever exposed over the network, it needs its own
+  authenticated, audited surface, not this door.
 - **Statement timeout** — *resolved (plan 19, issue 0002)*: the query
   endpoint wraps planning + execution in a `statement_timeout` (HTTP 408 on
   expiry) and `ukield` refuses to start when a single process runs both the

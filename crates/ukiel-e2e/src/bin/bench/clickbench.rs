@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
-use datafusion::prelude::{ParquetReadOptions, SessionContext};
+use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 
 use crate::hits::HITS_CB;
 use crate::suite::{self, median};
@@ -63,8 +63,20 @@ pub async fn run(iters: usize, label: &str) -> anyhow::Result<()> {
 /// same thing on both sides. Types stay the source's narrow ints: that is the
 /// engine's true ceiling, and the type-widening delta is *logged* in
 /// ADAPTATIONS.md rather than engineered away.
+///
+/// **Parquet reader settings match ukiel's provider exactly** — `pushdown_filters`
+/// and `reorder_filters`, both of which DataFusion leaves *off* by default.
+/// This matters more than it looks: ukiel's provider opts into predicate
+/// pushdown, so a reference running the stock defaults decodes rows for filtered
+/// queries that ukiel skips, inflating the reference and flattering ukiel's ratio
+/// on every query with a `WHERE` clause. Measured: it was worth 14.8x on q24 and
+/// fabricated a "10x faster than DataFusion" result. The ratio must isolate
+/// *ukiel's stack*, not ukiel's choice of a flag the reference could set too.
 async fn raw_session() -> anyhow::Result<SessionContext> {
-    let ctx = SessionContext::new();
+    let mut config = SessionConfig::new();
+    config.options_mut().execution.parquet.pushdown_filters = true;
+    config.options_mut().execution.parquet.reorder_filters = true;
+    let ctx = SessionContext::new_with_config(config);
     let dir = "bench/datasets/hits/";
     let opts = ParquetReadOptions::default().parquet_pruning(true);
     ctx.register_parquet("hits_raw", dir, opts)

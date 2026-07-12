@@ -4870,6 +4870,7 @@ dependencies = [
  "arrow",
  "axum",
  "chrono",
+ "datafusion",
  "flate2",
  "futures",
  "metrics",

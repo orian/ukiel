@@ -33,6 +33,7 @@ USAGE:
     bench hits compact [--target-mb N]
     bench hits queries [--iters N] [--label LABEL]
     bench clickbench load [--files N]
+    bench clickbench compact [--target-mb N]
     bench clickbench run [--iters N] [--label LABEL]        official 43 queries, ukiel stack
     bench clickbench raw [--iters N] [--label LABEL]        same 43, bare DataFusion
     bench clickbench compare --ukiel LABEL --raw LABEL      per-query overhead ratios
@@ -68,6 +69,9 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
         (Some("clickbench"), Some("load")) => {
             hits::load_clickbench(opt_usize(args, "--files")?).await
         }
+        (Some("clickbench"), Some("compact")) => {
+            hits::compact(&hits::HITS_CB, opt_usize(args, "--target-mb")?).await
+        }
         (Some("clickbench"), Some("run")) => {
             let iters = opt_usize(args, "--iters")?.unwrap_or(3);
             let label = opt_str(args, "--label").unwrap_or("baseline");
@@ -87,7 +91,9 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
             anyhow::bail!("unknown `clickbench` subcommand {sub:?}\n\n{USAGE}")
         }
         (Some("hits"), Some("load")) => hits::load(opt_usize(args, "--files")?).await,
-        (Some("hits"), Some("compact")) => hits::compact(opt_usize(args, "--target-mb")?).await,
+        (Some("hits"), Some("compact")) => {
+            hits::compact(&hits::HITS, opt_usize(args, "--target-mb")?).await
+        }
         (Some("hits"), Some("queries")) => {
             let iters = opt_usize(args, "--iters")?.unwrap_or(10);
             let label = opt_str(args, "--label").unwrap_or("baseline");

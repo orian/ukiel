@@ -47,12 +47,24 @@ one from a roadmap row.
 
 ### Benchmarks
 
-Volume-scale benchmarks (ClickBench `hits` reads, Bluesky ndjson write path)
-run against the compose stack via the `bench` binary — runbook, tooling, and
-recorded results in [`bench/README.md`](bench/README.md). Latest headline: the
-process-wide Parquet footer cache (plan 13) cut per-tenant read latency
-**~30–40%** at the 100M-row / 10 GB tier by removing the 67–108-footer-reads
-fan-out floor.
+Volume-scale benchmarks run against the compose stack via the `bench` binary —
+runbook, tooling, and all recorded results in
+[`bench/README.md`](bench/README.md). Two families: ukiel's own per-tenant SaaS
+scenarios (namespace-scoped, through the HTTP endpoint — the product's real query
+shape), and the **official upstream suites** (ClickBench's 43 queries, JSONBench's
+5), vendored with a per-query adaptation log.
+
+**Official headline (2026-07-12):** on ClickBench at 100M rows, ukiel costs
+**~2.1× bare DataFusion 54** — the same engine, same files, same SQL, same
+Parquet reader settings, minus the catalog/provider/cache stack — and beats it on
+nothing. That is the price of admission for the multitenant layer, measured
+rather than asserted, and it is the number to beat. (The reference runner is in
+the repo: `bench clickbench raw` + `bench clickbench compare`, so you can check
+us.)
+
+**House headline:** the process-wide Parquet footer cache (plan 13) cut
+per-tenant read latency **~30–40%** at the 100M-row / 10 GB tier by removing the
+67–108-footer-reads fan-out floor.
 
 ## Requirements
 

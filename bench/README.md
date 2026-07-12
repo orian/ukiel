@@ -1,4 +1,4 @@
-# Macro perf harness (plan 30)
+# Macro perf harness (plans 30 & 32)
 
 Volume-scale benchmarks on real datasets — ClickBench `hits` (read path) and
 Bluesky ndjson (write path) — run manually against the docker-compose stack via
@@ -9,6 +9,25 @@ PB+ intent.
 The harness reuses the e2e `Stack` (real Kafka/Postgres/MinIO, in-process
 ingest/compactor workers, HTTP query server), so it measures the same
 components the e2e suite proves correct.
+
+**Two families of suite, and the difference matters:**
+
+| | what it is | how it queries | plan |
+|---|---|---|---|
+| `hits queries`, `bluesky run` | ukiel's **own** per-tenant SaaS scenarios — the product's actual query shape | namespace-scoped, through the **HTTP endpoint** | 30 |
+| `clickbench`, `bluesky jsonbench` | the **official** upstream suites, vendored | whole-table, through the **unscoped operator session** | 32 |
+
+The official suites answer "how does ukiel do on the benchmark everyone
+publishes?"; the house suites answer "how does ukiel do at the thing it is
+*for*?" Neither substitutes for the other. The official suites are whole-table
+by construction, which ukiel's product path is not — so they run through an
+**operator (unscoped) session** (`ukiel_query::context::operator_session`), a
+library-only door with no tenant isolation that is deliberately unreachable from
+the HTTP server (issue 0001; a test asserts `server.rs` never references it).
+
+Every deviation of a vendored query from its upstream is logged, per query, in
+`bench/queries/<suite>/ADAPTATIONS.md`, with the pristine upstream file kept
+next to it so the adaptation set is a reviewable `diff`, not a claim.
 
 - **Manual-only** — never runs in CI (it moves tens of GB and runs for minutes
   to hours).
@@ -86,10 +105,21 @@ All commands are subcommands of the `bench` binary. Build once implicitly with
 `cargo run --release -p ukiel-e2e --bin bench -- <args>`.
 
 ```
+# House suites (plan 30) — per-tenant, namespace-scoped, via the HTTP endpoint
 bench hits load [--files N]
+bench hits compact [--target-mb N]
 bench hits queries [--iters N] [--label LABEL]
 bench bluesky produce --files N [--topic T]
 bench bluesky run --files N [--wave-files W] [--flush-ms MS] [--label LABEL]
+
+# Official suites (plan 32) — whole-table, via the unscoped operator session
+bench clickbench load [--files N]
+bench clickbench compact [--target-mb N]
+bench clickbench run [--iters N] [--label LABEL]        # 43 queries, ukiel stack
+bench clickbench raw [--iters N] [--label LABEL]        # same 43, bare DataFusion
+bench clickbench compare --ukiel LABEL --raw LABEL      # per-query overhead ratios
+bench bluesky jsonbench [--iters N] [--label LABEL]     # JSONBench's 5 queries
+
 bench --help
 ```
 
@@ -174,6 +204,65 @@ written (a red bench run is a finding).
 
 ---
 
+### The official suites (plan 32)
+
+#### `clickbench load [--files N]`
+
+Loads the same ClickBench parquet into a **second** hypertable, `hits_cb`, whose
+25 columns are named **verbatim** (`"CounterID"`, `"EventTime"`, …) so the
+upstream file's quoted CamelCase identifiers resolve. Separate from `hits` on
+purpose: renaming the plan-30 fixture would invalidate its recorded baselines,
+and the bench results are append-only. Packing key `CounterID`, sort key
+`("CounterID", "EventTime")`, day-split, one L1 commit per input file — same
+loader, different descriptor.
+
+Costs ~10–13 GB in MinIO *alongside* the `hits` fixture (both fit; `make e2e-down`
+wipes everything).
+
+#### `clickbench run|raw [--iters N] [--label LABEL]`
+
+The 43 official queries from `bench/queries/clickbench/queries.sql`:
+
+- **`run`** — through ukiel's full read stack (catalog planning, part pruning,
+  provider, footer cache) via the operator session.
+- **`raw`** — the *same SQL over the same parquet* on **bare DataFusion**, no
+  ukiel at all. Upstream's own harness pins DataFusion 54, which is ukiel's pin,
+  so this is both a reference ceiling and a sanity check against ClickBench's
+  published DataFusion numbers.
+
+Methodology is ClickBench's own: per query, **1 cold run** (fresh session, fresh
+metadata cache) then `--iters` **hot runs** (default 3); the headline is the hot
+minimum. A failing query is recorded and the suite *keeps going*, then the run
+exits non-zero — partial coverage is loud, never silent. Writes
+`bench/results/clickbench-{ukiel,raw}-<label>.json`.
+
+#### `clickbench compare --ukiel LABEL --raw LABEL`
+
+The deliverable: a per-query `ukiel / raw-DataFusion` **ratio** table — the
+measured cost of the catalog/provider/cache stack over the bare engine on
+identical queries and data. Refuses to compare runs whose fixtures differ in row
+count, and fails if the two engines ever returned *different row counts* for the
+same query (they disagree on the answer, so the timings are not comparable).
+
+#### `bluesky jsonbench [--iters N] [--label LABEL]`
+
+JSONBench's 5 Bluesky queries over whatever `bluesky run` last ingested (the
+report records the fixture's row count, so results are self-describing). Same
+cold/hot methodology.
+
+Requires a `bsky` fixture carrying the `did` column (added in plan 32 — q2/q4/q5
+group by the account); an older fixture is rejected with an explicit re-produce
+instruction rather than silently answering a different question.
+
+> **What this suite does and does not claim.** JSONBench measures *querying raw
+> JSON*; ukiel flattens the event at ingest, so it queries typed columns. That
+> is a real, declared system difference — a JSON-native engine does strictly more
+> work per row here than we do. Read the numbers as *ukiel answering JSONBench's
+> questions*, not as a like-for-like JSON-extraction benchmark. Full reasoning:
+> `bench/queries/jsonbench/ADAPTATIONS.md`.
+
+---
+
 ## 4. Runbook
 
 ```bash
@@ -191,6 +280,28 @@ cargo run --release -p ukiel-e2e --bin bench -- bluesky run --files 10 --label b
 #   → PERF lines + bench/results/bsky-run-baseline.json
 
 make e2e-down                                            # wipe volumes
+```
+
+Official suites (plan 32) — same datasets, no extra download:
+
+```bash
+B="cargo run --release -p ukiel-e2e --bin bench --"
+
+# ClickBench: load the verbatim-named fixture, run ukiel + the raw reference,
+# then diff them. Both runs must see the same data for the ratios to mean
+# anything, so load once and run both against it.
+$B clickbench load                                       # → hits_cb (~100M rows)
+$B clickbench run  --label loaded                        # ukiel, uncompacted
+$B clickbench raw  --label loaded                        # bare DataFusion
+$B clickbench compare --ukiel loaded --raw loaded        # the ratio table
+
+$B clickbench compact                                    # fold to 1 run/day
+$B clickbench run  --label compacted                     # ukiel, compacted
+$B clickbench compare --ukiel compacted --raw loaded     # raw is layout-free
+
+# JSONBench: needs a bsky fixture with the `did` column.
+$B bluesky run --files 10 --label baseline
+$B bluesky jsonbench --label baseline
 ```
 
 Big tiers: `bluesky run --files 100 --wave-files 10` (100M with bounded Kafka
@@ -268,6 +379,22 @@ comparisons stay local.
 - **Historical timestamps.** Bluesky events are from 2023+, so the run widens
   `max_event_age_days` (like the e2e Stack) to keep the event-time rail (issue
   0004) from rejecting them.
+- **"Cold" is only cold at the ukiel layer** (official suites). A fresh session
+  drops the parquet footer/metadata cache, so footers are re-read — but MinIO
+  and the OS page cache still hold the object bytes. Our cold numbers are
+  therefore optimistic relative to a true cold-storage read, exactly as
+  ClickBench's are on a repeat run. The hot minimum is the headline for this
+  reason.
+- **The `ukiel / raw` ratio is not purely "stack overhead."** Ukiel's type
+  system has no integer narrower than `int64`, so `hits_cb` widens the source's
+  `Int16`/`Int32`/`UInt16` columns; ukiel reads more bytes per row than the raw
+  engine does for the same column. Part of any ratio above 1 is that widening.
+  Stated in full — with the other type-level deltas — in
+  `bench/queries/clickbench/ADAPTATIONS.md`.
+- **JSONBench q3's row count scales with the fixture.** One Bluesky file spans
+  ~14 minutes, so a 1-file fixture puts every event in a single UTC hour bucket
+  and q3 ("when do people use Bluesky") returns 3 rows, not 72. Not a bug — the
+  suite reports the fixture's row count so results are self-describing.
 
 ---
 
@@ -615,6 +742,152 @@ Reproduce: `bench hits load && bench hits queries --label post-29` (loaded),
 then a fresh `hits load && bench hits compact --target-mb 16 && bench hits
 queries --label post-29-sizetargeted`. Bluesky: `bench/bench.sh post-29 plan14
 --skip-hits`.
+
+### OFFICIAL SUITES — plan 32 (ClickBench 43 + JSONBench 5), 2026-07-12
+
+SHA `9ba98b2`, same machine (AMD Ryzen AI 9 HX 370, 24 threads, 91 GB RAM,
+NVMe), tuned profile, compose stack local. **First official numbers.**
+
+Fixture: `hits_cb`, all 100 ClickBench files → **99,997,497 rows** (exactly
+ClickBench's official count), 25 verbatim-named columns, 1,102 live parts across
+22 day-partitions.
+
+#### ClickBench 43 — ukiel vs bare DataFusion
+
+Hot minimum per query (ClickBench's own methodology: 1 cold + 3 hot). The
+reference is **the same SQL over the same parquet on bare DataFusion 54** — the
+version upstream's own harness pins, which is ours — **with the same Parquet
+reader settings** (see the methodology note below). So the ratio is the price of
+ukiel's stack — catalog planning, provider, part pruning, footer cache — over the
+engine's own ceiling, and nothing else.
+
+| layout | total (sum of 43 hot minima) | vs raw | median per-query ratio |
+|---|---|---|---|
+| raw DataFusion (reference) | **24.7 s** | 1.00× | 1.00× |
+| ukiel, loaded (1,102 parts) | 53.4 s | **2.16×** | 2.28× |
+| ukiel, packed-compacted (22 parts) | 52.4 s | **2.12×** | 2.51× |
+| ukiel, SizeTargeted 16 MiB (667 parts) | 52.9 s | **2.14×** | **2.20×** |
+
+**Ukiel costs ~2.1× the bare engine on the official suite, and beats it on
+nothing.** That is the headline, and it is not a flattering one. For a system
+that adds a Postgres catalog, per-part planning, an isolation-capable provider
+and a cache layer on top of DataFusion — and that widens every integer to `int64`
+because it has no narrower type (ADAPTATIONS.md) — 2.1× is the honest price of
+admission. It is the number to beat, and we are not going to round it away.
+
+> **Methodology note — the confounder we found and killed.** The first raw
+> reference ran DataFusion's *stock* Parquet settings, where `pushdown_filters`
+> is **off by default**; ukiel's provider turns it **on**. That single flag was
+> worth **14.8×** on q24 (raw 2958 ms → 199 ms) and inflated the reference on
+> every query with a `WHERE` clause — which had made ukiel look *10× faster than
+> DataFusion* on q24. It was never a ukiel win; it was a misconfigured opponent.
+> The reference now matches ukiel's reader settings exactly, the "ukiel faster"
+> column is empty, and the totals above are the corrected ones. If you take one
+> methodological lesson from this file, take that one.
+
+**No layout dominates** — and the three-way trade is the interesting result:
+
+| query | loaded | packed | sized | raw | what it is |
+|---|---|---|---|---|---|
+| q01 | 60.2 | **4.8** | 39.0 | 1.0 | `COUNT(*)` |
+| q02 | 271 | **95** | 183 | 14.3 | `COUNT(*) WHERE AdvEngineID <> 0` |
+| q08 | 291 | **115** | 198 | 16.7 | `GROUP BY AdvEngineID` |
+| q24 | 1422 | **290** | 2798 | 199 | `SELECT * … ORDER BY EventTime LIMIT 10` |
+| q25 | 174 | 580 | **123** | 64.8 | `ORDER BY EventTime LIMIT 10` |
+| q27 | 187 | 992 | **152** | 95.8 | `ORDER BY EventTime, SearchPhrase LIMIT 10` |
+| q28 | 2745 | 4700 | **2722** | 1255 | `GROUP BY CounterID HAVING count > 100000` |
+| q37 | **63.8** | 138 | 76.2 | 59.4 | `CounterID = 62 AND EventDate BETWEEN …` |
+| q43 | 22.1 | 39.3 | **19.8** | 16.0 | `DATE_TRUNC('minute', …)` on one counter |
+
+Readings:
+
+- **Compaction is not a free win on a whole-table suite; packed placement trades
+  pruning and parallelism for file count.** Folding 1,102 parts into 22 (one run
+  per day) makes the scan-everything aggregates dramatically faster — fewer
+  footers to open, q01 **12.5×** — but it *costs* the TopK and key-filtered
+  queries (q27 **5.3× slower**, q25 3.3×, q37 2.2×). Two mechanisms, both
+  structural: 22 files means 22-way scan parallelism on a 24-thread box (was
+  1,102-way), and each day-part now spans **every** `CounterID`, so catalog
+  part-pruning by packing key — the thing that made q37–q43 cheap — has nothing
+  left to prune. Same failure mode plan 29 found on the whale tenant.
+- **SizeTargeted repairs every packed regression and gives back most of the
+  wins.** q27 992 → **152 ms** (better than uncompacted), q25 580 → **123**, q28
+  and q37–q43 all back to loaded-or-better; the heavy key splits into 64
+  dedicated slices while the tail still collapses to 14. It pays for that with
+  the whole-table aggregates (q01 4.8 → 39, q24 290 → 2798: 667 files is a lot
+  of footers when the query must read all of them). **Net: the best median ratio
+  of the three (2.20×) and within 1% of the others on total** — the balanced
+  posture, and the one to run in a multitenant deployment, where the queries that
+  matter are key-filtered.
+- **The worst ratios are aggregates ukiel could answer from its own catalog and
+  doesn't.** q07 (`MIN("EventDate"), MAX("EventDate")`) is **78× slower** than
+  raw (78.7 ms vs 1.0 ms): DataFusion reads it straight out of the Parquet column
+  statistics without touching a row group. Ukiel *stores those exact min/max
+  values in Postgres* (`parts.column_stats`, plan 12) and scans anyway. Same
+  shape for q01 `COUNT(*)` (the catalog has `row_count` per part — 1.0 ms of
+  arithmetic it currently pays 4.8–60 ms of I/O for). **A catalog-level aggregate
+  pushdown would make these near-instant on data that is already in Postgres.**
+  Filed as [issue 0010](../docs/issues/0010-aggregates-rescan-what-the-catalog-already-knows.md);
+  no roadmap row claims it yet.
+- **Cold ≈ hot once compacted** (median cold/hot 1.03× vs 1.15× loaded): with 22
+  footers instead of 1,102 there is almost nothing left for the metadata cache to
+  save. Plan 13's cache earns its keep exactly where fan-out is high — which is
+  the uncompacted state, and the steady state of a live ingesting table.
+
+#### JSONBench 5 — Bluesky, 9,999,994 rows
+
+Hot minimum, one live part (post-finalization), after `bluesky run --files 10`:
+
+| query | | ms |
+|---|---|---|
+| q1 | top event types | **32.8** |
+| q2 | + unique users per type (`count(DISTINCT did)`) | **232.4** |
+| q3 | hourly distribution (post/repost/like) | **133.1** |
+| q4 | top 3 post veterans (earliest post per did) | **124.0** |
+| q5 | top 3 by activity span | **132.6** |
+
+> These are **not** comparable to published JSONBench numbers, and the honest
+> reason is in `bench/queries/jsonbench/ADAPTATIONS.md`: JSONBench measures
+> querying *raw JSON*, and ukiel flattened those fields into typed columns at
+> ingest. A JSON-native engine does strictly more work per row here than we do.
+> The suite answers "can ukiel answer JSONBench's questions, and how fast" —
+> not "is ukiel faster at JSON extraction."
+
+**Write path (`bluesky run --files 10`), post-29 → plan-32 fixture:**
+
+| metric | post-29 | plan-32 (`did` added) | Δ |
+|---|---|---|---|
+| produce rate | 219.0k rows/s | 206.4k rows/s | **−5.8%** |
+| finalization | 7.3 s | 8.1 s | +11% |
+| stored rows | 9,999,994 ✓ | 9,999,994 ✓ | exactly-once held |
+
+The write-path cost is **expected and attributable**: plan 32 added the `did`
+utf8 column (~32 bytes/row on a 7-column row) so the suite could group by
+account. It is a *fixture* change, not a code regression — but it is a real cost
+and it is recorded rather than waved off as noise.
+
+**Compaction of `hits_cb` (the 25-column fixture), for reference:**
+
+| placement | parts | fold time | heavy-key fan-out | median/light fan-out |
+|---|---|---|---|---|
+| Packed (default) | 1,102 → **22** (1 run/day) | 131 s | 84 → 14 | 84 → 14 |
+| SizeTargeted(16 MiB) | 1,102 → **667** | 149 s | 84 → **64** (whale-split) | 84 → **14** |
+
+Reproduce:
+
+```bash
+B="cargo run --release -p ukiel-e2e --bin bench --"
+$B clickbench load && $B clickbench run --label loaded && $B clickbench raw --label loaded
+$B clickbench compare --ukiel loaded --raw loaded
+$B clickbench compact && $B clickbench run --label compacted        # packed
+$B clickbench compare --ukiel compacted --raw loaded
+# sized needs a fresh load (compaction is not reversible):
+make e2e-down && make e2e-up
+$B clickbench load && $B clickbench compact --target-mb 16 && $B clickbench run --label sized
+$B clickbench compare --ukiel sized --raw loaded
+# JSONBench:
+$B bluesky run --files 10 --label plan32 && $B bluesky jsonbench --label plan32
+```
 
 ### 100M / 1B tiers — optional / stretch
 

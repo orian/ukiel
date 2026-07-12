@@ -101,3 +101,21 @@ in the JSON report.
 metadata cache, so footers are re-read. It does *not* drop MinIO's or the OS's page cache, so the
 object bytes may still be in memory. Our cold numbers are therefore optimistic relative to a
 true cold-storage read, in the same way ClickBench's are on a repeat run.
+
+### The raw reference must use ukiel's Parquet reader settings
+
+`raw_session()` sets `pushdown_filters` and `reorder_filters` to `true`, because **ukiel's
+provider does** (`ParquetSource::with_pushdown_filters(true)`), and DataFusion leaves both
+**off by default**.
+
+This is not a detail. The first version of this reference ran the stock defaults, and the
+resulting comparison was *wrong in ukiel's favour*: on q24 (`SELECT * … WHERE "URL" LIKE
+'%google%' …`) the reference took **2958 ms** where the correctly-configured one takes **199 ms**
+— a 14.8× handicap — which made ukiel appear **10× faster than bare DataFusion**. It was not.
+Ukiel had simply enabled a flag the opponent had not, and every query with a `WHERE` clause was
+quietly tilted the same way.
+
+The ratio is supposed to isolate **ukiel's stack** — catalog, provider, pruning, cache — not
+ukiel's choice of a DataFusion setting that the reference is equally free to set. Any future
+change to the provider's reader configuration must be mirrored here, or the number stops meaning
+what it claims to mean.
