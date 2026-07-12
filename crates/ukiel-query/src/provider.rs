@@ -29,6 +29,7 @@ use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::scalar::ScalarValue;
+use datafusion_datasource_parquet::ParquetAccessPlan;
 use ukiel_catalog::PostgresCatalog;
 use ukiel_core::{Hypertable, TableColumns};
 
@@ -110,6 +111,53 @@ fn part_excludes_key(part: &ukiel_core::Part, key: i64) -> bool {
         .and_then(|v| v.as_str())
         .and_then(|encoded| ukiel_core::stats::bitmap_contains(encoded, key))
         .is_some_and(|present| !present)
+}
+
+/// A per-file `ParquetAccessPlan` skipping every row group whose catalog-stored
+/// key span provably excludes `key` (plan 16, Tier-2 #6).
+///
+/// `None` means "no plan" — read the file the normal way. That covers a part
+/// with no spans (everything written before plan 16), malformed spans (wrong
+/// arity, non-integer bounds), and the *every group survives* case, where a plan
+/// would be a no-op with extra allocation.
+///
+/// `Some(plan)` where every group is skipped is possible and is handled by the
+/// caller, which drops the file from the scan entirely rather than opening it to
+/// read nothing.
+///
+/// Safety: the spans come from the file's own row-group statistics, so a skip is
+/// proven, not guessed. DataFusion *reduces* a supplied plan further with its own
+/// predicate and statistics pruning — it never widens one — so an over-broad plan
+/// costs only performance, and the isolation `FilterExec` sits above the scan
+/// regardless.
+fn access_plan_for(part: &ukiel_core::Part, key: i64) -> Option<ParquetAccessPlan> {
+    let spans = part
+        .meta
+        .column_stats
+        .as_ref()?
+        .get(ukiel_core::stats::KEY_ROW_GROUPS_STAT)?
+        .as_array()?;
+    if spans.is_empty() {
+        return None;
+    }
+
+    let mut plan = ParquetAccessPlan::new_all(spans.len());
+    let mut skipped = 0usize;
+    for (i, span) in spans.iter().enumerate() {
+        // Malformed spans are positional poison: we cannot trust *any* index if
+        // one entry is wrong, so bail out entirely rather than skip a guess.
+        let (Some(lo), Some(hi)) = (
+            span.get(0).and_then(serde_json::Value::as_i64),
+            span.get(1).and_then(serde_json::Value::as_i64),
+        ) else {
+            return None;
+        };
+        if key < lo || key > hi {
+            plan.skip(i);
+            skipped += 1;
+        }
+    }
+    (skipped > 0).then_some(plan)
 }
 
 pub struct UkielTableProvider {
@@ -208,14 +256,30 @@ impl TableProvider for UkielTableProvider {
         // `None` and keep the part — plus the isolation `FilterExec` below,
         // which is the correctness boundary no matter what pruning decides.
         // Scoped mode only: the operator session has no key to test against.
-        let files: Vec<PartitionedFile> = parts
-            .iter()
-            .filter(|p| match self.slice {
-                Some(key) => !part_excludes_key(p, key),
-                None => true,
-            })
-            .map(|p| PartitionedFile::new(p.meta.path.clone(), p.meta.size_bytes as u64))
-            .collect();
+        //
+        // Surviving parts additionally get a catalog-driven `ParquetAccessPlan`
+        // (plan 16, #6): the row-group key spans let us pre-skip groups without
+        // reading the footer at all. DataFusion only ever *reduces* a supplied
+        // plan further, so this composes with predicate and statistics pruning.
+        let mut files: Vec<PartitionedFile> = Vec::with_capacity(parts.len());
+        for p in &parts {
+            let file = PartitionedFile::new(p.meta.path.clone(), p.meta.size_bytes as u64);
+            let Some(key) = self.slice else {
+                files.push(file);
+                continue;
+            };
+            if part_excludes_key(p, key) {
+                continue; // the bitmap proves this part holds none of the key's rows
+            }
+            match access_plan_for(p, key) {
+                // Every row group provably excludes the key: don't open the file
+                // at all. Cheaper than handing the reader an all-skip plan, and
+                // it keeps the plan's semantics trivially sound.
+                Some(plan) if plan.row_group_indexes().is_empty() => continue,
+                Some(plan) => files.push(file.with_extension(plan)),
+                None => files.push(file),
+            }
+        }
 
         // Requested query-schema indices (SELECT * when DataFusion sends none).
         let indices: Vec<usize> = match projection {

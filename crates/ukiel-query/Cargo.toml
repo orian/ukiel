@@ -8,6 +8,7 @@ ukiel-core = { workspace = true }
 ukiel-catalog = { workspace = true }
 ukiel-expr = { workspace = true }
 datafusion = { workspace = true }
+datafusion-datasource-parquet = { workspace = true }
 lru = { workspace = true }
 object_store = { workspace = true }
 axum = { workspace = true }
@@ -25,6 +26,9 @@ metrics = { workspace = true }
 
 [dev-dependencies]
 ukiel-ingest = { workspace = true }
+# Plan 16: the span test writes its fixture with the real key-aligned writer, so
+# the file and the catalog spans cannot drift apart in the test.
+ukiel-compactor = { workspace = true }
 testcontainers-modules = { workspace = true }
 tempfile = { workspace = true }
 reqwest = { workspace = true }

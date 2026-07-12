@@ -23,6 +23,11 @@ bytes = "1"
 futures = "0.3"
 tokio-util = "0.7"
 datafusion = "54"
+# Plan 16: `ParquetAccessPlan` (the external-index mechanism) is NOT re-exported
+# by the datafusion facade in 54.0.0 — it lives here. Same version, so cargo
+# unifies it with the copy datafusion already pulls in; a drifting pin would
+# produce two distinct types and a baffling error.
+datafusion-datasource-parquet = "54"
 axum = "0.8"
 async-trait = "0.1"
 url = "2"

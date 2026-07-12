@@ -1198,3 +1198,169 @@ async fn bitmap_prunes_a_sparse_in_range_tenant_to_zero_files() {
         .unwrap();
     assert_eq!(all_strings(&batches, "payload"), vec!["a1", "a2"]);
 }
+
+/// Plan 16 #6: catalog row-group key spans become a `ParquetAccessPlan`.
+///
+/// **What this test can and cannot show.** For a *partial* skip, DataFusion's
+/// own statistics pruning reaches the same answer once it has read the footer,
+/// and its metrics do not distinguish "the provider skipped this group" from
+/// "statistics pruned it" — so a partial-skip assertion would pass with the
+/// feature disabled and prove nothing (verified: it does). The access plan's
+/// real value there is the *cold* path — deciding without reading the footer at
+/// all — which no metric exposes. That gap is recorded in the perf note rather
+/// than papered over with a test that only looks convincing.
+///
+/// What IS observable, and what this test pins: when the spans prove *every*
+/// row group excludes the key, the provider drops the file from the scan
+/// entirely — zero files planned. Statistics pruning cannot do that, because it
+/// must open the file to find out.
+#[tokio::test]
+async fn catalog_spans_preskip_row_groups() {
+    use datafusion::arrow::array::{Int64Array, StringArray};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use object_store::ObjectStoreExt;
+
+    let h = setup().await;
+    let store_url = url::Url::parse(STORE_URL).unwrap();
+
+    let schema = Arc::new(
+        ukiel_core::arrow_schema_from_json(&json!({"fields": [
+            {"name": "tenant_id", "type": "int64"},
+            {"name": "ts", "type": "timestamp_ms"},
+            {"name": "payload", "type": "utf8"}
+        ]}))
+        .unwrap(),
+    );
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1i64, 1, 2, 2])),
+            Arc::new(Int64Array::from(vec![10i64, 20, 30, 40])),
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+        ],
+    )
+    .unwrap();
+
+    // The real key-aligned writer produces the file AND the spans that go in the
+    // catalog, so the two cannot drift apart in this test.
+    let sort_key = vec!["tenant_id".to_string(), "ts".to_string()];
+    let opts = ukiel_core::WriteOpts {
+        level: 1,
+        ts_column: Some("ts".to_string()),
+        bloom_columns: vec![],
+        max_row_group_rows: 2, // one row group per key
+    };
+    let (bytes, spans) = ukiel_compactor::rewrite::batch_to_parquet_key_aligned(
+        &batch,
+        "tenant_id",
+        &sort_key,
+        &opts,
+    )
+    .unwrap();
+    let spans = spans.expect("the key-aligned writer records spans");
+    assert_eq!(spans, json!([[1, 1], [2, 2]]), "one row group per key");
+
+    let ht2 = h
+        .catalog
+        .create_hypertable(
+            "spans",
+            &json!({"fields": [
+                {"name": "tenant_id", "type": "int64"},
+                {"name": "ts", "type": "timestamp_ms"},
+                {"name": "payload", "type": "utf8"}
+            ]}),
+            &json!({"columns": []}),
+            &sort_key,
+            "tenant_id",
+        )
+        .await
+        .unwrap();
+    for ns in [1i64, 2, 9] {
+        h.catalog
+            .create_logical_table(NamespaceId(ns), "spans", ht2)
+            .await
+            .unwrap();
+    }
+
+    let path = format!("ht/{ht2}/L1/aligned.parquet");
+    let size = bytes.len() as i64;
+    h.store
+        .put(&Path::from(path.clone()), bytes.into())
+        .await
+        .unwrap();
+    h.catalog
+        .commit(
+            ht2,
+            CommitOp::Add {
+                parts: vec![PartMeta {
+                    path,
+                    partition_values: json!({}),
+                    // The claimed range is deliberately wide: key 9 is inside it,
+                    // so range pruning keeps the part and only the SPANS can
+                    // eliminate it. No bitmap here, so this isolates the access
+                    // plan from the plan-16 bitmap path.
+                    packing_key_min: 1,
+                    packing_key_max: 100,
+                    row_count: 4,
+                    size_bytes: size,
+                    level: 1,
+                    column_stats: ukiel_core::stats::with_key_index(None, None, Some(spans)),
+                }],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let session = async |ns: i64| {
+        session_for_namespace(
+            &h.catalog,
+            NamespaceId(ns),
+            h.store.clone(),
+            &store_url,
+            test_metadata_cache(),
+        )
+        .await
+        .unwrap()
+    };
+
+    // Correctness under a partial skip: row group 1 is pre-skipped, and the rows
+    // that survive are exactly key 1's. An access plan that lost rows would show
+    // up here.
+    let ctx = session(1).await;
+    let batches = ctx
+        .sql("SELECT payload FROM spans ORDER BY ts")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(all_strings(&batches, "payload"), vec!["a", "b"]);
+
+    // The observable win: key 9 is inside the part's claimed range [1, 100] but
+    // no row group's span contains it, so the file is never planned. Statistics
+    // pruning would have had to open it to learn that.
+    let ctx = session(9).await;
+    let plan = ctx
+        .sql("EXPLAIN SELECT count(*) FROM spans")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let text = datafusion::arrow::util::pretty::pretty_format_batches(&plan)
+        .unwrap()
+        .to_string();
+    assert!(
+        !text.contains(".parquet"),
+        "spans exclude every row group: the file must not be planned at all, got:\n{text}"
+    );
+    let batches = ctx
+        .sql("SELECT count(*) AS n FROM spans")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(all_i64(&batches, "n"), vec![0]);
+}
