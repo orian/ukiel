@@ -96,6 +96,22 @@ fn extract_int64_ranges(
         .collect()
 }
 
+/// Whether the part's key bitmap *proves* it holds no rows for `key`.
+///
+/// Only a decodable bitmap that answers `false` licenses a skip. Every other
+/// state — no `column_stats`, no bitmap entry, a non-string value, an
+/// undecodable blob, a negative key — is undecidable and keeps the part. Pruning
+/// may only ever remove what it can prove is absent.
+fn part_excludes_key(part: &ukiel_core::Part, key: i64) -> bool {
+    part.meta
+        .column_stats
+        .as_ref()
+        .and_then(|s| s.get(ukiel_core::stats::PACKING_KEYS_STAT))
+        .and_then(|v| v.as_str())
+        .and_then(|encoded| ukiel_core::stats::bitmap_contains(encoded, key))
+        .is_some_and(|present| !present)
+}
+
 pub struct UkielTableProvider {
     catalog: PostgresCatalog,
     hypertable: Hypertable,
@@ -181,8 +197,23 @@ impl TableProvider for UkielTableProvider {
             .live_parts_pruned(self.hypertable.id, self.slice, &ranges)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // Plan 16: min/max ranges are conservative — a part spanning keys
+        // 100..4500 "contains" a tenant that owns no rows in it, and the scan
+        // opens the file to find nothing. The packing-key bitmap makes this
+        // exact: drop a part only when it *proves* the key is absent.
+        //
+        // Exactness is the bitmap's job; safety is the keep-by-default rule —
+        // a missing index, an undecodable one, or a negative key all yield
+        // `None` and keep the part — plus the isolation `FilterExec` below,
+        // which is the correctness boundary no matter what pruning decides.
+        // Scoped mode only: the operator session has no key to test against.
         let files: Vec<PartitionedFile> = parts
             .iter()
+            .filter(|p| match self.slice {
+                Some(key) => !part_excludes_key(p, key),
+                None => true,
+            })
             .map(|p| PartitionedFile::new(p.meta.path.clone(), p.meta.size_bytes as u64))
             .collect();
 

@@ -1027,3 +1027,174 @@ fn server_never_references_operator_session() {
          HTTP path is namespace-scoped, and the namespace is caller-supplied"
     );
 }
+
+/// Plan 16, the headline: a tenant whose key falls *inside* a part's min/max but
+/// owns no rows in it gets **zero object-store requests**.
+///
+/// Range pruning cannot see this — a part spanning keys 1..4500 "contains" 300,
+/// so today the scan opens the file to find nothing. The packing-key bitmap makes
+/// the decision exact, and the file is never opened.
+///
+/// The degradation rule is pinned right next to it: a part whose stats carry no
+/// bitmap (every file written before this plan) is still scanned. Pruning may
+/// only remove what it can *prove* is absent.
+#[tokio::test]
+async fn bitmap_prunes_a_sparse_in_range_tenant_to_zero_files() {
+    use ukiel_core::stats::{key_bitmap, with_key_index};
+
+    let h = setup().await;
+    let store_url = url::Url::parse(STORE_URL).unwrap();
+
+    // The seeded `events` fixture has one packed part (keys 1,2) and one
+    // dedicated part (key 2). Widen the packed part's claimed key range to
+    // 1..4500 and give it a real bitmap over {1, 2} — the shape a production
+    // packed file has: a wide range, a sparse key set.
+    let schema = ukiel_core::arrow_schema_from_json(&json!({"fields": [
+        {"name": "tenant_id", "type": "int64"},
+        {"name": "ts", "type": "timestamp_ms"},
+        {"name": "payload", "type": "utf8"}
+    ]}))
+    .unwrap();
+    let part = ukiel_ingest::rows_to_parquet(
+        &schema,
+        "tenant_id",
+        "ts",
+        &["tenant_id".to_string(), "ts".to_string()],
+        vec![
+            json!({"tenant_id": 1, "ts": 100, "payload": "a1"}),
+            json!({"tenant_id": 2, "ts": 150, "payload": "b1"}),
+        ],
+    )
+    .unwrap();
+
+    let batch = {
+        // Rebuild the batch to hand `key_bitmap` the exact rows written.
+        use datafusion::arrow::array::{Int64Array, StringArray};
+        use datafusion::arrow::record_batch::RecordBatch;
+        RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2])),
+                Arc::new(Int64Array::from(vec![100i64, 150])),
+                Arc::new(StringArray::from(vec!["a1", "b1"])),
+            ],
+        )
+        .unwrap()
+    };
+    let bitmap = key_bitmap(&batch, "tenant_id").expect("bitmap over {1,2}");
+
+    let ht2 = h
+        .catalog
+        .create_hypertable(
+            "sparse",
+            &json!({"fields": [
+                {"name": "tenant_id", "type": "int64"},
+                {"name": "ts", "type": "timestamp_ms"},
+                {"name": "payload", "type": "utf8"}
+            ]}),
+            &json!({"columns": []}),
+            &["tenant_id".to_string(), "ts".to_string()],
+            "tenant_id",
+        )
+        .await
+        .unwrap();
+    for ns in [1i64, 2, 300] {
+        h.catalog
+            .create_logical_table(NamespaceId(ns), "sparse", ht2)
+            .await
+            .unwrap();
+    }
+
+    let path = format!("ht/{ht2}/L1/sparse.parquet");
+    let size = part.bytes.len() as i64;
+    h.store
+        .put(&Path::from(path.clone()), part.bytes.into())
+        .await
+        .unwrap();
+    h.catalog
+        .commit(
+            ht2,
+            CommitOp::Add {
+                parts: vec![PartMeta {
+                    path,
+                    partition_values: json!({}),
+                    // A wide claimed range: 300 is inside it, so range pruning
+                    // keeps this part. Only the bitmap knows better.
+                    packing_key_min: 1,
+                    packing_key_max: 4500,
+                    row_count: 2,
+                    size_bytes: size,
+                    level: 1,
+                    column_stats: with_key_index(None, Some(bitmap.clone()), None),
+                }],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let session = async |ns: i64| {
+        session_for_namespace(
+            &h.catalog,
+            NamespaceId(ns),
+            h.store.clone(),
+            &store_url,
+            test_metadata_cache(),
+        )
+        .await
+        .unwrap()
+    };
+
+    // Namespace 300: in range, absent from the bitmap → no file is planned at
+    // all. This is the zero-object-store-request headline.
+    let ctx = session(300).await;
+    let plan = ctx
+        .sql("EXPLAIN SELECT count(*) FROM sparse")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let text = datafusion::arrow::util::pretty::pretty_format_batches(&plan)
+        .unwrap()
+        .to_string();
+    assert!(
+        !text.contains(".parquet"),
+        "a sparse in-range tenant must plan zero files, got:\n{text}"
+    );
+    let batches = ctx
+        .sql("SELECT count(*) AS n FROM sparse")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(all_i64(&batches, "n"), vec![0]);
+
+    // The tenants that *are* in the bitmap still see exactly their rows —
+    // isolation re-asserted next to the new pruning path.
+    for (ns, expected) in [(1i64, "a1"), (2, "b1")] {
+        let ctx = session(ns).await;
+        let batches = ctx
+            .sql("SELECT payload FROM sparse")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(all_strings(&batches, "payload"), vec![expected]);
+    }
+
+    // Degradation pin: the seeded `events` parts carry `column_stats: None`
+    // (every file written before plan 16 does). They must still be scanned —
+    // absence of an index is not evidence of absence of rows.
+    let ctx = session(1).await;
+    let batches = ctx
+        .sql("SELECT payload FROM events ORDER BY ts")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(all_strings(&batches, "payload"), vec!["a1", "a2"]);
+}
