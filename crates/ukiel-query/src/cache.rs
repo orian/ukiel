@@ -15,7 +15,7 @@ use object_store::path::Path;
 use object_store::{
     Attributes, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
     ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload,
-    PutResult, Result,
+    PutResult, Result, UploadPart,
 };
 
 /// Tuning knobs for [`CachingObjectStore`]; `Default` is the production
@@ -120,6 +120,68 @@ impl CachingObjectStore {
     }
 }
 
+/// Tees a multipart upload into a local tmp file (positioned writes, so
+/// out-of-order part completion is harmless), renamed into the cache only
+/// after the inner upload completes. Best-effort throughout: a tee failure
+/// poisons the prewarm (tmp removed at complete), never the upload.
+#[derive(Debug)]
+struct PrewarmingUpload {
+    inner: Box<dyn MultipartUpload>,
+    file: Arc<std::fs::File>,
+    tmp: PathBuf,
+    dest: PathBuf,
+    /// Next part's byte offset — parts arrive in call order.
+    offset: u64,
+    poisoned: Arc<std::sync::atomic::AtomicBool>,
+    finished: bool,
+}
+
+#[async_trait]
+impl MultipartUpload for PrewarmingUpload {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        let bytes = Bytes::from(data.clone());
+        let offset = self.offset;
+        self.offset += bytes.len() as u64;
+        let file = self.file.clone();
+        let poisoned = self.poisoned.clone();
+        let inner_part = self.inner.put_part(data);
+        Box::pin(async move {
+            use std::os::unix::fs::FileExt;
+            if file.write_all_at(&bytes, offset).is_err() {
+                poisoned.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            inner_part.await
+        })
+    }
+
+    async fn complete(&mut self) -> Result<PutResult> {
+        // Inner first: the upload is authoritative, the prewarm is a bonus.
+        let result = self.inner.complete().await?;
+        self.finished = true;
+        if self.poisoned.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = std::fs::remove_file(&self.tmp);
+        } else if std::fs::rename(&self.tmp, &self.dest).is_ok() {
+            metrics::counter!("cache_prewarms_total", "kind" => "multipart").increment(1);
+        }
+        Ok(result)
+    }
+
+    async fn abort(&mut self) -> Result<()> {
+        self.finished = true;
+        let _ = std::fs::remove_file(&self.tmp);
+        self.inner.abort().await
+    }
+}
+
+impl Drop for PrewarmingUpload {
+    fn drop(&mut self) {
+        // Errored merge: writer dropped mid-stream. No tmp litter.
+        if !self.finished {
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+    }
+}
+
 fn io_err(e: std::io::Error) -> object_store::Error {
     object_store::Error::Generic {
         store: "ukiel-cache",
@@ -170,12 +232,34 @@ impl ObjectStore for CachingObjectStore {
         Ok(result)
     }
 
+    /// Streaming uploads (plan-29 compactor outputs over BufWriter's 10 MiB
+    /// buffer) are teed into the cache; smaller streamed files flush through
+    /// `put_opts` and are prewarmed there — between the two, every merge
+    /// output lands hot and the compactor's post-close HEAD is local.
     async fn put_multipart_opts(
         &self,
         location: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
-        self.inner.put_multipart_opts(location, opts).await
+        let inner = self.inner.put_multipart_opts(location, opts).await?;
+        if !self.config.write_through {
+            return Ok(inner);
+        }
+        let dest = self.cache_path(location);
+        let tmp = dest.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+        match std::fs::File::create(&tmp) {
+            Ok(file) => Ok(Box::new(PrewarmingUpload {
+                inner,
+                file: Arc::new(file),
+                tmp,
+                dest,
+                offset: 0,
+                poisoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                finished: false,
+            })),
+            // Best-effort: no tee, upload unchanged.
+            Err(_) => Ok(inner),
+        }
     }
 
     /// Serve reads from the local cache. Every `get`/`get_range`/`get_ranges`/

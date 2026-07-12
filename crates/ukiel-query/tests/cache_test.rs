@@ -76,6 +76,82 @@ async fn write_through_disabled_leaves_cache_cold() {
 }
 
 #[tokio::test]
+async fn multipart_upload_prewarms_on_complete() {
+    let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    let cached = CachingObjectStore::new(inner.clone(), dir.path().to_path_buf());
+
+    let location = Path::from("ht/9/L2/streamed.parquet");
+    let part_a: Vec<u8> = (0..6000u32).map(|i| (i % 251) as u8).collect();
+    let part_b: Vec<u8> = (0..2500u32).map(|i| (i % 241) as u8).collect();
+
+    let mut upload = cached.put_multipart(&location).await.unwrap();
+    upload.put_part(part_a.clone().into()).await.unwrap();
+    upload.put_part(part_b.clone().into()).await.unwrap();
+    upload.complete().await.unwrap();
+
+    let mut want = part_a;
+    want.extend_from_slice(&part_b);
+
+    // The object is in the inner store...
+    let inner_bytes = inner.get(&location).await.unwrap().bytes().await.unwrap();
+    assert_eq!(inner_bytes.as_ref(), want.as_slice());
+    // ...and the completed upload prewarmed one whole-file cache entry
+    // (no tmp litter).
+    assert_eq!(
+        cached_file_names(dir.path()),
+        vec!["ht__9__L2__streamed.parquet".to_string()]
+    );
+    let cached_bytes = std::fs::read(dir.path().join("ht__9__L2__streamed.parquet")).unwrap();
+    assert_eq!(cached_bytes, want);
+
+    // The post-upload HEAD + reads are local: lose the inner object.
+    inner.delete(&location).await.unwrap();
+    assert_eq!(
+        cached.head(&location).await.unwrap().size,
+        want.len() as u64
+    );
+    let got = cached.get_range(&location, 5990..6010).await.unwrap();
+    assert_eq!(got.as_ref(), &want[5990..6010]);
+}
+
+#[tokio::test]
+async fn aborted_multipart_upload_leaves_no_cache_entry() {
+    let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    let cached = CachingObjectStore::new(inner.clone(), dir.path().to_path_buf());
+
+    let location = Path::from("ht/9/L2/aborted.parquet");
+    let mut upload = cached.put_multipart(&location).await.unwrap();
+    upload.put_part(vec![3u8; 1024].into()).await.unwrap();
+    upload.abort().await.unwrap();
+
+    assert!(
+        cached_file_names(dir.path()).is_empty(),
+        "an aborted upload must leave neither a cache entry nor tmp litter; dir had {:?}",
+        cached_file_names(dir.path())
+    );
+}
+
+#[tokio::test]
+async fn dropped_multipart_upload_leaves_no_tmp_litter() {
+    let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    let cached = CachingObjectStore::new(inner.clone(), dir.path().to_path_buf());
+
+    let location = Path::from("ht/9/L2/dropped.parquet");
+    let mut upload = cached.put_multipart(&location).await.unwrap();
+    upload.put_part(vec![5u8; 512].into()).await.unwrap();
+    drop(upload); // errored merge path: writer dropped without complete/abort
+
+    assert!(
+        cached_file_names(dir.path()).is_empty(),
+        "a dropped upload must leave no tmp litter; dir had {:?}",
+        cached_file_names(dir.path())
+    );
+}
+
+#[tokio::test]
 async fn head_never_downloads_the_object() {
     let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let dir = tempfile::tempdir().unwrap();
