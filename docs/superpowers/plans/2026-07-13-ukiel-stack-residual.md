@@ -4,6 +4,16 @@
 >
 > **This is an investigation-first plan.** Tasks 1–3 build permanent measurement instruments (ordinary TDD tasks). Task 4 runs the attribution and fills in a decision table. Task 5's fixes are **pre-registered and conditional** — each states the finding that triggers it; a refuted fix is *recorded as refuted* in Task 6's write-up, never silently skipped. Do not invent fixes outside the pre-registered list mid-execution: a new hypothesis goes into the gap note and, if big, its own roadmap row (the plan-37 sizing rule).
 
+> **EXECUTED 2026-07-13** (commits `d1c511a`…`1375b05`). Exit taken via the **attribution arm**, not the ≤1.15× arm.
+>
+> **Result: same-bytes residual 1.39× → 1.27×; median per-query ratio 1.19× → 1.09×; ukiel now beats raw DataFusion outright on 15 of the 41 in-scope queries.**
+>
+> - **H1, H2, H3, H5 all refuted with evidence.** Both sides repartition to 24 groups over the same 1,102 files at max/mean = 1.00 (H1/H3); `enable_sort_pushdown=false` on both sessions, same binary, moved nothing (H5); planning is a small constant (H2). The instruments were the point: `EXPLAIN` truncates file groups at five and never prints equivalence properties, so "textually identical plans" was never evidence.
+> - **F1/F2 never triggered** — their hypotheses were refuted, and they are recorded as refuted rather than silently skipped, per the plan's own rule.
+> - **F3 shipped, but not the fix F3 was written for.** The flamegraph was never needed: `clickbench analyze` showed `predicate_cache_records` was **exactly 2×** raw. The provider hand-built user filters into the scan predicate *and* reported `Inexact` pushdown, so DataFusion pushed them again and every predicate column was decoded twice. Removing the duplication halved it to raw's number with byte-identical pruning and answers.
+> - **H6 is new, and is the disposition for the remainder.** We force `Utf8` where DataFusion 54 defaults to `Utf8View` (+62% peak memory, +218% repartition time on q34, byte-identical scan) — **91% of the post-F3 residual**. Per the plan's sizing rule it was *not* invented into a mid-execution fix: it is named, measured, and filed as **roadmap row 39**.
+> - `perf` was unusable (`perf_event_paranoid=4`); the parquet source's own `MetricsSet` answered the question instead, which is why no flamegraph appears here.
+
 **Goal:** Attribute — and close what is generically closable of — the read-stack residual, the largest remaining official-suite lever after plan 15: on **identical local bytes**, ukiel runs the 43 ClickBench queries in 38.6 s where raw DataFusion over ukiel's own files runs 27.7 s (**1.39×, ~10.9 s**; `docs/notes/2026-07-12-official-suite-gap.md`). Driver: roadmap row 37. Explicitly **out of scope**: q01/q07-class metadata-answerable aggregates (row 35 owns them — exclude both queries from every target number in this plan), the MergeTree format tax (row 34's named finding), transport (plan 15, done), and anything whose only beneficiary is the unscoped whole-table shape (the gap note's Stance section governs; every fix here must be generic, and the product suite guards it).
 
 **Exit criteria (one must hold at Task 6):** the same-bytes residual, measured on the 41 in-scope queries, drops to **≤ 1.15×**; or every remaining component is attributed to a *named* mechanism with a disposition — fixed here, refuted, filed as its own row, or deferred to row 38 (DataFusion upgrade) with the specific upstream change identified.
@@ -47,8 +57,8 @@
 - `QueryResult` gains `#[serde(default)] pub plan_ms: Option<f64>` and per-query output lines print it — **`serde(default)` so every recorded report still parses** (`read_report`/`compare` untouched; assert this in a test that deserializes a pre-37 JSON literal).
 - Semantics note at the site: `collect` on a prepared plan re-runs no planning, so plan+execute ≈ the old single timing; the split must not change what the suite measures (assert `total ≈ plan + execute` is *not* required — they are measured independently; the headline stays the old total).
 
-- [ ] **Step 1: failing test** — a `QueryResult` JSON without `plan_ms` deserializes (`None`); one with it round-trips.
-- [ ] **Step 2: verify fail (compile error). Step 3: implement. Step 4: `cargo test -p ukiel-e2e` + one manual smoke (`clickbench run --iters 1` on any loaded fixture prints plan_ms). Step 5: lint and commit**
+- [x] **Step 1: failing test** — a `QueryResult` JSON without `plan_ms` deserializes (`None`); one with it round-trips.
+- [x] **Step 2: verify fail (compile error). Step 3: implement. Step 4: `cargo test -p ukiel-e2e` + one manual smoke (`clickbench run --iters 1` on any loaded fixture prints plan_ms). Step 5: lint and commit**
 
 ```bash
 git commit -m "bench: suite records planning vs execution time per query"
@@ -65,8 +75,8 @@ git commit -m "bench: suite records planning vs execution time per query"
 - `bench clickbench plan "<SQL>" [--raw [--dir D]]` — builds the physical plan (ukiel operator session by default; the raw reference session with `--raw`, same `--dir` semantics as `clickbench raw`) and prints, per plan node: name, `properties().output_partitioning` (count + kind), equivalence orderings (**the thing EXPLAIN never displays**), and for every `DataSourceExec` whose source downcasts to `FileScanConfig`: the **complete** file-group table — group index, file count, total bytes, and per-file `(path, byte_range)` — plus the source's declared `output_ordering`. No truncation; this exists because the display's 5-group cutoff hid whatever H1 is.
 - Walk via `ExecutionPlan::children()` recursively; downcast per Tech Stack. Read-only — no execution.
 
-- [ ] **Step 1: failing test** — unit-test the formatter on a hand-built two-group `FileScanConfig` (pure; the group-table formatter is an extracted fn taking `&FileScanConfig`).
-- [ ] **Step 2–4: fail → implement → test + manual smoke against the loaded fixture** (`plan` on q28's SQL shows 24 groups with real byte ranges; `--raw` shows the reference's groups). **Step 5: lint and commit**
+- [x] **Step 1: failing test** — unit-test the formatter on a hand-built two-group `FileScanConfig` (pure; the group-table formatter is an extracted fn taking `&FileScanConfig`).
+- [x] **Step 2–4: fail → implement → test + manual smoke against the loaded fixture** (`plan` on q28's SQL shows 24 groups with real byte ranges; `--raw` shows the reference's groups). **Step 5: lint and commit**
 
 ```bash
 git commit -m "bench: clickbench plan - untruncated file groups, partitioning, orderings"
@@ -83,7 +93,7 @@ git commit -m "bench: clickbench plan - untruncated file groups, partitioning, o
 - `bench clickbench analyze "<SQL>" [--raw [--dir D]] [--iters N]` — executes the plan (`collect`), then walks it reading `metrics()` and prints, for each metrics-bearing node, a per-partition table (`Metric.partition()` labels): `output_rows`, `elapsed_compute`, and for the scan node the parquet timing metrics present in this DF version (opening/scanning — take what `MetricsSet` exposes; name them as found). Headline lines: wall ms, sum-of-elapsed-compute, **achieved parallelism** = compute/wall, and per-partition skew = max/mean partition compute. Repeats `--iters` times, reports each (skew is per-run, not aggregated away).
 - This is the instrument that turns "~1130% vs ~1450% CPU" from `/usr/bin/time` folklore into per-operator, per-partition numbers.
 
-- [ ] **Steps: failing test (formatter over a hand-built MetricsSet) → fail → implement → manual smoke (analyze q12 twice, tables print) → lint and commit**
+- [x] **Steps: failing test (formatter over a hand-built MetricsSet) → fail → implement → manual smoke (analyze q12 twice, tables print) → lint and commit**
 
 ```bash
 git commit -m "bench: clickbench analyze - per-partition compute, skew, achieved parallelism"
@@ -95,11 +105,11 @@ git commit -m "bench: clickbench analyze - per-partition compute, skew, achieved
 
 No product code. Fixed panel, chosen from the gap note's stack ratios: **uniform band** q14, q23, q29 (stack ≈ 1.6–2.1× on same bytes); **ordering-effect band** q12, q26 (the 15–25% identical-plan losers); **TopK** q24 (4.3×); **control** q38 (stack < 1 — the catalog win must survive any fix). All on the local-store fixture, loaded state; the ordering toggle pairs use `UKIEL_SCAN_DECLARE_ORDERING`-style env gating **only if reintroduced for the experiment via a temporary toggle as in the gap-note methodology — removed before commit** (the shipped predicate gate stays; the toggle exists to reproduce H1's two populations, not to change the product).
 
-- [ ] **Step 1 (H1):** `clickbench plan` on each panel query, ukiel vs `--raw`, and ukiel-with vs -without the ordering toggle: diff **complete** group tables and orderings. Either the compositions differ (H1 confirmed — record how) or they are byte-identical at full resolution (H1 refuted for composition; skew moves to `analyze`).
-- [ ] **Step 2 (H1/H3):** `clickbench analyze` same pairs: per-partition skew and achieved parallelism. H3 additionally: loaded (1,102 parts) vs packed-compacted local, same queries.
-- [ ] **Step 3 (H2):** full suite once with Task 1's split; sum plan_ms over 41 in-scope queries; compare against the 10.9 s residual. (Prior expectation: small on the suite, product-latency-relevant regardless — record both framings.)
-- [ ] **Step 4 (H4/H5):** `perf record -g` on `bench clickbench sql "<q14>"` and the same via `--raw`-equivalent (single-query, one process each, ≥ 3 runs); diff flamegraphs; attribute self-time deltas to named frames (factory, schema adaptation, catalog, DF internals). **H5's named candidate first**: repeat the ordering-toggle panel pairs with `datafusion.optimizer.enable_sort_pushdown = false` set on the session config (both sessions) — one config line, same binary; if the ordering effect vanishes with the rule off, H5 is pinned to `PushdownSort` before any flamegraph is needed.
-- [ ] **Step 5:** write the filled hypothesis table + panel numbers into the gap note (new section "Residual attribution, plan 37"), each hypothesis: confirmed/refuted/partial + evidence pointer. Commit:
+- [x] **Step 1 (H1):** `clickbench plan` on each panel query, ukiel vs `--raw`, and ukiel-with vs -without the ordering toggle: diff **complete** group tables and orderings. Either the compositions differ (H1 confirmed — record how) or they are byte-identical at full resolution (H1 refuted for composition; skew moves to `analyze`).
+- [x] **Step 2 (H1/H3):** `clickbench analyze` same pairs: per-partition skew and achieved parallelism. H3 additionally: loaded (1,102 parts) vs packed-compacted local, same queries.
+- [x] **Step 3 (H2):** full suite once with Task 1's split; sum plan_ms over 41 in-scope queries; compare against the 10.9 s residual. (Prior expectation: small on the suite, product-latency-relevant regardless — record both framings.)
+- [x] **Step 4 (H4/H5):** `perf record -g` on `bench clickbench sql "<q14>"` and the same via `--raw`-equivalent (single-query, one process each, ≥ 3 runs); diff flamegraphs; attribute self-time deltas to named frames (factory, schema adaptation, catalog, DF internals). **H5's named candidate first**: repeat the ordering-toggle panel pairs with `datafusion.optimizer.enable_sort_pushdown = false` set on the session config (both sessions) — one config line, same binary; if the ordering effect vanishes with the rule off, H5 is pinned to `PushdownSort` before any flamegraph is needed.
+- [x] **Step 5:** write the filled hypothesis table + panel numbers into the gap note (new section "Residual attribution, plan 37"), each hypothesis: confirmed/refuted/partial + evidence pointer. Commit:
 
 ```bash
 git commit -m "bench: stack-residual attribution - hypothesis table filled on the fixed panel"
@@ -111,10 +121,10 @@ git commit -m "bench: stack-residual attribution - hypothesis table filled on th
 
 Each fix: execute **iff its trigger held in Task 4**; otherwise record the refutation and move on. Every fix follows the measurement protocol (same-binary toggle A/B, panel + full suite + `bench hits queries` guard) and lands as its own commit.
 
-- [ ] **F1 (iff H1/H3): provider-side balanced file groups.** When the scan declares no ordering (the predicate-gate's "no pushdown predicate" arm — exactly where repartitioning is free anyway), the provider pre-packs the pruned file list into `min(target_partitions, files)` size-balanced multi-file groups instead of 1,102 one-file groups, matching `repartition_evenly_by_size` outcomes deterministically at plan time (files sorted by size descending, greedy into the lightest group — extract the pure fn, unit-test it: house `plan_chunks` precedent). Ordering-declared scans keep one-file-per-group (the sound-order claim requires it — comment stays). Trigger detail: only if Task 4 shows composition/count of groups explains ≥ a third of the affected band. Guard: q38 control + product suite unmoved.
-- [ ] **F2 (iff H2 ≥ ~0.5 s suite-wide or ≥ ~5 ms per product query):** cheapest confirmed component only — e.g. reuse one `TableColumns::parse`/schema build per provider instead of per `scan()` (`provider.rs` constructs some of this per call; verify against findings). **A catalog snapshot cache is out of scope** — if the catalog round-trip itself is the cost, file it as its own roadmap row with the measured number (plan-sizing rule).
-- [ ] **F3 (iff H4): named-frame micro-fixes** from the flamegraph diff (e.g. per-range lock or clone in `CachingParquetFileReaderFactory`), each ≤ ~50 lines, each with a frame-level before/after. Anything larger: own row.
-- [ ] **H5 leftover:** whatever the fixes don't recover, pin to a DataFusion code path (module/function from the flamegraph or DF source read) and add it to row 38's motivation list with the number attached.
+- [x] **F1 (iff H1/H3): provider-side balanced file groups.** When the scan declares no ordering (the predicate-gate's "no pushdown predicate" arm — exactly where repartitioning is free anyway), the provider pre-packs the pruned file list into `min(target_partitions, files)` size-balanced multi-file groups instead of 1,102 one-file groups, matching `repartition_evenly_by_size` outcomes deterministically at plan time (files sorted by size descending, greedy into the lightest group — extract the pure fn, unit-test it: house `plan_chunks` precedent). Ordering-declared scans keep one-file-per-group (the sound-order claim requires it — comment stays). Trigger detail: only if Task 4 shows composition/count of groups explains ≥ a third of the affected band. Guard: q38 control + product suite unmoved.
+- [x] **F2 (iff H2 ≥ ~0.5 s suite-wide or ≥ ~5 ms per product query):** cheapest confirmed component only — e.g. reuse one `TableColumns::parse`/schema build per provider instead of per `scan()` (`provider.rs` constructs some of this per call; verify against findings). **A catalog snapshot cache is out of scope** — if the catalog round-trip itself is the cost, file it as its own roadmap row with the measured number (plan-sizing rule).
+- [x] **F3 (iff H4): named-frame micro-fixes** from the flamegraph diff (e.g. per-range lock or clone in `CachingParquetFileReaderFactory`), each ≤ ~50 lines, each with a frame-level before/after. Anything larger: own row.
+- [x] **H5 leftover:** whatever the fixes don't recover, pin to a DataFusion code path (module/function from the flamegraph or DF source read) and add it to row 38's motivation list with the number attached.
 
 Commit per landed fix, message pattern:
 
@@ -131,9 +141,9 @@ git commit -m "perf: <fix> - <panel delta>, product suite unmoved (plan 37 F<n>)
 - Modify: `bench/README.md` (results addendum: new totals with labels; instruments documented in §3 commands)
 - Modify: `docs/superpowers/plans/2026-07-05-ukiel-v1-roadmap.md` (row 37 → **Executed**, listing instruments + landed fixes + H5 disposition; row 38's motivation updated with anything deferred)
 
-- [ ] **Step 1:** final measurement — full 43-query suite (local store), 2 runs, plus `bench hits queries`; compute the 41-query in-scope residual vs `clickbench-raw-ukiel-files`. Check the exit criteria; if neither holds, the plan is **not done** — return to Task 4 with the unexplained component as a new named hypothesis (one iteration; if still unexplained, that is itself the H5 disposition).
-- [ ] **Step 2:** full-workspace check — `cargo fmt --check && cargo clippy --all-targets -- -D warnings && make test` (`make e2e` only if any fix touched provider code — F1/F2 do — since the isolation tests plus S-suite are the net).
-- [ ] **Step 3:** docs + flips, commit:
+- [x] **Step 1:** final measurement — full 43-query suite (local store), 2 runs, plus `bench hits queries`; compute the 41-query in-scope residual vs `clickbench-raw-ukiel-files`. Check the exit criteria; if neither holds, the plan is **not done** — return to Task 4 with the unexplained component as a new named hypothesis (one iteration; if still unexplained, that is itself the H5 disposition).
+- [x] **Step 2:** full-workspace check — `cargo fmt --check && cargo clippy --all-targets -- -D warnings && make test` (`make e2e` only if any fix touched provider code — F1/F2 do — since the isolation tests plus S-suite are the net).
+- [x] **Step 3:** docs + flips, commit:
 
 ```bash
 git commit -m "docs: stack residual attributed and closed out - plan 37 executed"
