@@ -8,40 +8,58 @@ thing the plan convention exists to prevent. Row 38 therefore sits **blocked
 upstream**, and this note is the standing recipe for whoever writes the plan
 when the trigger fires.
 
-## Already in 54 — sort-pushdown Phase 1 (correction, 2026-07-13)
+## Already in 54 — sort-pushdown Phases 1–3 (corrections, 2026-07-13)
 
-[PR #19064] ("Establish the high level API for sort pushdown and the optimizer
-rule…", merged 2025-12-17, released in **DataFusion 52**) is *not* a watch
-item — it is in our pin. Verified in the vendored 54 sources:
-`enable_sort_pushdown: bool, default = true`
-(`datafusion-common-54.0.0/src/config.rs:1289`) — the `PushdownSort` rule runs
-by default in every ukiel session today — and `try_pushdown_sort` trait hooks
-on `FileSource`/`DataSource` (`datafusion-datasource-54.0.0/src/file.rs:260`,
-`src/source.rs:215,499`), with `reverse_scan_inexact` for reversed
-file/row-group order (Inexact: the `SortExec` stays for correctness, TopK
-terminates early). Two consequences, neither belonging to row 38:
+The sort-pushdown epic is [apache/datafusion#23036] ("skip sorts and skip
+IO / decode for ORDER BY / TopK queries") — a phased initiative whose first
+three phases are **in our pin**, not upstream-future:
 
-- **Row 37**: the rule is a *named candidate mechanism* for the unexplained
-  declared-ordering concurrency effect (identical plans, different achieved
-  parallelism — sort-aware machinery keying off declared orderings would look
-  exactly like that), and the config flag is a clean same-binary A/B lever.
-  Recorded in plan 37's hypothesis table.
-- **Opportunity on 54, no upgrade needed**: the provider could implement
-  `try_pushdown_sort` (ORDER-BY-ts TopK over ts-sliced/dedicated files is the
-  product-shaped beneficiary). If row 37's attribution or the product suite
-  motivates it, that is a new row — not a reason to hold row 38 open.
+| phase | released in | what it does |
+|---|---|---|
+| 1 — [PR #19064] | DF **52** | `PushdownSort` optimizer rule (`enable_sort_pushdown` default **true**, `datafusion-common-54.0.0/src/config.rs:1289`), `try_pushdown_sort` hooks on `DataSource`/`FileSource`, reverse file/row-group iteration (Inexact: `SortExec` stays, TopK terminates early) |
+| 2 — PR #21182 | DF **53** | **statistics-based file reordering** for ORDER BY, runtime `DynamicFilter` pruning from the TopK heap (upstream: 27× on `ORDER BY LIMIT`) |
+| 3 — PR #21956 | DF **54** | multi-partition support (`BufferExec`) |
+| 4 — PR #22450 | DF **55**, in review | runtime row-group early stopping |
+
+Verified live end-to-end in the vendored 54 sources: the machinery lives in
+`datafusion-datasource-54.0.0/src/file_scan_config/sort_pushdown.rs`;
+`FileScanConfig::try_pushdown_sort` (`file_scan_config/mod.rs:956`) delegates
+to the file source **passing `self.eq_properties()`** — i.e. the provider's
+declared output ordering is a *direct input* to the decision — and
+`ParquetSource` implements the hook
+(`datafusion-datasource-parquet-54.0.0/src/source.rs:830`), first checking
+whether the natural ordering already satisfies the requested sort. Outcomes:
+Exact (drop the `SortExec`), Inexact (keep it; reorder files/row groups by
+statistics; TopK dynamic filters prune at runtime), Unsupported. **None of
+this shows in EXPLAIN output.** Open arrow-rs dependencies for the DESC exact
+path: arrow-rs#9937 (page-level reverse decode) and arrow-rs#10158
+(`peek_next_row_group`). Consequences, neither belonging to row 38:
+
+- **Row 37**: this is the leading *named candidate mechanism* for the
+  declared-ordering effects we measured and could not see in plans — declared
+  ordering → eq_properties → `ParquetSource::try_pushdown_sort` →
+  file/row-group reordering + runtime dynamic filters, on by default,
+  invisible in EXPLAIN. Plan 37's H5 carries it plus the one-line lever
+  (`datafusion.optimizer.enable_sort_pushdown = false`, same binary).
+- **Opportunity on 54, no upgrade needed**: ukiel's provider already benefits
+  passively wherever it declares an ordering (predicated scans, post
+  predicate-gate); the *active* opportunity — catalog-aware ordering claims so
+  ORDER-BY-ts TopK over ts-sliced/dedicated files hits the Exact/Inexact
+  paths — is implementable against 54's hooks. If row 37's attribution or the
+  product suite motivates it, that is a new row — not a reason to hold row 38
+  open.
 
 ## Watch triggers (any one re-opens the row)
 
 1. **A DataFusion release newer than 54.0.0 on crates.io** — check
    `https://crates.io/api/v1/crates/datafusion` (`max_stable_version`).
-2. **Sort-pushdown later phases landing in a release beyond 54**: the epic
-   [apache/datafusion#17348] tracks what Phase 1 left out (exact row-level
-   reversal; [PR #17337]'s `preferred_ordering` on `TableScan`). Relevant to
-   the problems we measured on 54: predicate pushdown rebuilding the scan and
+2. **Sort-pushdown Phase 4 landing**: PR #22450 (runtime row-group early
+   stopping) is in review targeting **DF 55** — the first concrete release
+   target worth auditing; the DESC exact path additionally waits on
+   arrow-rs#9937/#10158 (epic [apache/datafusion#23036]). Also still relevant
+   on any newer release: whether predicate pushdown rebuilding the scan stops
    clearing the declared output ordering (plan-11 sort-elimination block; the
-   plan-32-era predicate-gate workaround in `provider.rs`). When a release
-   note mentions these, audit that release first.
+   plan-32-era predicate-gate workaround in `provider.rs`).
 3. **Row 37's H5 disposition** naming a DF code path fixed in a newer release.
 
 ## What the eventual plan must contain (pre-written checklist)
@@ -102,6 +120,5 @@ If the release notes show only additive change on our surface: one plan,
 → docs). If `AsyncFileReader`/`ObjectStore`/writer traits break: consider
 splitting read-side and write-side into two rows rather than one mega-plan.
 
-[apache/datafusion#17348]: https://github.com/apache/datafusion/issues/17348
-[PR #17337]: https://github.com/apache/datafusion/pull/17337
+[apache/datafusion#23036]: https://github.com/apache/datafusion/issues/23036
 [PR #19064]: https://github.com/apache/datafusion/pull/19064
