@@ -128,6 +128,8 @@ bench clickbench compact [--target-mb N]
 bench clickbench run [--iters N] [--label LABEL]        # 43 queries, ukiel stack
 bench clickbench raw [--iters N] [--label LABEL] [--dir D]  # same 43, bare DataFusion
 bench clickbench sql "SQL"                              # one statement (EXPLAIN etc.), operator session
+bench clickbench plan "SQL" [--raw] [--dir D] [--max-files N]    # full plan (plan 37)
+bench clickbench analyze "SQL" [--raw] [--dir D] [--iters N]     # per-partition profile (plan 37)
 bench clickbench compare --ukiel LABEL --raw LABEL      # per-query overhead ratios
 bench bluesky jsonbench [--iters N] [--label LABEL]     # JSONBench's 5 queries
 
@@ -1124,6 +1126,65 @@ Readings:
   skip, DataFusion's metrics cannot distinguish a provider-skipped group from a
   statistics-pruned one (see `docs/notes/2026-07-06-parquet-read-performance.md`).
   The bitmap is the headline; the access plan rides along.
+
+### READ-STACK RESIDUAL — plan 37 (attribution + F3), 2026-07-13
+
+SHA `e4822e4`. Local-filesystem store (`UKIEL_E2E_STORE_DIR`) so transport is out
+of every number; `hits_cb`, 100 files, 99,997,497 rows, 1,102 parts.
+
+**Two new instruments, because the standard ones cannot see the thing that
+matters.** `EXPLAIN` truncates its file-group list at five groups and never
+prints equivalence properties at all; `EXPLAIN ANALYZE` sums metrics across
+partitions. The earlier investigation concluded "textually identical plans" from
+that output — which was never evidence, because the part that could differ is the
+part that does not print.
+
+- `bench clickbench plan "SQL" [--raw]` — every file group, every byte range,
+  partition counts, equivalence orderings. Untruncated.
+- `bench clickbench analyze "SQL" [--raw]` — per-partition compute, skew,
+  achieved parallelism, and the parquet source's own metrics (`bytes_scanned`,
+  `predicate_cache_records`, `peak_mem_used`, …).
+
+**F3 — the scan predicate was being evaluated twice.** The provider hand-built
+every user filter into the `ParquetSource` predicate *and* reported `Inexact`
+pushdown, so DataFusion pushed the same filters into the same source again and
+the reader decoded every predicate column twice. `predicate_cache_records` was
+**exactly 2×** raw (181,821,762 vs 90,949,793). Removing the duplication halves
+it to raw's number with **byte-identical `bytes_scanned`, `pushdown_rows_pruned`
+and answers**.
+
+| 41 in-scope queries (q01/q07 are row 35's) | total | vs raw, same bytes | median per-query |
+|---|---|---|---|
+| raw DataFusion over ukiel's own files | 27.7 s | 1.00× | 1.00× |
+| ukiel, local store — before | 38.5 s | 1.39× | 1.19× |
+| **ukiel, local store — after F3** | **35.3 s** | **1.27×** | **1.09×** |
+
+Biggest wins are exactly where the double decode was: q28 −22%, q31 −27%,
+q32 −21%, q21 −18%. **Ukiel now beats raw DataFusion outright on 15 of the 41.**
+Product-suite guard (same-binary A/B on the scoped path): predicated scenarios
+improve (heavy `adv_filter` −9%, `search_phrases` −5%; median `distinct_users`
+−15%), nothing regresses beyond the noise floor.
+
+**What was refuted, with evidence** (all four were live suspects):
+
+- **Partition composition/skew** — at full resolution both sides produce 24
+  groups over the same 1,102 files, 7,575.9 MiB, **max/mean = 1.00**. Identical.
+- **1,102 one-file partitions** — DataFusion repartitions to 24 balanced groups
+  on *both* sides; the one-file groups never reach the executor.
+- **DataFusion's sort-pushdown machinery** — `enable_sort_pushdown = false` on
+  both sessions, same binary, moved **nothing** (ukiel 1,142–1,245 ms, raw
+  845–872 ms, unmoved).
+- **Per-query planning cost** — now measured per query (`plan_ms`); a small
+  constant, nowhere near the residual.
+
+**What remains, named: we defeat `Utf8View` (roadmap row 39).** DataFusion 54
+defaults `schema_force_view_types = true`, so raw reads strings as `Utf8View`;
+our provider forces plain `Utf8` (`arrow_typeof("URL")` = `Utf8` on ukiel,
+`Utf8View` on raw, **same files**). On q34 (`GROUP BY "URL"`, no predicate,
+byte-identical scan): peak memory **+62%**, repartition time **+218%**, wall
+1.53×. That is **91% of the post-F3 residual**, and it is filed rather than
+fixed here because `physical_schema()` is shared with ingest, the compactor and
+alias compilation — a design change, not a micro-fix.
 
 ### 100M / 1B tiers — optional / stretch
 

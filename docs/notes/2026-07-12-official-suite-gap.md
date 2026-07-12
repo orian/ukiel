@@ -176,6 +176,82 @@ layout should be tuned further against this suite (see Stance).
    the same sketch. Row 34's ClickHouse substrate ladder will sharpen this
    before anyone commits to it.
 
+## Residual attribution — plan 37 (2026-07-13)
+
+The 1.39× same-bytes residual (ukiel-local 38.6 s vs raw-over-ukiel's-files 27.7 s)
+was attacked with three new instruments (`clickbench plan`, `clickbench analyze`,
+and a plan/execute split in the suite harness), because the earlier tools could
+not see the thing that mattered: **`EXPLAIN` truncates its file-group list at five
+groups and never prints equivalence properties at all**, and **`EXPLAIN ANALYZE`
+sums metrics across partitions**. "Textually identical plans" was never evidence.
+
+### The hypothesis table, filled
+
+| # | Hypothesis | Verdict | Evidence |
+|---|---|---|---|
+| H1 | Partition composition/skew differs invisibly | **Refuted** | At full resolution both sides produce **24 groups over the same 1,102 files, 7,575.9 MiB, max/mean = 1.00** — identical balance. Only the *byte-split boundaries* differ (catalog order vs directory order), with no balance consequence. |
+| H2 | Per-query planning cost is material | **Refuted as a suite-level lever** | Planning is now recorded per query (`plan_ms`); it is a small constant, nowhere near the 10.9 s residual. Retained as an instrument because it is product-latency-relevant even when it is not suite-relevant. |
+| H3 | 1,102 one-file partitions cost per-partition setup | **Refuted** | DataFusion repartitions to 24 balanced groups on *both* sides before execution. The 1,102 one-file groups never reach the executor. |
+| H4 | Per-file reader-factory / schema-adaptation overhead | **Partially confirmed → see H6** | The reader factory is a clean passthrough (`get_metadata` only; the lock is never held across I/O). But the *schema* it presents is not — see H6. |
+| H5 | The effect is DataFusion-internal sort-pushdown machinery | **Refuted** | `enable_sort_pushdown = false` on both sessions (same binary) changed **nothing** on either side: ukiel 1,142–1,245 ms, raw 845–872 ms, unmoved. The named call chain is live but is not this effect. |
+
+### What it actually was: two named mechanisms
+
+**F3 — the scan predicate was evaluated twice. (Fixed, shipped.)** The provider
+hand-built every user filter into the `ParquetSource` predicate *and* reported
+`Inexact` pushdown, so DataFusion pushed the same filters into the same source
+again. The reader decoded every predicate column twice. The instrument made it
+unmissable: **`predicate_cache_records` was exactly 2×** ukiel-vs-raw
+(181,821,762 vs 90,949,793). Removing the hand-built user filters halved it to
+exactly raw's number, with **byte-identical `bytes_scanned`, `pushdown_rows_pruned`
+and answers** — DataFusion achieves the same pruning on its own. The isolation
+predicate stays: DataFusion has no way to know about it.
+
+Effect: 41 in-scope queries **38.5 s → 35.3 s**; residual **1.39× → 1.27×**;
+**median per-query ratio 1.19× → 1.09×**. Concentrated exactly where the double
+decode was (q28 −22%, q31 −27%, q32 −21%, q21 −18%). Product-suite guard
+(same-binary A/B, scoped path): predicated scenarios improve, nothing regresses
+beyond the noise floor.
+
+**H6 — the provider defeats `Utf8View`. (Named, measured, filed as roadmap row
+39 — NOT fixed here.)** DataFusion 54 defaults `schema_force_view_types = true`,
+so the raw reference reads string columns as **`Utf8View`**. Ukiel's provider
+builds its scan schema from `TableColumns::physical_schema()`, which forces plain
+**`Utf8`** — `SELECT arrow_typeof("URL")` returns `Utf8` on ukiel and `Utf8View`
+on raw over the *same files*. The signature is string copies instead of string
+views:
+
+| q34 (`GROUP BY "URL"`, no predicate) | ukiel | raw | Δ |
+|---|---|---|---|
+| `bytes_scanned` | 1,730,466,741 | 1,730,466,405 | **±0%** |
+| `peak_mem_used` | 14.9 GB | 9.2 GB | **+62%** |
+| `repartition_time` | 3,449 ms | 1,086 ms | **+218%** |
+| `time_elapsed_processing` | 17,493 ms | 11,687 ms | +50% |
+| wall | 3,864 ms | 2,533 ms | 1.53× |
+
+This accounts for the bulk of what remains: the residual after F3 is **7.5 s over
+41 queries, 91% of it in the top ten, and those ten are the string-heavy scans**
+(q34/q35 `GROUP BY URL`, q22/q23/q26/q28 string predicates). It is **not** fixed
+here because it is not a micro-fix: `physical_schema()` is shared with ingest,
+the compactor, alias compilation (`ukiel_expr`) and materialized columns, so
+switching the *scan* schema to view types is a design change with a blast radius.
+Plan-37's own sizing rule says such a thing files its own row rather than growing
+this one. **Roadmap row 39.**
+
+### Where the residual stands
+
+| | 41 in-scope queries | vs raw (same bytes) | median per-query |
+|---|---|---|---|
+| raw DataFusion over ukiel's files | 27.7 s | 1.00× | 1.00× |
+| ukiel, local store (before plan 37) | 38.5 s | 1.39× | 1.19× |
+| **ukiel, local store + F3** | **35.3 s** | **1.27×** | **1.09×** |
+
+**Ukiel now beats raw DataFusion outright on 15 of the 41 queries.** The exit
+criterion of ≤ 1.15× on the *total* is not met (1.27×), and the plan's alternative
+exit applies: every remaining component is attributed to a named mechanism with a
+disposition — H1/H2/H3/H5 refuted with evidence, F3 fixed, **H6 named, measured,
+and filed as row 39**.
+
 **Shipped since this note: the key index (roadmap row 16, 2026-07-13).** The
 q38–q43-class advantage below now extends to the *sparse* tenant — the case
 min/max pruning was blindest to. A roaring bitmap of each part's distinct
