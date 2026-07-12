@@ -1072,6 +1072,59 @@ UKIEL_E2E_CACHE_DIR=/dev/shm/ukiel-bench-cache $B clickbench run --label cache-s
 $B clickbench compare --ukiel cache-shm --raw loaded
 ```
 
+### KEY INDEX — plan 16 (roaring key bitmap + catalog access plans), 2026-07-13
+
+SHA `de56b19`, same machine, tuned profile. `hits` fixture reloaded (100 files,
+100M rows, 1,102 parts) so its parts carry the new index.
+
+**The mechanism, measured** (`bench hits fanout` — files that survive *range*
+pruning vs *bitmap* pruning, i.e. what the provider actually plans):
+
+| tenant | rows | range-pruned | **bitmap-pruned** | files eliminated |
+|---|---|---|---|---|
+| heavy (3922) | 8,527,070 | 67 | **56** | 16% |
+| median (150550) | 123 | 108 | **7** | **93%** |
+| light (240030) | 1,003 | 82 | **8** | **90%** |
+
+Those eliminated files are the sparse-tenant false positive: their key *range*
+contains the tenant, so min/max pruning kept them, but they hold **none of its
+rows**. The query used to open every one of them to find nothing.
+
+**Read suite — `post-29` → `plan16`**, warm median ms (same fixture shape,
+uncompacted, MinIO):
+
+| scenario | heavy | median | light |
+|---|---|---|---|
+| `count` | 26.6 → 25.3 (−5%) | 33.2 → **10.2 (−69%)** | 25.4 → **10.2 (−60%)** |
+| `adv_filter` | 47.3 → 54.7 (+16%) | 41.4 → **11.3 (−73%)** | 32.5 → **11.7 (−64%)** |
+| `distinct_users` | 57.8 → 53.4 (−8%) | 40.1 → **11.3 (−72%)** | 30.4 → **12.3 (−60%)** |
+| `top_urls` | 321 → 309 (−4%) | 46.6 → **13.5 (−71%)** | 33.1 → **15.7 (−53%)** |
+| `search_phrases` | 137 → 149 (+9%) | 42.4 → **13.9 (−67%)** | 34.9 → **16.3 (−53%)** |
+| `ts_window` | 2.7 → 3.0 | 2.7 → 2.4 | 2.6 → 2.5 |
+
+Readings:
+
+- **The long tail collapses: −53% to −73% on every scan-heavy scenario** for the
+  median and light tenants. This is the multitenant case the product is *for* —
+  thousands of small tenants sharing packed files — and it is where min/max
+  pruning was weakest.
+- **The heavy tenant is flat, and that is the correct outcome**, not a
+  disappointment. A tenant with 8.5M rows genuinely has data in almost every
+  part (67 → 56 files), so there is nothing for the bitmap to prune. Its ±5–16%
+  wobble is noise at this fan-out. **A perf feature that helps the case it was
+  designed for and does nothing elsewhere is working**; one that appeared to help
+  everywhere would be the suspicious result.
+- **Catalog cost: 794 bytes per part** (854 kB of `column_stats` across 1,102
+  parts), for ~6,500 tenants. The 10k-distinct-key cap never engaged; 951 of
+  1,102 parts carry a bitmap (the other 151 are single-key parts, which are
+  already exact under range pruning and are deliberately skipped).
+- **Row-group access plans (#6) are not separately measurable here.** The loaded
+  fixture's parts are written by the bench loader, which does not produce
+  key-aligned row groups — spans appear after `compact`. And for a *partial*
+  skip, DataFusion's metrics cannot distinguish a provider-skipped group from a
+  statistics-pruned one (see `docs/notes/2026-07-06-parquet-read-performance.md`).
+  The bitmap is the headline; the access plan rides along.
+
 ### 100M / 1B tiers — optional / stretch
 
 100M Bluesky is a documented long run; 1B needs `--wave-files` and hours.

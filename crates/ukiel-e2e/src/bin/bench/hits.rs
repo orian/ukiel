@@ -602,7 +602,20 @@ async fn load_dataset(
                 row_count: sorted.num_rows() as i64,
                 size_bytes: size,
                 level: 1,
-                column_stats: ukiel_core::stats::int64_column_stats(&sorted),
+                // Plan 16: the loader builds parts directly, so it must write the
+                // same key index a real writer would — otherwise the fixture is
+                // a shape production never produces and the benchmark measures
+                // the wrong system. Bitmap only: it is catalog-side, so the file
+                // bytes are unchanged and the recorded baselines stay
+                // byte-comparable. Row-group spans need the key-aligned writer
+                // and appear after `compact`, which is where they belong.
+                column_stats: ukiel_core::stats::with_key_index(
+                    ukiel_core::stats::int64_column_stats(&sorted),
+                    (kmin != kmax)
+                        .then(|| ukiel_core::stats::key_bitmap(&sorted, dataset.packing_key))
+                        .flatten(),
+                    None,
+                ),
             });
         }
         // One commit per input file: each file is its own run.
@@ -798,6 +811,63 @@ pub async fn compact(dataset: &Dataset, target_mb: Option<usize>) -> anyhow::Res
             let fo = stack.live_part_count(ht, Some(t.id)).await;
             println!("  {class} tenant {} fan-out now {fo}", t.id);
         }
+    }
+    Ok(())
+}
+
+/// `bench hits fanout`: for each census tenant, how many live parts survive
+/// **range** pruning (min/max) versus **bitmap** pruning (plan 16). The gap is
+/// the sparse-tenant false positive the bitmap exists to kill — files a query
+/// used to open only to find none of its rows.
+pub async fn fanout() -> anyhow::Result<()> {
+    let census: HitsCensus = serde_json::from_reader(std::fs::File::open(
+        results_dir().join("hits-tenants.json"),
+    )?)
+    .context("read hits-tenants.json — run `bench hits load` first")?;
+    let stack = Stack::start().await;
+    let ht = stack.catalog.get_hypertable(HITS.table).await?.id;
+    let parts = stack.catalog.live_parts(ht, None).await?;
+
+    println!(
+        "{:<8} {:>10} {:>8} {:>8} {:>8}",
+        "class", "tenant", "range", "bitmap", "saved"
+    );
+    for (class, t) in [
+        ("heavy", &census.heavy),
+        ("median", &census.median),
+        ("light", &census.light),
+    ] {
+        let in_range: Vec<_> = parts
+            .iter()
+            .filter(|p| p.meta.packing_key_min <= t.id && p.meta.packing_key_max >= t.id)
+            .collect();
+        let kept = in_range
+            .iter()
+            .filter(|p| {
+                // Exactly the provider's rule: only a decodable `Some(false)`
+                // prunes; every other state keeps the part.
+                p.meta
+                    .column_stats
+                    .as_ref()
+                    .and_then(|s| s.get(ukiel_core::stats::PACKING_KEYS_STAT))
+                    .and_then(|v| v.as_str())
+                    .and_then(|e| ukiel_core::stats::bitmap_contains(e, t.id))
+                    .unwrap_or(true)
+            })
+            .count();
+        let saved = in_range.len() - kept;
+        println!(
+            "{class:<8} {:>10} {:>8} {:>8} {:>7}%",
+            t.id,
+            in_range.len(),
+            kept,
+            if in_range.is_empty() {
+                0
+            } else {
+                saved * 100 / in_range.len()
+            }
+        );
+        println!("PERF hits/{class}/fanout_bitmap={kept}");
     }
     Ok(())
 }

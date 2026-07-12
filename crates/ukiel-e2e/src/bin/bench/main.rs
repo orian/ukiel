@@ -33,6 +33,7 @@ USAGE:
     bench hits load [--files N]
     bench hits compact [--target-mb N]
     bench hits queries [--iters N] [--label LABEL]
+    bench hits fanout                                      range vs bitmap pruning per tenant
     bench clickbench load [--files N] [--layout counter|ts]
     bench clickbench compact [--target-mb N]
     bench clickbench run [--iters N] [--label LABEL]        official 43 queries, ukiel stack
@@ -110,6 +111,7 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
             let label = opt_str(args, "--label").unwrap_or("baseline");
             hits::queries(iters, label).await
         }
+        (Some("hits"), Some("fanout")) => hits::fanout().await,
         (Some("hits"), sub) => anyhow::bail!("unknown `hits` subcommand {sub:?}\n\n{USAGE}"),
         (Some("bluesky"), Some("produce")) => {
             let files = opt_usize(args, "--files")?

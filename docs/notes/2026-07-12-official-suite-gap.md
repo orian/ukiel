@@ -176,6 +176,15 @@ layout should be tuned further against this suite (see Stance).
    the same sketch. Row 34's ClickHouse substrate ladder will sharpen this
    before anyone commits to it.
 
+**Shipped since this note: the key index (roadmap row 16, 2026-07-13).** The
+q38–q43-class advantage below now extends to the *sparse* tenant — the case
+min/max pruning was blindest to. A roaring bitmap of each part's distinct
+packing keys makes part pruning exact: on the 100M-row fixture the median
+tenant's planned files fall 108 → 7 (−93%) and the light tenant's 82 → 8 (−90%),
+and its scan-heavy scenarios drop 53–73%. Those were files whose key *range*
+contained the tenant but which held none of its rows. The heavy tenant is
+unchanged (it has rows nearly everywhere), which is the correct outcome.
+
 What is *not* on the list: the catalog/provider stack itself. On key-filtered
 product-shaped queries it already beats bare DataFusion by 3–4.5× on identical
 files (q38–q43, 0.22–0.34×) — the pruning does exactly what it was built for.

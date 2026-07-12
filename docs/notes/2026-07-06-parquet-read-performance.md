@@ -51,14 +51,41 @@ lakehouses don't have one. Prune before I/O exists:
    partition and its parts share the same time bound), so a separate
    `partition_values`-based clause would be redundant. Parts without stats
    (all pre-plan-12 files) always survive — pruning is strictly an optimization.
-5. **Per-part key bitmap for packed files**: min/max ranges false-positive on
-   sparse tenants (range 100–4500 "contains" keyless tenant 300). A roaring
-   bitmap of distinct packing keys (~100s of bytes in `column_stats`) makes
-   part pruning exact.
-6. **Catalog-driven `ParquetAccessPlan`** (endgame): files are key-sorted, so
-   store per-part `(key → row-group range)` boundaries at write time; the
-   provider hands DataFusion exact row-group selections **without reading
-   footers** — the catalog becomes a global page index.
+5. ~~**Per-part key bitmap for packed files**~~ **(plan 16, done)**: min/max
+   ranges false-positive on sparse tenants (a part spanning keys 100–4500
+   "contains" keyless tenant 300, so the scan opens the file to find nothing). A
+   roaring **treemap** of distinct packing keys — treemap, not bitmap: packing
+   keys are `i64` and real tenant ids do not fit `u32` — goes into the existing
+   `column_stats` JSONB (no migration), written by all three writers (ingest L0,
+   streaming merge, deletion rewrite) for **multi-key parts only** (a dedicated
+   file or whale slice is already exact under range pruning). The provider drops
+   a part only on a decodable `Some(false)`. **Headline: a sparse in-range tenant
+   now plans zero files — zero object-store requests.** Capped at 10k distinct
+   keys, above which min/max is dense enough and the blob stops paying for
+   itself.
+6. ~~**Catalog-driven `ParquetAccessPlan`**~~ **(plan 16, done)**: files are
+   key-sorted (plan 14's key-aligned row groups), so each multi-key part stores
+   its per-row-group `[min, max]` key spans, taken from the writer's own
+   row-group metadata. The provider turns them into a per-file
+   `ParquetAccessPlan` (`PartitionedFile::with_extension`), pre-skipping groups;
+   when the spans exclude *every* group the file is dropped from the scan
+   outright.
+
+   **Honest re-pricing, post-plan-13.** The original framing — "exact row-group
+   selection *without reading footers*" — was written before the metadata cache
+   existed. The cache already makes repeat footer reads free, so #6's remaining
+   value is narrower than it looked: the cold path (first touch of a file in a
+   process), the pruning work skipped per query, and composition with pushdown
+   (DataFusion only ever *reduces* a supplied plan, never widens it).
+
+   **Observability gap, stated rather than papered over.** For a *partial* skip,
+   DataFusion's metrics do not distinguish "the provider skipped this row group"
+   from "statistics pruned it after reading the footer" — an assertion on the
+   partial case passes with the feature disabled, so it proves nothing (we
+   checked). The plan-16 test therefore pins the *all-groups-excluded* case,
+   which only the access plan can produce, and the partial case rests on the
+   correctness assertions plus the mechanism's own guarantee. If DataFusion ever
+   exposes a plan-skipped metric, tighten it.
 
 ## Tier 3 — write-side layout & encoding (rides the compactor) — plan 14, done
 
@@ -122,7 +149,7 @@ All planned (roadmap rows in parentheses): Tier 1 = plan 11
 (`ukiel-scan-pushdown`); Tier-2 #4 = plan 12 (`catalog-stats-pruning`);
 Tier-4 #11 = plan 13 (`parquet-metadata-cache`); Tier-3 #7–10 = plan 14
 (`file-layout`); Tier-4 #12–13 = plan 15 (`cache-tiering`); Tier-2 #5–6 =
-plan 16 (`key-index`, execute after 11/12/14). Recommended execution order:
+plan 16 (`key-index`, **done 2026-07-13**). Recommended execution order:
 11 → 12 → 13 → 14 → 15 → 16, though 13/14/15 are mutually independent.
 Perf smoke numbers get appended here after each plan.
 
