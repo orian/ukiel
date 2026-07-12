@@ -918,6 +918,44 @@ Labels: `local-loaded`, `raw ukiel-files`, `ab-*` (ordering A/B),
 `heuristic*`, `tslayout-*`. Anchor totals: raw 24.7 s / ukiel-local 38.6 s /
 ukiel-MinIO 53.4 s.
 
+### OFFICIAL SUITES — plan 15 (cache tiering), 2026-07-12
+
+Same machine, same fixture state as the anchors (fresh `clickbench load`:
+99,997,497 rows, 1,102 parts, loaded/uncompacted), MinIO transport, the
+plan-15 cache tier wired into the e2e stack via `UKIEL_E2E_CACHE_DIR` with the
+cache dir on tmpfs (`/dev/shm` — memory-backed, the upper bound of the tier;
+NVMe would sit between this and local-store). Cache starts cold; the per-query
+cold pass populates it (the 1,102 parts are ~7 MB avg, below the 64 MiB
+threshold, so this run prices the whole-file path — production compactor
+outputs land hot via write-through instead of paying that first read).
+
+| run | total (43 hot minima) | vs raw | median per-query ratio |
+|---|---|---|---|
+| ukiel, MinIO, no cache (plan-32 anchor) | 53.4 s | 2.16× | 2.28× |
+| **ukiel, MinIO + plan-15 cache (tmpfs)** | **39.5 s** | **1.60×** | 1.76× |
+| ukiel, local store (transport-free anchor) | 38.6 s | 1.56× | 1.65× |
+| raw DataFusion, source files (ceiling) | 24.7 s | 1.00× | — |
+
+**The cache recovers 94% of the measured transport share** (13.9 s of the
+14.8 s the gap note attributed to MinIO HTTP), landing within 2.3% of the
+local-store anchor — plan 15 does in production configuration what
+`UKIEL_E2E_STORE_DIR` did as an experiment. Per-query: the mid-size scans gain
+the most (q02/q04/q20/q30 at 0.30–0.32× of the no-cache time); the CPU-bound
+full-scan regexes (q34/q35) don't move (1.02×) because transport was never
+their cost. Residual vs local-store is small (median 1.03×) and concentrated in
+the sub-500 ms TopK/point queries (q24 1.43×, q27 1.54×) — consistent with
+the cache's extra per-read `stat`+open against 1,102 parts, though not
+separately attributed (single run each; could be partly noise).
+
+Label: `cache-shm`. Reproduce:
+
+```bash
+$B clickbench load
+mkdir -p /dev/shm/ukiel-bench-cache
+UKIEL_E2E_CACHE_DIR=/dev/shm/ukiel-bench-cache $B clickbench run --label cache-shm
+$B clickbench compare --ukiel cache-shm --raw loaded
+```
+
 ### 100M / 1B tiers — optional / stretch
 
 100M Bluesky is a documented long run; 1B needs `--wave-files` and hours.

@@ -159,6 +159,12 @@ layout should be tuned further against this suite (see Stance).
    **plan 15 (cache tiering — prewarm + chunked local cache) is the product
    answer** and just got re-authored against the post-29 tree. After 15, the
    hot path serves from local NVMe like the local-store runs here.
+   **Executed and measured (2026-07-12, same day):** the suite over MinIO with
+   the plan-15 cache on tmpfs (`UKIEL_E2E_CACHE_DIR`, wired for this run) totals
+   **39.5 s** — 13.9 s of the 14.8 s transport share recovered (94%), within
+   2.3% of the 38.6 s local-store anchor. This item is done; the ranked list
+   below it is what remains. (`bench/README.md` §"OFFICIAL SUITES — plan 15";
+   label `cache-shm`.)
 2. **Predicate-gated ordering declaration** (shipped with this note): q28-class
    filterless aggregates 1.5× on low-fan-out layouts, no product-path change.
 3. **Catalog aggregate pushdown — roadmap row 35 / issue 0010** (the worst
