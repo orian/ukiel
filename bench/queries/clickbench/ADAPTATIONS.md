@@ -102,6 +102,39 @@ metadata cache, so footers are re-read. It does *not* drop MinIO's or the OS's p
 object bytes may still be in memory. Our cold numbers are therefore optimistic relative to a
 true cold-storage read, in the same way ClickBench's are on a repeat run.
 
+## The ClickHouse dialect (plan 34)
+
+`queries-clickhouse.sql` is **this repo's** `queries.sql` (already `hits_cb`-named, already using
+day-number `EventDate` literals) translated to ClickHouse's SQL dialect. `diff queries.sql
+queries-clickhouse.sql` is the complete change set. It runs against both ClickHouse fixtures
+(`--table cb`, `--table parquet`), so those two rungs differ only in storage format.
+
+Separately, `queries-clickhouse-official.sql` and `create-clickhouse-official.sql` are upstream's
+**verbatim** ClickHouse files, run against the verbatim 105-column MergeTree. Those are the
+calibration fixture and carry **zero** adaptations — that is the entire point of them.
+
+| # | change | queries |
+|---|---|---|
+| CH1 | `to_timestamp_seconds(x)` → `toDateTime(x)` | q19, q43 |
+| CH2 | `extract(minute FROM …)` → `toMinute(…)` | q19 |
+| CH3 | `DATE_TRUNC('minute', …)` → `toStartOfMinute(…)`; the `ORDER BY DATE_TRUNC('minute', M)` collapses to `ORDER BY M` (M is already the truncated value) | q43 |
+| CH4 | `REGEXP_REPLACE(…)` → `replaceRegexpOne(…)` | q29 |
+| CH5 | `AVG(length(x))` → `AVG(lengthUTF8(x))` | q28, q29 |
+
+**CH5 deserves its own paragraph, because it costs ClickHouse time and we did it deliberately.**
+DataFusion's `length()` counts *characters*; ClickHouse's counts *bytes*. Upstream's own two query
+files disagree here — ClickBench's DataFusion variant and its ClickHouse variant compute genuinely
+different numbers for q28/q29, and nobody seems to mind. We do mind: every rung of our comparison
+must return the *same answer*, or the timings are not comparing anything. So the ClickHouse dialect
+uses `lengthUTF8` to match DataFusion's semantics, and pays for it — **q28 costs +613 ms versus the
+byte-length version** (61.8 ms → 674.8 ms). We took the slower, correct option and recorded the
+price rather than banking a free 613 ms on a different question.
+
+Types on the `cb` fixture mirror ukiel's exactly (`Int64` / `String`, per T1 above), so ClickHouse
+is not handed a narrower-and-cheaper version of the data than ukiel reads. That is what makes it
+apples-to-apples; the `official` fixture keeps upstream's narrow types, which is why it is the
+calibration table and not the comparison one.
+
 ### The raw reference must use ukiel's Parquet reader settings
 
 `raw_session()` sets `pushdown_filters` and `reorder_filters` to `true`, because **ukiel's
