@@ -9,6 +9,8 @@ serde_json = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true }
 thiserror = { workspace = true }
+roaring = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 bytes = { workspace = true }

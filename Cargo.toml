@@ -35,6 +35,10 @@ metrics-util = "0.19"
 metrics-exporter-prometheus = "0.16"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 lru = "0.18"
+# Plan 16 key index: roaring treemap of distinct packing keys (u64 domain — i64
+# tenant ids do not fit a u32 Bitmap), base64 for the JSONB-safe encoding.
+roaring = "0.11"
+base64 = "0.22"
 ukiel-core = { path = "crates/ukiel-core" }
 ukiel-catalog = { path = "crates/ukiel-catalog" }
 ukiel-ingest = { path = "crates/ukiel-ingest" }
