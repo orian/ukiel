@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::BoxStream;
 use object_store::path::Path;
@@ -17,19 +18,57 @@ use object_store::{
     PutResult, Result,
 };
 
+/// Tuning knobs for [`CachingObjectStore`]; `Default` is the production
+/// configuration (write-through on, 64 MiB large-object threshold, 8 MiB
+/// chunks).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CacheConfig {
+    /// Objects strictly larger than this many bytes are cached as aligned
+    /// chunk files instead of one whole-file copy.
+    pub large_object_threshold: u64,
+    /// Chunk size in bytes for large-object caching.
+    pub chunk_size: u64,
+    /// Prewarm the cache with every successfully written object.
+    pub write_through: bool,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            large_object_threshold: 64 * 1024 * 1024,
+            chunk_size: 8 * 1024 * 1024,
+            write_through: true,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CachingObjectStore {
     inner: Arc<dyn ObjectStore>,
     dir: PathBuf,
+    config: CacheConfig,
 }
 
 impl CachingObjectStore {
     pub fn new(inner: Arc<dyn ObjectStore>, dir: PathBuf) -> Self {
-        Self { inner, dir }
+        Self::with_config(inner, dir, CacheConfig::default())
+    }
+
+    pub fn with_config(inner: Arc<dyn ObjectStore>, dir: PathBuf, config: CacheConfig) -> Self {
+        Self { inner, dir, config }
     }
 
     fn cache_path(&self, location: &Path) -> PathBuf {
         self.dir.join(location.as_ref().replace('/', "__"))
+    }
+
+    /// Atomic tmp+rename write. Concurrent racers may both write; the rename
+    /// makes that harmless.
+    async fn write_atomic(&self, path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+        let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+        tokio::fs::write(&tmp, bytes).await.map_err(io_err)?;
+        tokio::fs::rename(&tmp, path).await.map_err(io_err)?;
+        Ok(())
     }
 
     /// Downloads the whole object once; concurrent racers may download twice,
@@ -37,63 +76,22 @@ impl CachingObjectStore {
     async fn ensure_cached(&self, location: &Path) -> Result<PathBuf> {
         let path = self.cache_path(location);
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-            metrics::counter!("cache_hits_total", "tier" => "file").increment(1);
             return Ok(path);
         }
         metrics::counter!("cache_misses_total", "tier" => "file").increment(1);
         let bytes = self.inner.get(location).await?.bytes().await?;
-        let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
-        tokio::fs::write(&tmp, &bytes).await.map_err(io_err)?;
-        tokio::fs::rename(&tmp, &path).await.map_err(io_err)?;
+        self.write_atomic(&path, &bytes).await?;
         Ok(path)
     }
-}
 
-fn io_err(e: std::io::Error) -> object_store::Error {
-    object_store::Error::Generic {
-        store: "ukiel-cache",
-        source: Box::new(e),
-    }
-}
-
-fn generic_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> object_store::Error {
-    object_store::Error::Generic {
-        store: "ukiel-cache",
-        source: Box::new(e),
-    }
-}
-
-impl fmt::Display for CachingObjectStore {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CachingObjectStore({})", self.inner)
-    }
-}
-
-#[async_trait]
-impl ObjectStore for CachingObjectStore {
-    async fn put_opts(
-        &self,
-        location: &Path,
-        payload: PutPayload,
-        opts: PutOptions,
-    ) -> Result<PutResult> {
-        self.inner.put_opts(location, payload, opts).await
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        location: &Path,
-        opts: PutMultipartOptions,
-    ) -> Result<Box<dyn MultipartUpload>> {
-        self.inner.put_multipart_opts(location, opts).await
-    }
-
-    /// Serve reads from the local cache file. Every `get`/`get_range`/
-    /// `get_ranges` in object_store 0.13 routes through here, so caching this
-    /// one method covers the whole Parquet read path. The `File` payload lets
+    /// Serve a read from a local cache file. The `File` payload lets
     /// object_store seek/slice the requested range itself.
-    async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-        let path = self.ensure_cached(location).await?;
+    fn serve_local_file(
+        &self,
+        location: &Path,
+        path: PathBuf,
+        options: &GetOptions,
+    ) -> Result<GetResult> {
         let file = std::fs::File::open(&path).map_err(io_err)?;
         let metadata = file.metadata().map_err(io_err)?;
         let total = metadata.len();
@@ -119,6 +117,87 @@ impl ObjectStore for CachingObjectStore {
             range,
             attributes: Attributes::default(),
         })
+    }
+}
+
+fn io_err(e: std::io::Error) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "ukiel-cache",
+        source: Box::new(e),
+    }
+}
+
+fn generic_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "ukiel-cache",
+        source: Box::new(e),
+    }
+}
+
+impl fmt::Display for CachingObjectStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CachingObjectStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for CachingObjectStore {
+    /// Delegate to `inner` first — a failed upload must not poison the cache —
+    /// then prewarm the local cache with the accepted payload (write-through):
+    /// ukield shares one wrapped store across roles, so ingest L0 files,
+    /// deletion rewrites, and small compactor outputs land hot at write time.
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult> {
+        // Cloning a PutPayload is cheap: it is a list of ref-counted chunks.
+        let prewarm = self.config.write_through.then(|| payload.clone());
+        let result = self.inner.put_opts(location, payload, opts).await?;
+        if let Some(payload) = prewarm {
+            // Best-effort: the upload is durable either way; a failed cache
+            // write just means the first read misses, as before.
+            let bytes = Bytes::from(payload);
+            if self
+                .write_atomic(&self.cache_path(location), &bytes)
+                .await
+                .is_ok()
+            {
+                metrics::counter!("cache_prewarms_total", "kind" => "put").increment(1);
+            }
+        }
+        Ok(result)
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    /// Serve reads from the local cache. Every `get`/`get_range`/`get_ranges`/
+    /// `head` in object_store 0.13 routes through here, so caching this one
+    /// method covers the whole Parquet read path.
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        // A whole-file copy always wins — prewarmed writes and previously
+        // read objects, HEADs included (local metadata answers them).
+        let whole = self.cache_path(location);
+        if tokio::fs::try_exists(&whole).await.unwrap_or(false) {
+            metrics::counter!("cache_hits_total", "tier" => "file").increment(1);
+            return self.serve_local_file(location, whole, &options);
+        }
+        // A HEAD must never fetch data (the compactor HEADs every output
+        // file right after writing it; head routes through get_opts because
+        // ObjectStoreExt::head is a get_opts default — it cannot be
+        // overridden here).
+        if options.head {
+            return self.inner.get_opts(location, options).await;
+        }
+        let path = self.ensure_cached(location).await?;
+        self.serve_local_file(location, path, &options)
     }
 
     fn delete_stream(
