@@ -36,21 +36,42 @@ pub enum Session {
 }
 
 impl Session {
-    /// Runs `sql` to completion and returns the row count.
+    /// Runs `sql` to completion, reporting how much of the time went to
+    /// *planning* (plan 37, H2): SQL parse → logical plan → physical plan.
     ///
     /// Running it *to completion* is what makes the engines comparable:
     /// DataFusion is lazy and ClickHouse is not, so timing either one at "first
-    /// row" would flatter one of them. Only the count comes back — no caller
+    /// row" would flatter one of them. Only the row count comes back — no caller
     /// needs the data, and materializing a 100M-row result would be a memory bug
     /// in waiting. The count is kept precisely so a cross-engine comparison can
     /// catch two engines disagreeing on the *answer*.
-    pub async fn query(&self, sql: &str) -> anyhow::Result<usize> {
+    ///
+    /// Returns `(total_ms, plan_ms, rows)`. `plan_ms` is `None` for ClickHouse,
+    /// which plans server-side and does not expose the split.
+    ///
+    /// The DataFusion arm deliberately reproduces what `DataFrame::collect` does
+    /// — build the physical plan, then `collect` it — rather than timing a
+    /// different code path. `collect` on an already-built plan re-plans nothing,
+    /// so total ≈ plan + execute and the suite's headline number is unchanged.
+    pub async fn query_split(&self, sql: &str) -> anyhow::Result<(f64, Option<f64>, usize)> {
+        let start = Instant::now();
         match self {
             Session::DataFusion(ctx) => {
-                let batches = ctx.sql(sql).await?.collect().await?;
-                Ok(batches.iter().map(|b| b.num_rows()).sum())
+                let df = ctx.sql(sql).await?;
+                let plan = df.create_physical_plan().await?;
+                let plan_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+                let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+                Ok((
+                    total_ms,
+                    Some(plan_ms),
+                    batches.iter().map(|b| b.num_rows()).sum(),
+                ))
             }
-            Session::Http(ch) => ch.query(sql).await,
+            Session::Http(ch) => {
+                let rows = ch.query(sql).await?;
+                Ok((start.elapsed().as_secs_f64() * 1000.0, None, rows))
+            }
         }
     }
 }
@@ -98,6 +119,13 @@ pub struct QueryResult {
     pub hot_min_ms: f64,
     pub hot_median_ms: f64,
     pub rows: usize,
+    /// Median planning time over the hot runs (plan 37): SQL → logical →
+    /// physical plan, before a single row is read. `None` for engines that do
+    /// not expose the split (ClickHouse) and for every report recorded before
+    /// plan 37 — hence `serde(default)`, without which the entire measurement
+    /// history would stop deserializing the day this field landed.
+    #[serde(default)]
+    pub plan_ms: Option<f64>,
     /// Present iff the query failed — partial coverage must be loud.
     pub error: Option<String>,
 }
@@ -121,13 +149,10 @@ pub fn median(mut v: Vec<f64>) -> f64 {
     }
 }
 
-/// Runs `sql`, returning elapsed ms and the row count. Wall-clock, client-side,
+/// Runs `sql`, returning `(total_ms, plan_ms, rows)`. Wall-clock, client-side,
 /// whole result collected — identically for every engine.
-async fn timed(session: &Session, sql: &str) -> anyhow::Result<(f64, usize)> {
-    let start = Instant::now();
-    let rows = session.query(sql).await?;
-    let ms = start.elapsed().as_secs_f64() * 1000.0;
-    Ok((ms, rows))
+async fn timed(session: &Session, sql: &str) -> anyhow::Result<(f64, Option<f64>, usize)> {
+    session.query_split(sql).await
 }
 
 /// A fresh ukiel operator session with an empty metadata cache — cold, in the
@@ -168,7 +193,7 @@ where
     for (name, sql) in queries {
         let cold_ctx = new_session().await?;
         let cold = match timed(&cold_ctx, sql).await {
-            Ok((ms, _)) => ms,
+            Ok((ms, _, _)) => ms,
             Err(e) => {
                 println!("FAIL {engine}/{name}: {e}");
                 results.push(QueryResult {
@@ -178,6 +203,7 @@ where
                     hot_min_ms: 0.0,
                     hot_median_ms: 0.0,
                     rows: 0,
+                    plan_ms: None,
                     error: Some(e.to_string()),
                 });
                 continue;
@@ -185,16 +211,20 @@ where
         };
 
         let mut hot = Vec::with_capacity(iters);
+        let mut plans = Vec::with_capacity(iters);
         let mut rows = 0;
         for _ in 0..iters {
-            let (ms, n) = timed(&warm, sql).await?;
+            let (ms, plan_ms, n) = timed(&warm, sql).await?;
             hot.push(ms);
+            plans.extend(plan_ms);
             rows = n;
         }
         let hot_min = hot.iter().copied().fold(f64::INFINITY, f64::min);
         let hot_median = median(hot.clone());
+        let plan_ms = (!plans.is_empty()).then(|| median(plans));
+        let plan_note = plan_ms.map_or(String::new(), |p| format!(", plan {p:.1}"));
         println!(
-            "PERF {engine}/{name}={hot_min:.1} (cold {cold:.1}, median {hot_median:.1}, {rows} rows)"
+            "PERF {engine}/{name}={hot_min:.1} (cold {cold:.1}, median {hot_median:.1}{plan_note}, {rows} rows)"
         );
         results.push(QueryResult {
             name: name.clone(),
@@ -203,6 +233,7 @@ where
             hot_min_ms: hot_min,
             hot_median_ms: hot_median,
             rows,
+            plan_ms,
             error: None,
         });
     }
@@ -243,4 +274,43 @@ pub fn read_report(file: &str) -> anyhow::Result<SuiteReport> {
     let f = std::fs::File::open(&path)
         .with_context(|| format!("read {} — run the matching suite first", path.display()))?;
     Ok(serde_json::from_reader(f)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Plan 37 adds `plan_ms`. Every report recorded before it must still parse,
+    /// or `compare` silently loses the entire measurement history the moment the
+    /// field lands. `serde(default)` is what makes that true — pinned here with
+    /// a real pre-37 payload rather than trusted.
+    #[test]
+    fn pre_plan37_reports_still_deserialize() {
+        let pre_37 = r#"{
+            "label": "loaded",
+            "engine": "ukiel",
+            "table_rows": 99997497,
+            "queries": [{
+                "name": "q01",
+                "cold_ms": 13.8,
+                "hot_ms": [3.1, 3.4],
+                "hot_min_ms": 3.1,
+                "hot_median_ms": 3.25,
+                "rows": 1,
+                "error": null
+            }]
+        }"#;
+        let report: SuiteReport = serde_json::from_str(pre_37).unwrap();
+        assert_eq!(report.queries[0].hot_min_ms, 3.1);
+        assert_eq!(
+            report.queries[0].plan_ms, None,
+            "a pre-37 report has no planning split, and that must not be an error"
+        );
+
+        // And a post-37 one round-trips.
+        let mut q = report.queries[0].clone();
+        q.plan_ms = Some(1.75);
+        let round: QueryResult = serde_json::from_str(&serde_json::to_string(&q).unwrap()).unwrap();
+        assert_eq!(round.plan_ms, Some(1.75));
+    }
 }
