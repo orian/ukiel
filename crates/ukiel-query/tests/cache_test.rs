@@ -168,3 +168,119 @@ async fn head_never_downloads_the_object() {
         cached_file_names(dir.path())
     );
 }
+
+#[tokio::test]
+async fn large_objects_cache_aligned_chunks_and_serve_ranges() {
+    let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    let cached = CachingObjectStore::with_config(
+        inner.clone(),
+        dir.path().to_path_buf(),
+        CacheConfig {
+            large_object_threshold: 1024,
+            chunk_size: 512,
+            write_through: true,
+        },
+    );
+
+    // 4000 position-dependent bytes (a partial tail chunk: 4000 = 7*512 + 416),
+    // put straight into the INNER store so the read path — not write-through —
+    // is what populates the cache.
+    let source: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+    let location = Path::from("ht/9/L1/big.parquet");
+    inner.put(&location, source.clone().into()).await.unwrap();
+
+    // A range crossing the chunk boundary at 1024 (covers chunks 1 and 2).
+    let got = cached.get_range(&location, 900..1300).await.unwrap();
+    assert_eq!(got.as_ref(), &source[900..1300]);
+
+    // The tail chunk is clamped to the object size.
+    let tail = cached.get_range(&location, 3900..4000).await.unwrap();
+    assert_eq!(tail.as_ref(), &source[3900..4000]);
+
+    // Exactly the covering chunks were cached — and no whole-file copy.
+    assert_eq!(
+        cached_file_names(dir.path()),
+        vec![
+            "ht__9__L1__big.parquet.chunk-1".to_string(),
+            "ht__9__L1__big.parquet.chunk-2".to_string(),
+            "ht__9__L1__big.parquet.chunk-7".to_string(),
+        ],
+        "expected only the covering chunk files"
+    );
+
+    // Chunk files hold aligned slices: chunk 1 is exactly source[512..1024).
+    let chunk1 = std::fs::read(dir.path().join("ht__9__L1__big.parquet.chunk-1")).unwrap();
+    assert_eq!(chunk1.as_slice(), &source[512..1024]);
+
+    // Delete from inner: previously fetched ranges still serve from chunks...
+    inner.delete(&location).await.unwrap();
+    let again = cached.get_range(&location, 900..1300).await.unwrap();
+    assert_eq!(again.as_ref(), &source[900..1300]);
+    // ...but a range needing an unfetched chunk (chunk 5) errors — proving
+    // the cache really is chunk-granular, not a hidden whole-file copy.
+    assert!(
+        cached.get_range(&location, 3000..3100).await.is_err(),
+        "unfetched chunks must miss to the inner store"
+    );
+}
+
+#[tokio::test]
+async fn small_objects_keep_the_whole_file_path() {
+    let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    let cached = CachingObjectStore::with_config(
+        inner.clone(),
+        dir.path().to_path_buf(),
+        CacheConfig {
+            large_object_threshold: 1024,
+            chunk_size: 512,
+            write_through: false,
+        },
+    );
+
+    // Exactly at the threshold: still the whole-file path (strictly-larger
+    // objects chunk).
+    let source: Vec<u8> = (0..1024u32).map(|i| (i % 249) as u8).collect();
+    let location = Path::from("ht/9/L0/small.parquet");
+    inner.put(&location, source.clone().into()).await.unwrap();
+
+    let got = cached.get_range(&location, 100..300).await.unwrap();
+    assert_eq!(got.as_ref(), &source[100..300]);
+
+    assert_eq!(
+        cached_file_names(dir.path()),
+        vec!["ht__9__L0__small.parquet".to_string()],
+        "small objects cache as one whole file, never .chunk- files"
+    );
+}
+
+#[tokio::test]
+async fn prewarmed_large_object_serves_whole_file_never_chunks() {
+    let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    let cached = CachingObjectStore::with_config(
+        inner.clone(),
+        dir.path().to_path_buf(),
+        CacheConfig {
+            large_object_threshold: 1024,
+            chunk_size: 512,
+            write_through: true,
+        },
+    );
+
+    // Written through the cache: prewarmed whole, despite being > threshold.
+    let source: Vec<u8> = (0..3000u32).map(|i| (i % 253) as u8).collect();
+    let location = Path::from("ht/9/L2/prewarmed-big.parquet");
+    cached.put(&location, source.clone().into()).await.unwrap();
+    inner.delete(&location).await.unwrap();
+
+    // Any range serves from the whole-file copy; no chunk files appear, and
+    // no HEAD to the (now empty) inner store is needed.
+    let got = cached.get_range(&location, 700..2900).await.unwrap();
+    assert_eq!(got.as_ref(), &source[700..2900]);
+    assert_eq!(
+        cached_file_names(dir.path()),
+        vec!["ht__9__L2__prewarmed-big.parquet".to_string()]
+    );
+}

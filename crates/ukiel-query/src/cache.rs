@@ -3,13 +3,17 @@
 //! routes through in object_store 0.13) are served from a local copy
 //! downloaded once per object; everything else delegates to `inner`.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::io::SeekFrom;
+use std::ops::Range;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
 use futures::stream::BoxStream;
 use object_store::path::Path;
 use object_store::{
@@ -17,6 +21,7 @@ use object_store::{
     ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload,
     PutResult, Result, UploadPart,
 };
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 /// Tuning knobs for [`CachingObjectStore`]; `Default` is the production
 /// configuration (write-through on, 64 MiB large-object threshold, 8 MiB
@@ -47,6 +52,9 @@ pub struct CachingObjectStore {
     inner: Arc<dyn ObjectStore>,
     dir: PathBuf,
     config: CacheConfig,
+    /// Memoized object sizes (one `head` per path). Objects are immutable,
+    /// so entries never go stale.
+    sizes: Mutex<HashMap<String, u64>>,
 }
 
 impl CachingObjectStore {
@@ -55,11 +63,84 @@ impl CachingObjectStore {
     }
 
     pub fn with_config(inner: Arc<dyn ObjectStore>, dir: PathBuf, config: CacheConfig) -> Self {
-        Self { inner, dir, config }
+        Self {
+            inner,
+            dir,
+            config,
+            sizes: Mutex::new(HashMap::new()),
+        }
     }
 
     fn cache_path(&self, location: &Path) -> PathBuf {
         self.dir.join(location.as_ref().replace('/', "__"))
+    }
+
+    fn chunk_path(&self, location: &Path, index: u64) -> PathBuf {
+        self.dir.join(format!(
+            "{}.chunk-{index}",
+            location.as_ref().replace('/', "__")
+        ))
+    }
+
+    /// Object size from the in-memory map, or one `head` on the inner store.
+    /// Immutable objects: entries never go stale, and an entry outlives its
+    /// object in the inner store — cached chunks stay readable after GC.
+    async fn object_size(&self, location: &Path) -> Result<u64> {
+        if let Some(size) = self
+            .sizes
+            .lock()
+            .expect("sizes lock")
+            .get(location.as_ref())
+        {
+            return Ok(*size);
+        }
+        let size = self.inner.head(location).await?.size;
+        self.sizes
+            .lock()
+            .expect("sizes lock")
+            .insert(location.as_ref().to_string(), size);
+        Ok(size)
+    }
+
+    /// Reads `range` of a large object from aligned chunk files, fetching any
+    /// missing chunk from the inner store (aligned offsets, clamped to the
+    /// object size). Concurrent racers may fetch a chunk twice; the atomic
+    /// rename makes that harmless — same as `ensure_cached`.
+    async fn read_range_chunked(
+        &self,
+        location: &Path,
+        size: u64,
+        range: Range<u64>,
+    ) -> Result<Bytes> {
+        if range.start >= range.end {
+            return Ok(Bytes::new());
+        }
+        let chunk_size = self.config.chunk_size.max(1);
+        let mut out = Vec::with_capacity((range.end - range.start) as usize);
+        for index in range.start / chunk_size..=(range.end - 1) / chunk_size {
+            let chunk_start = index * chunk_size;
+            let chunk_end = (chunk_start + chunk_size).min(size);
+            let path = self.chunk_path(location, index);
+            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                metrics::counter!("cache_hits_total", "tier" => "chunk").increment(1);
+            } else {
+                metrics::counter!("cache_misses_total", "tier" => "chunk").increment(1);
+                let bytes = self
+                    .inner
+                    .get_range(location, chunk_start..chunk_end)
+                    .await?;
+                self.write_atomic(&path, &bytes).await?;
+            }
+            // The slice of this chunk the request covers, chunk-relative.
+            let lo = range.start.max(chunk_start) - chunk_start;
+            let hi = range.end.min(chunk_end) - chunk_start;
+            let mut file = tokio::fs::File::open(&path).await.map_err(io_err)?;
+            file.seek(SeekFrom::Start(lo)).await.map_err(io_err)?;
+            let mut buf = vec![0u8; (hi - lo) as usize];
+            file.read_exact(&mut buf).await.map_err(io_err)?;
+            out.extend_from_slice(&buf);
+        }
+        Ok(out.into())
     }
 
     /// Atomic tmp+rename write. Concurrent racers may both write; the rename
@@ -276,12 +357,47 @@ impl ObjectStore for CachingObjectStore {
         // A HEAD must never fetch data (the compactor HEADs every output
         // file right after writing it; head routes through get_opts because
         // ObjectStoreExt::head is a get_opts default — it cannot be
-        // overridden here).
+        // overridden here). Memoize the size it reports: it saves the later
+        // lookup on the chunked path.
         if options.head {
-            return self.inner.get_opts(location, options).await;
+            let result = self.inner.get_opts(location, options).await?;
+            self.sizes
+                .lock()
+                .expect("sizes lock")
+                .insert(location.as_ref().to_string(), result.meta.size);
+            return Ok(result);
         }
-        let path = self.ensure_cached(location).await?;
-        self.serve_local_file(location, path, &options)
+
+        let size = self.object_size(location).await?;
+        if size <= self.config.large_object_threshold {
+            let path = self.ensure_cached(location).await?;
+            return self.serve_local_file(location, path, &options);
+        }
+
+        // Large object: chunk-granular. Note: an un-ranged `get` buffers the
+        // object in memory; the Parquet read path always sends ranges, so
+        // that stays unused.
+        let range = match &options.range {
+            Some(r) => r.as_range(size).map_err(generic_err)?,
+            None => 0..size,
+        };
+        let bytes = self
+            .read_range_chunked(location, size, range.clone())
+            .await?;
+        Ok(GetResult {
+            payload: GetResultPayload::Stream(
+                futures::stream::once(async move { Ok::<_, object_store::Error>(bytes) }).boxed(),
+            ),
+            meta: ObjectMeta {
+                location: location.clone(),
+                last_modified: Utc::now(),
+                size,
+                e_tag: None,
+                version: None,
+            },
+            range,
+            attributes: Attributes::default(),
+        })
     }
 
     fn delete_stream(
