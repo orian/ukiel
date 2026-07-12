@@ -21,6 +21,7 @@ use std::process::ExitCode;
 
 mod bluesky;
 mod clickbench;
+mod clickhouse;
 mod hits;
 mod report;
 mod suite;
@@ -41,6 +42,8 @@ USAGE:
     bench bluesky produce --files N [--topic T] [--wave-files W]
     bench bluesky run --files N [--wave-files W] [--flush-ms MS] [--label LABEL]
     bench bluesky jsonbench [--iters N] [--label LABEL]     official JSONBench 5 queries
+    bench clickhouse load --table official|cb [--files N]   ClickHouse reference fixtures
+    bench clickhouse run --table official|cb|parquet [--iters N] [--label LABEL]
 
 Datasets: bench/datasets/{hits,bluesky}/ (fetch via `make bench-fetch-{hits,bluesky}`).
 Queries:  bench/queries/{clickbench,jsonbench}/ (vendored + ADAPTATIONS.md).
@@ -126,6 +129,24 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
             let iters = opt_usize(args, "--iters")?.unwrap_or(3);
             let label = opt_str(args, "--label").unwrap_or("baseline");
             bluesky::jsonbench(iters, label).await
+        }
+        (Some("clickhouse"), Some("load")) => {
+            let table =
+                clickhouse::Table::parse(opt_str(args, "--table").ok_or_else(|| {
+                    anyhow::anyhow!("clickhouse load needs --table official|cb")
+                })?)?;
+            clickhouse::load(table, opt_usize(args, "--files")?).await
+        }
+        (Some("clickhouse"), Some("run")) => {
+            let table = clickhouse::Table::parse(opt_str(args, "--table").ok_or_else(|| {
+                anyhow::anyhow!("clickhouse run needs --table official|cb|parquet")
+            })?)?;
+            let iters = opt_usize(args, "--iters")?.unwrap_or(3);
+            let label = opt_str(args, "--label").unwrap_or("baseline");
+            clickhouse::run(table, iters, label).await
+        }
+        (Some("clickhouse"), sub) => {
+            anyhow::bail!("unknown `clickhouse` subcommand {sub:?}\n\n{USAGE}")
         }
         (Some("bluesky"), sub) => anyhow::bail!("unknown `bluesky` subcommand {sub:?}\n\n{USAGE}"),
         (Some(other), _) => anyhow::bail!("unknown command '{other}'\n\n{USAGE}"),

@@ -37,7 +37,9 @@ fn queries() -> anyhow::Result<Vec<suite::Query>> {
 /// pushdown) without editing the suite.
 pub async fn sql(statement: &str) -> anyhow::Result<()> {
     let stack = ukiel_e2e::Stack::start().await;
-    let ctx = suite::cold_ukiel_session(&stack).await?;
+    let suite::Session::DataFusion(ctx) = suite::cold_ukiel_session(&stack).await? else {
+        anyhow::bail!("the operator session is always a DataFusion session");
+    };
     let batches = ctx.sql(statement).await?.collect().await?;
     println!(
         "{}",
@@ -146,7 +148,7 @@ pub async fn raw(iters: usize, label: &str, dir: &str) -> anyhow::Result<()> {
         iters,
         table_rows,
         &queries()?,
-        || async { raw_session(dir).await },
+        || async { Ok(suite::Session::DataFusion(raw_session(dir).await?)) },
     )
     .await?;
     suite::finish(report, &format!("clickbench-raw-{label}.json"))?;

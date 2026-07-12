@@ -1,14 +1,17 @@
 //! Shared harness for the *official* benchmark suites (plan 32): ClickBench's
 //! 43 queries and JSONBench's 5.
 //!
-//! Both are whole-table suites, so both run through ukiel's unscoped
-//! [operator session](ukiel_query::context::operator_session), and both use
-//! ClickBench's methodology: per query, one **cold** run (fresh session, fresh
-//! metadata cache) then N **hot** runs; the headline is the hot minimum.
+//! Every engine — ukiel's unscoped
+//! [operator session](ukiel_query::context::operator_session), bare DataFusion,
+//! and (plan 34) ClickHouse over HTTP — runs through the same methodology, which
+//! is ClickBench's own: per query, one **cold** run then N **hot** runs; the
+//! headline is the hot minimum. That uniformity is the whole point. Rungs of a
+//! comparison timed by different rules do not compare.
 //!
-//! "Cold" is honestly only cold at the ukiel layer — a fresh session drops the
-//! parquet footer cache, but the OS page cache and MinIO still hold the bytes.
-//! The reports say so rather than implying a cold-storage read.
+//! "Cold" is honestly only cold at the engine's *own* caching layer — a fresh
+//! ukiel session drops the parquet footer cache, and ClickHouse drops its mark
+//! and uncompressed caches — but the OS page cache still holds the bytes on
+//! every rung. That is stated rather than dressed up as a cold-storage read.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,6 +22,38 @@ use datafusion::prelude::SessionContext;
 use serde::{Deserialize, Serialize};
 use ukiel_e2e::Stack;
 use ukiel_query::metadata_cache::ParquetMetadataCache;
+
+use crate::clickhouse::ClickHouseEngine;
+
+/// A SQL engine one of the official suites can drive.
+///
+/// Concrete rather than a trait: there are exactly two transports (in-process
+/// DataFusion, HTTP) and a trait would buy nothing but an `async_trait`
+/// dependency and a box per query.
+pub enum Session {
+    DataFusion(SessionContext),
+    Http(ClickHouseEngine),
+}
+
+impl Session {
+    /// Runs `sql` to completion and returns the row count.
+    ///
+    /// Running it *to completion* is what makes the engines comparable:
+    /// DataFusion is lazy and ClickHouse is not, so timing either one at "first
+    /// row" would flatter one of them. Only the count comes back — no caller
+    /// needs the data, and materializing a 100M-row result would be a memory bug
+    /// in waiting. The count is kept precisely so a cross-engine comparison can
+    /// catch two engines disagreeing on the *answer*.
+    pub async fn query(&self, sql: &str) -> anyhow::Result<usize> {
+        match self {
+            Session::DataFusion(ctx) => {
+                let batches = ctx.sql(sql).await?.collect().await?;
+                Ok(batches.iter().map(|b| b.num_rows()).sum())
+            }
+            Session::Http(ch) => ch.query(sql).await,
+        }
+    }
+}
 
 /// One vendored query: its upstream number (`q01`…) and its SQL.
 pub type Query = (String, String);
@@ -86,25 +121,27 @@ pub fn median(mut v: Vec<f64>) -> f64 {
     }
 }
 
-/// Runs `sql` to completion, returning elapsed ms and the row count. Collects
-/// the full result, so the timing covers execution and not just planning.
-async fn timed(ctx: &SessionContext, sql: &str) -> anyhow::Result<(f64, usize)> {
+/// Runs `sql`, returning elapsed ms and the row count. Wall-clock, client-side,
+/// whole result collected — identically for every engine.
+async fn timed(session: &Session, sql: &str) -> anyhow::Result<(f64, usize)> {
     let start = Instant::now();
-    let batches = ctx.sql(sql).await?.collect().await?;
+    let rows = session.query(sql).await?;
     let ms = start.elapsed().as_secs_f64() * 1000.0;
-    Ok((ms, batches.iter().map(|b| b.num_rows()).sum()))
+    Ok((ms, rows))
 }
 
 /// A fresh ukiel operator session with an empty metadata cache — cold, in the
 /// only sense ukiel controls.
-pub async fn cold_ukiel_session(stack: &Stack) -> anyhow::Result<SessionContext> {
-    Ok(ukiel_query::context::operator_session(
-        &stack.catalog,
-        stack.store.clone(),
-        &stack.store_url,
-        Arc::new(ParquetMetadataCache::default()),
-    )
-    .await?)
+pub async fn cold_ukiel_session(stack: &Stack) -> anyhow::Result<Session> {
+    Ok(Session::DataFusion(
+        ukiel_query::context::operator_session(
+            &stack.catalog,
+            stack.store.clone(),
+            &stack.store_url,
+            Arc::new(ParquetMetadataCache::default()),
+        )
+        .await?,
+    ))
 }
 
 /// Runs a suite against a session factory: one cold run on a brand-new session
@@ -123,7 +160,7 @@ pub async fn run_suite<F, Fut>(
 ) -> anyhow::Result<SuiteReport>
 where
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<SessionContext>>,
+    Fut: std::future::Future<Output = anyhow::Result<Session>>,
 {
     let warm = new_session().await?;
     let mut results = Vec::with_capacity(queries.len());

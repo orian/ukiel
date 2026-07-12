@@ -1,0 +1,9 @@
+<!-- Point `file()` at the read-only ClickBench fixture mount (plan 34).
+
+     The dataset is mounted :ro so the container can never touch our 14 GB of
+     source data. ClickHouse's entrypoint chowns its default user_files dir on
+     startup, which fails hard against a read-only mount — so we mount the
+     fixture somewhere else and move user_files_path to it instead. -->
+<clickhouse>
+    <user_files_path>/fixtures/hits/</user_files_path>
+</clickhouse>
