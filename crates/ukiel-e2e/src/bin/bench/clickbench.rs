@@ -31,6 +31,21 @@ fn queries() -> anyhow::Result<Vec<suite::Query>> {
     )
 }
 
+/// `bench clickbench sql "<SQL>"`: one statement through the ukiel operator
+/// session, results pretty-printed. The diagnosis door: `EXPLAIN`/`EXPLAIN
+/// ANALYZE` on the exact stack the suite measures (partition counts, pruning,
+/// pushdown) without editing the suite.
+pub async fn sql(statement: &str) -> anyhow::Result<()> {
+    let stack = ukiel_e2e::Stack::start().await;
+    let ctx = suite::cold_ukiel_session(&stack).await?;
+    let batches = ctx.sql(statement).await?.collect().await?;
+    println!(
+        "{}",
+        datafusion::arrow::util::pretty::pretty_format_batches(&batches)?
+    );
+    Ok(())
+}
+
 /// `bench clickbench run [--iters N] [--label L]`: the 43 queries through
 /// ukiel's full read stack (catalog planning, provider, part pruning, footer
 /// cache) via the unscoped operator session.
@@ -72,12 +87,11 @@ pub async fn run(iters: usize, label: &str) -> anyhow::Result<()> {
 /// on every query with a `WHERE` clause. Measured: it was worth 14.8x on q24 and
 /// fabricated a "10x faster than DataFusion" result. The ratio must isolate
 /// *ukiel's stack*, not ukiel's choice of a flag the reference could set too.
-async fn raw_session() -> anyhow::Result<SessionContext> {
+async fn raw_session(dir: &str) -> anyhow::Result<SessionContext> {
     let mut config = SessionConfig::new();
     config.options_mut().execution.parquet.pushdown_filters = true;
     config.options_mut().execution.parquet.reorder_filters = true;
     let ctx = SessionContext::new_with_config(config);
-    let dir = "bench/datasets/hits/";
     let opts = ParquetReadOptions::default().parquet_pruning(true);
     ctx.register_parquet("hits_raw", dir, opts)
         .await
@@ -100,10 +114,16 @@ async fn raw_session() -> anyhow::Result<SessionContext> {
     Ok(ctx)
 }
 
-/// `bench clickbench raw [--iters N] [--label L]`: the same 43 queries on bare
-/// DataFusion over the same parquet files — the reference ceiling.
-pub async fn raw(iters: usize, label: &str) -> anyhow::Result<()> {
-    let probe = raw_session().await?;
+/// `bench clickbench raw [--iters N] [--label L] [--dir D]`: the same 43
+/// queries on bare DataFusion over parquet files — the reference ceiling.
+/// `--dir` defaults to the source dataset; pointing it at a local ukiel store
+/// (`$UKIEL_E2E_STORE_DIR/ht/<id>/`) prices ukiel's *file layout* (int64
+/// widening, ZSTD, sorting) with zero ukiel stack — only do that on a
+/// freshly-loaded fixture, where every object in the dir is a live part
+/// (after `compact`, superseded objects linger until GC and would be
+/// double-counted).
+pub async fn raw(iters: usize, label: &str, dir: &str) -> anyhow::Result<()> {
+    let probe = raw_session(dir).await?;
     let rows = probe
         .sql("SELECT count(*) AS n FROM hits_cb")
         .await?
@@ -126,7 +146,7 @@ pub async fn raw(iters: usize, label: &str) -> anyhow::Result<()> {
         iters,
         table_rows,
         &queries()?,
-        || async { raw_session().await },
+        || async { raw_session(dir).await },
     )
     .await?;
     suite::finish(report, &format!("clickbench-raw-{label}.json"))?;

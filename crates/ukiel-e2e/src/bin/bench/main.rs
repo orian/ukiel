@@ -32,10 +32,11 @@ USAGE:
     bench hits load [--files N]
     bench hits compact [--target-mb N]
     bench hits queries [--iters N] [--label LABEL]
-    bench clickbench load [--files N]
+    bench clickbench load [--files N] [--layout counter|ts]
     bench clickbench compact [--target-mb N]
     bench clickbench run [--iters N] [--label LABEL]        official 43 queries, ukiel stack
-    bench clickbench raw [--iters N] [--label LABEL]        same 43, bare DataFusion
+    bench clickbench raw [--iters N] [--label LABEL] [--dir D]  same 43, bare DataFusion
+    bench clickbench sql \"SQL\"                              one statement (EXPLAIN etc.) via the operator session
     bench clickbench compare --ukiel LABEL --raw LABEL      per-query overhead ratios
     bench bluesky produce --files N [--topic T] [--wave-files W]
     bench bluesky run --files N [--wave-files W] [--flush-ms MS] [--label LABEL]
@@ -67,7 +68,7 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
             Ok(())
         }
         (Some("clickbench"), Some("load")) => {
-            hits::load_clickbench(opt_usize(args, "--files")?).await
+            hits::load_clickbench(opt_usize(args, "--files")?, opt_str(args, "--layout")).await
         }
         (Some("clickbench"), Some("compact")) => {
             hits::compact(&hits::HITS_CB, opt_usize(args, "--target-mb")?).await
@@ -80,7 +81,14 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
         (Some("clickbench"), Some("raw")) => {
             let iters = opt_usize(args, "--iters")?.unwrap_or(3);
             let label = opt_str(args, "--label").unwrap_or("baseline");
-            clickbench::raw(iters, label).await
+            let dir = opt_str(args, "--dir").unwrap_or("bench/datasets/hits/");
+            clickbench::raw(iters, label, dir).await
+        }
+        (Some("clickbench"), Some("sql")) => {
+            let statement = args
+                .get(2)
+                .ok_or_else(|| anyhow::anyhow!("clickbench sql needs a statement"))?;
+            clickbench::sql(statement).await
         }
         (Some("clickbench"), Some("compare")) => {
             let ukiel = opt_str(args, "--ukiel").unwrap_or("baseline");

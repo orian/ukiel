@@ -65,7 +65,17 @@ make e2e-down   # docker compose down -v   (wipes all volumes)
 
 The bench connects to the stack via the same env vars the e2e suite uses
 (`UKIEL_E2E_KAFKA`, `UKIEL_E2E_PG`, `UKIEL_E2E_S3`), with compose-matching
-defaults — no config needed for the default local stack.
+defaults. **`UKIEL_E2E_STORE_DIR=<dir>` swaps MinIO for a local-filesystem
+object store** — set it for *both* the load and every later command against
+that fixture (the catalog stores store-relative paths; mixing stores 404s).
+Added for the gap-attribution runs (`docs/notes/2026-07-12-official-suite-gap.md`):
+it removes the HTTP transport layer, which the plan-32 headline showed was
+half the measured ukiel-vs-raw gap. `clickbench raw --dir` points the raw
+reference at any parquet directory — e.g. the local store's own `ht/<id>/L1/`
+right after a load, which prices ukiel's file layout with zero ukiel stack
+(only on a freshly-loaded fixture: post-compaction the dir still holds
+superseded objects until GC, and a listing would double-count). No config is
+needed for the default local stack.
 
 ---
 
@@ -116,7 +126,8 @@ bench bluesky run --files N [--wave-files W] [--flush-ms MS] [--label LABEL]
 bench clickbench load [--files N]
 bench clickbench compact [--target-mb N]
 bench clickbench run [--iters N] [--label LABEL]        # 43 queries, ukiel stack
-bench clickbench raw [--iters N] [--label LABEL]        # same 43, bare DataFusion
+bench clickbench raw [--iters N] [--label LABEL] [--dir D]  # same 43, bare DataFusion
+bench clickbench sql "SQL"                              # one statement (EXPLAIN etc.), operator session
 bench clickbench compare --ukiel LABEL --raw LABEL      # per-query overhead ratios
 bench bluesky jsonbench [--iters N] [--label LABEL]     # JSONBench's 5 queries
 
@@ -888,6 +899,24 @@ $B clickbench compare --ukiel sized --raw loaded
 # JSONBench:
 $B bluesky run --files 10 --label plan32 && $B bluesky jsonbench --label plan32
 ```
+
+### OFFICIAL SUITES follow-up — gap attribution + layout experiment, 2026-07-12
+
+The plan-32 2.16× was decomposed with controlled runs (full analysis and
+per-run tables: `docs/notes/2026-07-12-official-suite-gap.md`): **transport
+52%** (MinIO HTTP, no data-cache tier — killed for benching by
+`UKIEL_E2E_STORE_DIR`, killed for production by plan 15), **stack 38%**
+(dominated by issue-0010 aggregates — row 35 — while key-filtered queries
+*beat* raw DataFusion 3–4.5× on identical files), **layout 10%** (int64
+widening + ZSTD — row 36). With local bytes ukiel is **1.56× raw**. The
+provider now declares its output ordering only on predicated scans (measured
+split, see the note; product path unaffected by construction). A time-led
+fixture layout (`clickbench load --layout ts`) was measured and recorded as
+*not* a net win — it trades the CounterID point-query class for
+aggregate/TopK wins (ts-sized 42.4 s vs counter-loaded 38.6 s local).
+Labels: `local-loaded`, `raw ukiel-files`, `ab-*` (ordering A/B),
+`heuristic*`, `tslayout-*`. Anchor totals: raw 24.7 s / ukiel-local 38.6 s /
+ukiel-MinIO 53.4 s.
 
 ### 100M / 1B tiers — optional / stretch
 

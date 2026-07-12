@@ -384,6 +384,24 @@ pub const HITS_CB: Dataset = Dataset {
     day_from: ("EventTime", 1000),
 };
 
+/// `hits_cb` in a **time-led layout** (`bench clickbench load --layout ts`):
+/// same 25 columns and table name, but packed and sorted by `EventDate` with
+/// `EventTime` inside the day. `HITS_CB` models ClickBench as if it were the
+/// multitenant product (CounterID-packed) — the right *product* shape, but not
+/// how anyone would deploy a whole-table analytics workload. This layout is
+/// that deployment: files are time-ordered (the ORDER BY the data actually
+/// has), part stats prune by date range, and within a day the packing key is
+/// constant, so SizeTargeted compaction ts-slices each day (plan 29
+/// whale-split) into balanced files. Load into a fresh catalog+store — same
+/// table name, different physical claim.
+pub const HITS_CB_TS: Dataset = Dataset {
+    table: "hits_cb",
+    cols: HITS_CB.cols,
+    packing_key: "EventDate",
+    sort_key: &["EventDate", "EventTime"],
+    day_from: ("EventTime", 1000),
+};
+
 fn dataset_dir() -> PathBuf {
     PathBuf::from("bench/datasets/hits")
 }
@@ -616,17 +634,26 @@ fn require_inputs(files: Option<usize>) -> anyhow::Result<Vec<PathBuf>> {
     Ok(inputs)
 }
 
-/// `bench clickbench load [--files N]`: loads the official-suite fixture
-/// (`hits_cb`, verbatim column names). No census and no logical tables — the
-/// 43 queries are whole-table and run through the unscoped operator session.
-pub async fn load_clickbench(files: Option<usize>) -> anyhow::Result<()> {
+/// `bench clickbench load [--files N] [--layout ts]`: loads the official-suite
+/// fixture (`hits_cb`, verbatim column names). No census and no logical
+/// tables — the 43 queries are whole-table and run through the unscoped
+/// operator session. `--layout ts` loads [`HITS_CB_TS`] (time-led packing)
+/// instead of the multitenant-shaped default; same table name, so it needs a
+/// fresh catalog + store.
+pub async fn load_clickbench(files: Option<usize>, layout: Option<&str>) -> anyhow::Result<()> {
+    let dataset = match layout {
+        None | Some("counter") => &HITS_CB,
+        Some("ts") => &HITS_CB_TS,
+        Some(other) => anyhow::bail!("unknown --layout '{other}' (expected 'counter' or 'ts')"),
+    };
     let inputs = require_inputs(files)?;
     let stack = Stack::start().await;
-    let census = load_dataset(&stack, &HITS_CB, &inputs).await?;
+    let census = load_dataset(&stack, dataset, &inputs).await?;
     let rows: i64 = census.values().sum();
     println!(
-        "hits_cb: {rows} rows over {} CounterIDs from {} file(s) — run `bench clickbench run`",
+        "hits_cb: {rows} rows over {} {}s from {} file(s) — run `bench clickbench run`",
         census.len(),
+        dataset.packing_key,
         inputs.len()
     );
     Ok(())

@@ -72,18 +72,32 @@ impl Stack {
             .expect("connect catalog");
         catalog.migrate().await.expect("migrate");
 
-        let s3 = AmazonS3Builder::new()
-            .with_endpoint(&s3_endpoint)
-            .with_bucket_name("ukiel")
-            .with_access_key_id("minioadmin")
-            .with_secret_access_key("minioadmin")
-            .with_region("us-east-1")
-            .with_allow_http(true)
-            .with_virtual_hosted_style_request(false)
-            .build()
-            .expect("build s3 store");
-        let store: Arc<dyn ObjectStore> = Arc::new(s3);
-        let store_url = url::Url::parse("s3://ukiel/").unwrap();
+        // UKIEL_E2E_STORE_DIR swaps MinIO for a local-filesystem store (bench
+        // attribution: reads skip the HTTP object-store layer entirely; part
+        // paths are store-relative, so the catalog is oblivious). Unset =
+        // compose MinIO, the e2e default.
+        let (store, store_url): (Arc<dyn ObjectStore>, url::Url) =
+            match std::env::var("UKIEL_E2E_STORE_DIR") {
+                Ok(dir) if !dir.is_empty() => {
+                    std::fs::create_dir_all(&dir).expect("create store dir");
+                    let local = object_store::local::LocalFileSystem::new_with_prefix(&dir)
+                        .expect("build local store");
+                    (Arc::new(local), url::Url::parse("file:///").unwrap())
+                }
+                _ => {
+                    let s3 = AmazonS3Builder::new()
+                        .with_endpoint(&s3_endpoint)
+                        .with_bucket_name("ukiel")
+                        .with_access_key_id("minioadmin")
+                        .with_secret_access_key("minioadmin")
+                        .with_region("us-east-1")
+                        .with_allow_http(true)
+                        .with_virtual_hosted_style_request(false)
+                        .build()
+                        .expect("build s3 store");
+                    (Arc::new(s3), url::Url::parse("s3://ukiel/").unwrap())
+                }
+            };
 
         let producer: FutureProducer = ClientConfig::new()
             .set("bootstrap.servers", &brokers)
