@@ -69,7 +69,18 @@ fn scan_info(exec: &DataSourceExec) -> Option<ScanInfo> {
                     (f.object_meta.location.to_string(), range)
                 })
                 .collect();
-            let bytes: u64 = g.files().iter().map(|f| f.object_meta.size).sum();
+            // A repartitioned scan SPLITS files into byte ranges, and every range
+            // carries the whole file's `object_meta.size`. Summing that would
+            // double-count split files and misstate group balance — which is the
+            // exact signal H1 rests on. Charge each range only its own bytes.
+            let bytes: u64 = g
+                .files()
+                .iter()
+                .map(|f| match &f.range {
+                    Some(r) => (r.end - r.start) as u64,
+                    None => f.object_meta.size,
+                })
+                .sum();
             Group { bytes, files }
         })
         .collect();
@@ -227,6 +238,28 @@ pub async fn analyze_report(
         if per_partition.is_empty() {
             continue;
         }
+        // Named metrics beyond compute/rows — the parquet source's own timing
+        // (opening, scanning, row-group pruning, bytes) is where an I/O-bound
+        // difference actually shows, and `elapsed_compute` deliberately excludes
+        // async wait, so without these a wall-vs-CPU gap has nowhere to land.
+        let mut named: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+        for m in metrics.iter() {
+            let v = m.value();
+            let name = v.name().to_string();
+            if matches!(name.as_str(), "elapsed_compute" | "output_rows") {
+                continue;
+            }
+            *named.entry(name).or_default() += v.as_usize() as f64;
+        }
+        for (k, v) in &named {
+            let shown = if k.starts_with("time_") || k.ends_with("_time") {
+                format!("{:.1} ms", v / 1e6)
+            } else {
+                format!("{v:.0}")
+            };
+            s.push_str(&format!("{indent}    [{k}] {shown}\n"));
+        }
+
         let computes: Vec<u128> = per_partition.values().map(|(c, _)| *c).collect();
         let sum: u128 = computes.iter().sum();
         total_compute_ns += sum;

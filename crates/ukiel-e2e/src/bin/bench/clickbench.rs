@@ -31,21 +31,51 @@ fn queries() -> anyhow::Result<Vec<suite::Query>> {
     )
 }
 
+/// Plan 37, H5: the same-binary lever for DataFusion's **sort-pushdown**
+/// machinery (epic apache/datafusion#23036, phases 1–3 all live in our DF 54
+/// pin; `enable_sort_pushdown` defaults to true).
+///
+/// Why this exists as a knob rather than a rebuild: the provider's declared
+/// ordering feeds `eq_properties()` → `FileScanConfig::try_pushdown_sort` →
+/// `ParquetSource::try_pushdown_sort` → **statistics-based file/row-group
+/// reordering and runtime TopK dynamic filters** — none of which appears in
+/// `EXPLAIN`. That is exactly the observed signature: identical displayed plans,
+/// different execution. `UKIEL_BENCH_SORT_PUSHDOWN=0` turns the whole chain off
+/// on *both* sessions in one toggle, without changing the binary — which the
+/// measurement protocol requires, because rebuild-between-configs A/B is how the
+/// earlier investigation misled itself.
+fn apply_sort_pushdown_toggle(ctx: &SessionContext) {
+    let enabled = std::env::var("UKIEL_BENCH_SORT_PUSHDOWN")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    if !enabled {
+        ctx.state_ref()
+            .write()
+            .config_mut()
+            .options_mut()
+            .optimizer
+            .enable_sort_pushdown = false;
+        eprintln!("note: datafusion.optimizer.enable_sort_pushdown = false (H5 lever)");
+    }
+}
+
 /// The session an instrument runs against: ukiel's operator session, or the raw
 /// DataFusion reference over a parquet directory. The whole method is
 /// differential — same bytes, same binary, two stacks — so every instrument
 /// takes this.
 async fn instrument_session(raw_dir: Option<&str>) -> anyhow::Result<SessionContext> {
-    match raw_dir {
-        Some(dir) => raw_session(dir).await,
+    let ctx = match raw_dir {
+        Some(dir) => raw_session(dir).await?,
         None => {
             let stack = ukiel_e2e::Stack::start().await;
             let suite::Session::DataFusion(ctx) = suite::cold_ukiel_session(&stack).await? else {
                 anyhow::bail!("the operator session is always a DataFusion session");
             };
-            Ok(ctx)
+            ctx
         }
-    }
+    };
+    apply_sort_pushdown_toggle(&ctx);
+    Ok(ctx)
 }
 
 /// `bench clickbench plan "<SQL>" [--raw [--dir D]] [--max-files N]`: the
@@ -124,8 +154,12 @@ pub async fn run(iters: usize, label: &str) -> anyhow::Result<()> {
         parts.len()
     );
 
-    let report = suite::run_suite("ukiel", label, iters, table_rows, &queries()?, || {
-        suite::cold_ukiel_session(&stack)
+    let report = suite::run_suite("ukiel", label, iters, table_rows, &queries()?, || async {
+        let s = suite::cold_ukiel_session(&stack).await?;
+        if let suite::Session::DataFusion(ctx) = &s {
+            apply_sort_pushdown_toggle(ctx);
+        }
+        Ok(s)
     })
     .await?;
     suite::finish(report, &format!("clickbench-ukiel-{label}.json"))?;
@@ -207,7 +241,11 @@ pub async fn raw(iters: usize, label: &str, dir: &str) -> anyhow::Result<()> {
         iters,
         table_rows,
         &queries()?,
-        || async { Ok(suite::Session::DataFusion(raw_session(dir).await?)) },
+        || async {
+            let ctx = raw_session(dir).await?;
+            apply_sort_pushdown_toggle(&ctx);
+            Ok(suite::Session::DataFusion(ctx))
+        },
     )
     .await?;
     suite::finish(report, &format!("clickbench-raw-{label}.json"))?;

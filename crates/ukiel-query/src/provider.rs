@@ -231,7 +231,7 @@ impl TableProvider for UkielTableProvider {
 
     async fn scan(
         &self,
-        state: &dyn Session,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -316,21 +316,22 @@ impl TableProvider for UkielTableProvider {
         scan_projection.dedup();
         let scanned_schema = Arc::new(self.physical_schema.project(&scan_projection)?);
 
-        // Pushdown predicate for the Parquet reader: isolation (when scoped) AND
-        // every user filter that converts cleanly. Built against the FILE schema
-        // (physical_schema) — pushdown may reference unprojected columns.
-        // Best-effort by design: anything skipped is re-applied by DataFusion
-        // above (Inexact), and the FilterExec below remains the security
-        // boundary regardless.
-        let physical_names: std::collections::HashSet<&str> = self
-            .physical_schema
-            .fields()
-            .iter()
-            .map(|f| f.name().as_str())
-            .collect();
-        let df_schema =
-            datafusion::common::DFSchema::try_from(self.physical_schema.as_ref().clone())?;
-        let mut pushdown: Option<Arc<dyn PhysicalExpr>> = match self.slice {
+        // Pushdown predicate for the Parquet reader: **the isolation predicate
+        // only** (scoped mode). Built against the FILE schema (physical_schema),
+        // because pushdown may reference columns the projection drops.
+        //
+        // The user's own filters are deliberately NOT folded in here, even though
+        // they could be. DataFusion already pushes them into this same
+        // `ParquetSource` (we enable `pushdown_filters`), so hand-building them a
+        // second time made the reader evaluate every predicate column **twice** —
+        // measured as exactly 2x `predicate_cache_records` (181.8M vs 90.9M on
+        // ClickBench q14) and ~15% of wall, with byte-identical pruning and
+        // answers. The isolation predicate is different in kind: DataFusion has no
+        // way to know about it, so it is ours to supply.
+        //
+        // The `FilterExec` below remains the security boundary regardless of what
+        // any of this pushes down (plan 37, F3).
+        let pushdown: Option<Arc<dyn PhysicalExpr>> = match self.slice {
             Some(key) => Some(binary(
                 col(&self.hypertable.packing_key, &self.physical_schema)?,
                 Operator::Eq,
@@ -339,24 +340,6 @@ impl TableProvider for UkielTableProvider {
             )?),
             None => None,
         };
-        for filter in filters {
-            let refs = filter.column_refs();
-            if !refs
-                .iter()
-                .all(|c| physical_names.contains(c.name.as_str()))
-            {
-                continue; // references an alias or unknown column: not pushable
-            }
-            match state.create_physical_expr(filter.clone(), &df_schema) {
-                Ok(expr) => {
-                    pushdown = Some(match pushdown {
-                        Some(prev) => binary(prev, Operator::And, expr, &self.physical_schema)?,
-                        None => expr,
-                    });
-                }
-                Err(_) => continue, // unconvertible filter: DataFusion re-applies it
-            }
-        }
 
         let has_predicate = pushdown.is_some();
         let mut source = ParquetSource::new(self.physical_schema.clone())
