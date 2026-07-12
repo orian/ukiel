@@ -137,6 +137,39 @@ pub fn key_row_groups(
     Some(serde_json::Value::Array(spans))
 }
 
+/// Folds the key index into a part's `column_stats` object.
+///
+/// Shared by all three writers (ingest, streaming merge, deletion rewrite) so
+/// the JSON shape cannot drift between them. Both indices are optional and
+/// independent: an absent one is simply not written, and the reader treats its
+/// absence as "no information — keep the part".
+///
+/// Callers gate on **multi-key parts only** (`key_min != key_max`): a dedicated
+/// file — every `Separated` output, every plan-29 whale slice — is already exact
+/// under range pruning, so an index there is pure overhead, and a whale slice
+/// would blow the distinct-key cap anyway.
+pub fn with_key_index(
+    stats: Option<serde_json::Value>,
+    bitmap: Option<String>,
+    spans: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    if bitmap.is_none() && spans.is_none() {
+        return stats;
+    }
+    let mut map = match stats {
+        Some(serde_json::Value::Object(m)) => m,
+        // No Int64 stats to extend: the index still earns its own object.
+        _ => serde_json::Map::new(),
+    };
+    if let Some(b) = bitmap {
+        map.insert(PACKING_KEYS_STAT.to_string(), serde_json::Value::String(b));
+    }
+    if let Some(s) = spans {
+        map.insert(KEY_ROW_GROUPS_STAT.to_string(), s);
+    }
+    Some(serde_json::Value::Object(map))
+}
+
 /// `{"col": {"min": i64, "max": i64}}` for every Int64 column with at least
 /// one non-null value. `None` when nothing is collectable.
 pub fn int64_column_stats(batch: &RecordBatch) -> Option<serde_json::Value> {

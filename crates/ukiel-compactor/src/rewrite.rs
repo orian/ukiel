@@ -16,7 +16,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObjectWriter};
-use ukiel_core::stats::Int64StatsAccumulator;
+use ukiel_core::stats::{Int64StatsAccumulator, KeyBitmapAccumulator};
 use ukiel_core::{Part, Placement, TableColumns, WriteOpts};
 
 use crate::CompactorError;
@@ -242,7 +242,7 @@ pub fn batch_to_parquet_key_aligned(
     packing_key: &str,
     sort_key: &[String],
     opts: &ukiel_core::WriteOpts,
-) -> Result<Vec<u8>, CompactorError> {
+) -> Result<(Vec<u8>, Option<serde_json::Value>), CompactorError> {
     let props = ukiel_core::writer_props(&batch.schema(), sort_key, opts);
     let mut bytes = Vec::new();
     let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), Some(props))?;
@@ -254,8 +254,14 @@ pub fn batch_to_parquet_key_aligned(
         }
         writer.write(&slice)?;
     }
+    // Plan 16: flush the in-progress group so `flushed_row_groups()` sees every
+    // group (it excludes the buffered one), then read the spans before `close()`
+    // consumes the writer. Positional index — a missing final group would
+    // mis-align every span.
+    writer.flush()?;
+    let spans = ukiel_core::stats::key_row_groups(writer.flushed_row_groups(), packing_key);
     writer.close()?;
-    Ok(bytes)
+    Ok((bytes, spans))
 }
 
 /// Callback fired before an output file's first byte — the caller registers
@@ -284,6 +290,11 @@ struct OpenFile {
     current_key: i64,
     rows: i64,
     stats: Int64StatsAccumulator,
+    /// Plan 16: distinct packing keys, folded in per slice.
+    keys: KeyBitmapAccumulator,
+    /// The packing-key column name — the bitmap and the row-group spans both
+    /// index it.
+    packing_key: String,
     /// A `SizeTargeted` whale continuation: a single-key dedicated file that
     /// must not absorb a following different key.
     dedicated: bool,
@@ -296,6 +307,7 @@ impl OpenFile {
         self.current_key = key;
         self.rows += slice.num_rows() as i64;
         self.stats.update(slice);
+        self.keys.update(slice, &self.packing_key);
         Ok(())
     }
 
@@ -307,14 +319,35 @@ impl OpenFile {
 
     async fn close(self, store: &Arc<dyn ObjectStore>) -> Result<ChunkOutput, CompactorError> {
         let OpenFile {
-            writer,
+            mut writer,
             path,
             key_min,
             key_max,
             rows,
             stats,
+            keys,
+            packing_key,
             ..
         } = self;
+        // Plan 16: row-group spans come from the writer's own metadata. Two
+        // ordering constraints, and getting either wrong corrupts the index
+        // silently rather than loudly:
+        //   1. `flush()` first — `flushed_row_groups()` excludes the in-progress
+        //      group, so reading it unflushed would omit the final row group and
+        //      leave every span positionally mis-indexed against the file.
+        //   2. Read before `close()`, which consumes the writer.
+        // Multi-key files only: a dedicated file (every `Separated` output, every
+        // whale ts-slice) is already exact under range pruning.
+        let multi_key = key_min != key_max;
+        let (bitmap, spans) = if multi_key {
+            writer.flush().await?;
+            let spans =
+                ukiel_core::stats::key_row_groups(writer.flushed_row_groups(), &packing_key);
+            (keys.finish(), spans)
+        } else {
+            (None, None)
+        };
+
         writer.close().await?;
         let size_bytes = store.head(&Path::from(path.clone())).await?.size as i64;
         Ok(ChunkOutput {
@@ -323,7 +356,7 @@ impl OpenFile {
             key_max,
             row_count: rows,
             size_bytes,
-            column_stats: stats.finish(),
+            column_stats: ukiel_core::stats::with_key_index(stats.finish(), bitmap, spans),
         })
     }
 }
@@ -388,6 +421,8 @@ impl StreamingChunkWriter {
             current_key: key,
             rows: 0,
             stats: Int64StatsAccumulator::default(),
+            keys: KeyBitmapAccumulator::default(),
+            packing_key: self.packing_key.clone(),
             dedicated,
         })
     }
@@ -560,6 +595,99 @@ mod tests {
             next_path,
             on_open,
         )
+    }
+
+    /// Plan 16, on the writer that produces most production parts. Three
+    /// properties, and each one is a way the index could be silently wrong:
+    ///
+    /// * the bitmap is **exact** — a key inside the file's min/max that owns no
+    ///   rows tests `false` (the whole reason the bitmap exists);
+    /// * the spans **agree with the file's own footer**, group for group (they
+    ///   are positional, so an off-by-one would make a reader skip live data);
+    /// * a **single-key** file carries neither (range pruning is already exact
+    ///   there, so an index would be pure cost).
+    #[tokio::test]
+    async fn streaming_writer_records_an_exact_bitmap_and_footer_matching_spans() {
+        use parquet::file::statistics::Statistics;
+        use ukiel_core::stats::{KEY_ROW_GROUPS_STAT, PACKING_KEYS_STAT, bitmap_contains};
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let opened = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let opts = WriteOpts {
+            level: 1,
+            ts_column: Some("ts".to_string()),
+            bloom_columns: vec![],
+            max_row_group_rows: 4, // force several row groups
+        };
+        let w = writer_over(&store, Placement::Packed, opts, opened.clone());
+        // Keys 1, 2 and 9 — nothing between 2 and 9, which is what the bitmap
+        // can prove and min/max (1..9) cannot.
+        let out = w
+            .write(one_stream(vec![kv_run(1, 5), kv_run(2, 5), kv_run(9, 5)]))
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1, "packed → one file");
+        let stats = out[0].column_stats.as_ref().expect("stats written");
+
+        let encoded = stats[PACKING_KEYS_STAT].as_str().expect("bitmap written");
+        for present in [1, 2, 9] {
+            assert_eq!(bitmap_contains(encoded, present), Some(true), "{present}");
+        }
+        for absent in [3, 5, 8] {
+            // Inside [key_min, key_max] = [1, 9], so range pruning keeps the
+            // part; the bitmap proves it holds no such rows.
+            assert_eq!(bitmap_contains(encoded, absent), Some(false), "{absent}");
+        }
+
+        // Spans, against the file's own footer.
+        let bytes = store
+            .get(&Path::from(out[0].path.clone()))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let md = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .unwrap()
+            .metadata()
+            .clone();
+        let footer: Vec<serde_json::Value> = md
+            .row_groups()
+            .iter()
+            .map(|rg| match rg.column(0).statistics().unwrap() {
+                Statistics::Int64(v) => {
+                    serde_json::json!([*v.min_opt().unwrap(), *v.max_opt().unwrap()])
+                }
+                _ => panic!("int64 key stats"),
+            })
+            .collect();
+        assert!(md.num_row_groups() > 1, "the fixture must span row groups");
+        assert_eq!(
+            stats[KEY_ROW_GROUPS_STAT],
+            serde_json::Value::Array(footer),
+            "spans == the file's own footer, group for group"
+        );
+
+        // A single-key (dedicated) file carries no index: range pruning is
+        // already exact for it. Fresh store — `writer_over` restarts its path
+        // counter, and on_open asserts the file does not yet exist.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let w = writer_over(
+            &store,
+            Placement::Separated,
+            WriteOpts::for_level(1),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+        );
+        let out = w.write(one_stream(vec![kv_run(7, 4)])).await.unwrap();
+        let stats = out[0].column_stats.as_ref().unwrap();
+        assert!(
+            stats.get(PACKING_KEYS_STAT).is_none(),
+            "no bitmap on a dedicated file"
+        );
+        assert!(
+            stats.get(KEY_ROW_GROUPS_STAT).is_none(),
+            "no spans on a dedicated file"
+        );
     }
 
     #[tokio::test]
@@ -787,7 +915,8 @@ mod tests {
             bloom_columns: vec![],
             max_row_group_rows: 4,
         };
-        let bytes = batch_to_parquet_key_aligned(&batch, "tenant_id", &sort_key, &opts).unwrap();
+        let (bytes, spans) =
+            batch_to_parquet_key_aligned(&batch, "tenant_id", &sort_key, &opts).unwrap();
 
         let md = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
             .unwrap()
@@ -809,6 +938,18 @@ mod tests {
             vec![(1, 1), (2, 2), (3, 3), (3, 4)],
             "consecutive groups' key ranges never interleave"
         );
+
+        // Plan 16: the catalog's row-group spans must agree with the file's own
+        // footer, group for group. They are positional — a missing or extra
+        // entry would mis-index every group after it, and a reader would skip
+        // the wrong data. Pinning them against the footer is the only assertion
+        // that catches that.
+        let expected: serde_json::Value = ranges
+            .iter()
+            .map(|(lo, hi)| serde_json::json!([lo, hi]))
+            .collect::<Vec<_>>()
+            .into();
+        assert_eq!(spans.unwrap(), expected, "spans == the file's own footer");
 
         // Shared opts: ZSTD (L1+), delta-ts, nulls-first stamps.
         let rg0 = md.row_group(0);

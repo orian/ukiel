@@ -61,3 +61,46 @@ async fn delete_key_drops_dedicated_and_rewrites_packed() {
     let stats = delete_key(&env.catalog, &env.store, &ht, 7).await.unwrap();
     assert_eq!(stats.dropped_parts + stats.rewritten_parts, 0);
 }
+
+/// Plan 16: a deletion rewrite rebuilds the key index from the *kept* rows, so
+/// the deleted key falls out of the bitmap. Without this, the rewritten part's
+/// min/max could still span the deleted key and every future query for it would
+/// open the file to find nothing — the exact false positive the bitmap exists to
+/// kill.
+#[tokio::test]
+async fn deletion_rewrite_drops_the_key_from_the_bitmap() {
+    use ukiel_core::stats::{PACKING_KEYS_STAT, bitmap_contains};
+
+    let env = setup().await;
+    // One packed file spanning keys 3..90: deleting 7 leaves the range intact
+    // (3..90 still "contains" 7), so only the bitmap can prove 7 is gone.
+    add_l0(
+        &env,
+        "d1",
+        vec![
+            json!({"tenant_id": 3, "ts": 1, "payload": "three"}),
+            json!({"tenant_id": 7, "ts": 2, "payload": "seven"}),
+            json!({"tenant_id": 90, "ts": 3, "payload": "ninety"}),
+        ],
+    )
+    .await;
+
+    let ht = env.catalog.get_hypertable("events").await.unwrap();
+    delete_key(&env.catalog, &env.store, &ht, 7).await.unwrap();
+
+    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
+    assert_eq!(parts.len(), 1, "the packed file was rewritten in place");
+    let part = &parts[0];
+    // The range still spans 7 — this is precisely why range pruning is not enough.
+    assert!(part.meta.packing_key_min <= 7 && part.meta.packing_key_max >= 7);
+
+    let stats = part.meta.column_stats.as_ref().expect("stats rebuilt");
+    let encoded = stats[PACKING_KEYS_STAT].as_str().expect("bitmap rebuilt");
+    assert_eq!(
+        bitmap_contains(encoded, 7),
+        Some(false),
+        "the deleted key must be gone from the bitmap"
+    );
+    assert_eq!(bitmap_contains(encoded, 3), Some(true));
+    assert_eq!(bitmap_contains(encoded, 90), Some(true));
+}

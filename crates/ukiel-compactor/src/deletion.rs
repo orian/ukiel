@@ -65,7 +65,7 @@ pub async fn delete_key(
         // batch stays sorted after the filter).
         let opts =
             ukiel_core::WriteOpts::from_columns(&cols, &hypertable.sort_key, part.meta.level);
-        let bytes = rewrite::batch_to_parquet_key_aligned(
+        let (bytes, spans) = rewrite::batch_to_parquet_key_aligned(
             &kept,
             &hypertable.packing_key,
             &hypertable.sort_key,
@@ -90,7 +90,16 @@ pub async fn delete_key(
             row_count: kept.num_rows() as i64,
             size_bytes,
             level: part.meta.level,
-            column_stats: ukiel_core::stats::int64_column_stats(&kept),
+            // Plan 16: the rewritten part's index is rebuilt from the *kept*
+            // rows, so the deleted key drops out of the bitmap — which is what
+            // makes a later query for it prune this part instead of opening it.
+            column_stats: ukiel_core::stats::with_key_index(
+                ukiel_core::stats::int64_column_stats(&kept),
+                (key_min != key_max)
+                    .then(|| ukiel_core::stats::key_bitmap(&kept, &hypertable.packing_key))
+                    .flatten(),
+                (key_min != key_max).then_some(spans).flatten(),
+            ),
         });
     }
 

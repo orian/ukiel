@@ -119,7 +119,17 @@ fn finish_batch(
         })?;
     let key_min = arrow::compute::min(keys).ok_or(IngestError::EmptyFlush)?;
     let key_max = arrow::compute::max(keys).ok_or(IngestError::EmptyFlush)?;
-    let column_stats = ukiel_core::stats::int64_column_stats(&batch);
+    // Plan 16: the packing-key bitmap makes part pruning exact for sparse
+    // tenants. Multi-key L0 flushes only — a single-key file is already exact
+    // under range pruning. No row-group spans here: L0 files are small,
+    // short-lived and single-row-group in practice, so spans would buy nothing.
+    let column_stats = ukiel_core::stats::with_key_index(
+        ukiel_core::stats::int64_column_stats(&batch),
+        (key_min != key_max)
+            .then(|| ukiel_core::stats::key_bitmap(&batch, packing_key))
+            .flatten(),
+        None,
+    );
 
     let props = ukiel_core::writer_props(&batch.schema(), sort_key, &opts);
     let mut bytes = Vec::new();
@@ -186,6 +196,51 @@ mod tests {
         assert_eq!(payloads.value(0), "b");
         assert_eq!(payloads.value(1), "a");
         assert_eq!(payloads.value(2), "c");
+    }
+
+    /// Plan 16: a multi-key L0 flush carries an exact packing-key bitmap; a
+    /// single-key flush does not (range pruning is already exact there, so the
+    /// index would be pure cost on a short-lived file).
+    #[test]
+    fn l0_multi_key_flush_carries_an_exact_key_bitmap() {
+        use ukiel_core::stats::{KEY_ROW_GROUPS_STAT, PACKING_KEYS_STAT, bitmap_contains};
+
+        let cols = ukiel_core::TableColumns::parse(&json!({"fields": [
+            {"name": "tenant_id", "type": "int64"},
+            {"name": "ts", "type": "timestamp_ms"}
+        ]}))
+        .unwrap();
+        let sort_key = sk();
+
+        // Keys 2 and 40 — the gap between them is what min/max cannot see.
+        let rows: Vec<_> = [2i64, 40, 2, 40]
+            .iter()
+            .enumerate()
+            .map(|(i, k)| json!({"tenant_id": k, "ts": i as i64}))
+            .collect();
+        let part = encode_rows(&cols, "tenant_id", "ts", &sort_key, rows).unwrap();
+        let stats = part.column_stats.as_ref().unwrap();
+        let encoded = stats[PACKING_KEYS_STAT].as_str().expect("bitmap written");
+        assert_eq!(bitmap_contains(encoded, 2), Some(true));
+        assert_eq!(bitmap_contains(encoded, 40), Some(true));
+        // Inside [2, 40], owns no rows: the bitmap proves the part can be skipped.
+        assert_eq!(bitmap_contains(encoded, 17), Some(false));
+        // L0 files are small and single-row-group in practice — no spans here.
+        assert!(stats.get(KEY_ROW_GROUPS_STAT).is_none());
+
+        // Single-key flush: no bitmap.
+        let rows: Vec<_> = (0..3i64)
+            .map(|i| json!({"tenant_id": 5, "ts": i}))
+            .collect();
+        let part = encode_rows(&cols, "tenant_id", "ts", &sort_key, rows).unwrap();
+        assert!(
+            part.column_stats
+                .as_ref()
+                .unwrap()
+                .get(PACKING_KEYS_STAT)
+                .is_none(),
+            "a single-key part is already exact under range pruning"
+        );
     }
 
     #[test]
