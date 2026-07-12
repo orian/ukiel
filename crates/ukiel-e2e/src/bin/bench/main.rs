@@ -23,6 +23,7 @@ mod bluesky;
 mod clickbench;
 mod clickhouse;
 mod hits;
+mod inspect;
 mod report;
 mod suite;
 
@@ -38,6 +39,8 @@ USAGE:
     bench clickbench compact [--target-mb N]
     bench clickbench run [--iters N] [--label LABEL]        official 43 queries, ukiel stack
     bench clickbench raw [--iters N] [--label LABEL] [--dir D]  same 43, bare DataFusion
+    bench clickbench plan \"SQL\" [--raw] [--dir D] [--max-files N]   full plan: groups, orderings
+    bench clickbench analyze \"SQL\" [--raw] [--dir D] [--iters N]     per-partition compute + skew
     bench clickbench sql \"SQL\"                              one statement (EXPLAIN etc.) via the operator session
     bench clickbench compare --ukiel LABEL --raw LABEL      per-query overhead ratios
     bench bluesky produce --files N [--topic T] [--wave-files W]
@@ -87,6 +90,24 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
             let label = opt_str(args, "--label").unwrap_or("baseline");
             let dir = opt_str(args, "--dir").unwrap_or("bench/datasets/hits/");
             clickbench::raw(iters, label, dir).await
+        }
+        (Some("clickbench"), Some("plan")) => {
+            let statement = args
+                .get(2)
+                .ok_or_else(|| anyhow::anyhow!("clickbench plan needs a statement"))?;
+            let raw = args.iter().any(|a| a == "--raw");
+            let dir = opt_str(args, "--dir").unwrap_or("bench/datasets/hits/");
+            let max_files = opt_usize(args, "--max-files")?.unwrap_or(3);
+            clickbench::plan(statement, raw.then_some(dir), max_files).await
+        }
+        (Some("clickbench"), Some("analyze")) => {
+            let statement = args
+                .get(2)
+                .ok_or_else(|| anyhow::anyhow!("clickbench analyze needs a statement"))?;
+            let raw = args.iter().any(|a| a == "--raw");
+            let dir = opt_str(args, "--dir").unwrap_or("bench/datasets/hits/");
+            let iters = opt_usize(args, "--iters")?.unwrap_or(1);
+            clickbench::analyze(statement, raw.then_some(dir), iters).await
         }
         (Some("clickbench"), Some("sql")) => {
             let statement = args

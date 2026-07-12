@@ -2,3 +2,4 @@
 .idea/
 /bench/datasets/
 /bench/results/
+/bench/store/

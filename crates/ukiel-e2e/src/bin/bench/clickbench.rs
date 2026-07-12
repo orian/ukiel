@@ -31,6 +31,65 @@ fn queries() -> anyhow::Result<Vec<suite::Query>> {
     )
 }
 
+/// The session an instrument runs against: ukiel's operator session, or the raw
+/// DataFusion reference over a parquet directory. The whole method is
+/// differential — same bytes, same binary, two stacks — so every instrument
+/// takes this.
+async fn instrument_session(raw_dir: Option<&str>) -> anyhow::Result<SessionContext> {
+    match raw_dir {
+        Some(dir) => raw_session(dir).await,
+        None => {
+            let stack = ukiel_e2e::Stack::start().await;
+            let suite::Session::DataFusion(ctx) = suite::cold_ukiel_session(&stack).await? else {
+                anyhow::bail!("the operator session is always a DataFusion session");
+            };
+            Ok(ctx)
+        }
+    }
+}
+
+/// `bench clickbench plan "<SQL>" [--raw [--dir D]] [--max-files N]`: the
+/// **complete** physical plan — every file group, every byte range, partitioning
+/// and equivalence orderings.
+///
+/// This exists because `EXPLAIN` truncates its file-group list at five groups
+/// and never prints equivalence properties at all. The gap-note investigation
+/// concluded "textually identical plans" from that output, which was never
+/// evidence: the part that could differ is the part that does not print.
+pub async fn plan(statement: &str, raw_dir: Option<&str>, max_files: usize) -> anyhow::Result<()> {
+    let ctx = instrument_session(raw_dir).await?;
+    let plan = ctx.sql(statement).await?.create_physical_plan().await?;
+    println!(
+        "engine: {}
+{}",
+        raw_dir.map_or("ukiel (operator session)".to_string(), |d| format!(
+            "raw DataFusion over {d}"
+        )),
+        crate::inspect::plan_report(&plan, max_files)
+    );
+    Ok(())
+}
+
+/// `bench clickbench analyze "<SQL>" [--raw [--dir D]] [--iters N]`: per-partition
+/// compute, skew, and achieved parallelism — what `EXPLAIN ANALYZE` averages away.
+pub async fn analyze(statement: &str, raw_dir: Option<&str>, iters: usize) -> anyhow::Result<()> {
+    let ctx = instrument_session(raw_dir).await?;
+    println!(
+        "engine: {}",
+        raw_dir.map_or("ukiel (operator session)".to_string(), |d| format!(
+            "raw DataFusion over {d}"
+        ))
+    );
+    for i in 1..=iters {
+        // A fresh physical plan per run: metrics accumulate into the plan's own
+        // nodes, so reusing one would sum every run together and hide the skew.
+        let plan = ctx.sql(statement).await?.create_physical_plan().await?;
+        println!("--- run {i}/{iters} ---");
+        println!("{}", crate::inspect::analyze_report(&ctx, plan).await?);
+    }
+    Ok(())
+}
+
 /// `bench clickbench sql "<SQL>"`: one statement through the ukiel operator
 /// session, results pretty-printed. The diagnosis door: `EXPLAIN`/`EXPLAIN
 /// ANALYZE` on the exact stack the suite measures (partition counts, pruning,
