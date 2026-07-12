@@ -263,6 +263,7 @@ impl TableProvider for UkielTableProvider {
             }
         }
 
+        let has_predicate = pushdown.is_some();
         let mut source = ParquetSource::new(self.physical_schema.clone())
             .with_pushdown_filters(true)
             .with_reorder_filters(true)
@@ -277,28 +278,40 @@ impl TableProvider for UkielTableProvider {
         let file_groups: Vec<FileGroup> =
             files.into_iter().map(|f| FileGroup::new(vec![f])).collect();
 
-        // Declared ordering: the file's true physical order, the longest prefix
-        // of the sort key present in the scan. Built against the file schema —
-        // DataFusion validates the declared ordering against the unprojected
-        // table schema (and each file's min/max stats), then maps it through the
-        // scan projection. Declaring the *full* `(packing_key, ts, …)` order is
-        // the only sound choice: a packed file is NOT ts-sorted on its own (ts
-        // resets per key), so a `[ts]`-only claim would be rejected by
-        // stats validation. Sort elimination for `ORDER BY ts` would need the
-        // isolation predicate's `packing_key = const` equivalence to collapse
-        // `(packing_key, ts)` to `(ts)`; see the note in `order_by_sort_key_*`.
-        let mut sort_exprs: Vec<PhysicalSortExpr> = Vec::new();
-        for name in &self.hypertable.sort_key {
-            match col(name, &self.physical_schema) {
-                Ok(expr) => sort_exprs.push(PhysicalSortExpr::new_default(expr)),
-                Err(_) => break, // column not in the file: ordering prefix ends
-            }
-        }
+        // Declared ordering — predicated scans only; a measured split, not a
+        // principle (`docs/notes/2026-07-12-official-suite-gap.md`). Two
+        // same-binary-A/B facts on DataFusion 54: (a) on a *filterless* scan
+        // the declaration survives to file repartitioning and forces
+        // order-preserving mode — whole-file groups instead of balanced
+        // byte-range splits, gating low-fan-out layouts on their largest file
+        // (packed hits_cb GROUP BY CounterID: a 732 MB single-threaded
+        // critical path, 1.54x); (b) on *predicated* scans (a WHERE clause or
+        // the isolation slice — every product query) the declaration is
+        // cleared from the displayed plan by pushdown, yet dropping it still
+        // cost 15–25% wall on a broad band of GROUP BYs via lower achieved
+        // scan concurrency (identical plans, metrics, and total CPU; ~1450%
+        // vs ~1130% utilization — mechanism in DataFusion not fully pinned).
+        // So: declare exactly when a pushdown predicate exists. Sort
+        // elimination never fires on 54 either way
+        // (`order_by_sort_key_results_stay_correct_and_ordered`); files stamp
+        // `sorting_columns` (plan 27) regardless. Declaring the *full*
+        // `(packing_key, ts, …)` prefix is the only sound claim: a packed
+        // file is NOT ts-sorted on its own (ts resets per key), so a
+        // `[ts]`-only claim would be rejected by stats validation.
         let mut builder = FileScanConfigBuilder::new(self.store_url.clone(), source)
             .with_file_groups(file_groups)
             .with_projection_indices(Some(scan_projection))?;
-        if let Some(ordering) = LexOrdering::new(sort_exprs) {
-            builder = builder.with_output_ordering(vec![ordering]);
+        if has_predicate {
+            let mut sort_exprs: Vec<PhysicalSortExpr> = Vec::new();
+            for name in &self.hypertable.sort_key {
+                match col(name, &self.physical_schema) {
+                    Ok(expr) => sort_exprs.push(PhysicalSortExpr::new_default(expr)),
+                    Err(_) => break, // column not in the file: ordering prefix ends
+                }
+            }
+            if let Some(ordering) = LexOrdering::new(sort_exprs) {
+                builder = builder.with_output_ordering(vec![ordering]);
+            }
         }
         let config = builder.build();
         let scan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);

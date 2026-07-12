@@ -708,15 +708,19 @@ async fn order_by_sort_key_results_stay_correct_and_ordered() {
         .unwrap();
     assert_eq!(all_strings(&batches, "payload"), vec!["a1", "a2"]);
 
-    // TODO(follow-up): sort elimination does not fire in DataFusion 54. The
-    // writers declare `sorting_columns` and the provider declares the file's
-    // `(packing_key, ts)` output ordering, but Task 3's predicate pushdown
-    // rebuilds the scan and clears the declared ordering, so `EnforceSorting`
-    // still inserts a `SortExec` for `ORDER BY ts`. Eliminating it needs the
-    // isolation predicate's `packing_key = const` equivalence to survive
-    // pushdown and collapse `(packing_key, ts)` to `(ts)` — a DataFusion-side
-    // capability. The declared ordering is sound metadata regardless; it pays
-    // off once pushdown and ordering coexist. Tracked in the perf note.
+    // The provider declares the `(packing_key, ts)` output ordering only on
+    // *predicated* scans (a WHERE clause or the isolation slice) — the
+    // measured split from `docs/notes/2026-07-12-official-suite-gap.md`: on
+    // filterless scans the declaration forces order-preserving file
+    // repartitioning (whole-file groups, largest-file critical path, 1.54x on
+    // packed scan aggregates), while on predicated scans dropping it cost
+    // 15-25% wall via lower scan concurrency. Both sides are pinned here so a
+    // change in either direction is a deliberate, re-measured act.
+
+    // Predicated (scoped) scan: declaration active. `sort_order_for_reorder`
+    // tracks it on this query — pushdown clears the declaration from the
+    // DataSourceExec display, but the reorder marker only appears when the
+    // scan declared an ordering.
     let batches = ctx
         .sql("EXPLAIN SELECT ts FROM events ORDER BY ts")
         .await
@@ -727,11 +731,35 @@ async fn order_by_sort_key_results_stay_correct_and_ordered() {
     let plan = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
         .unwrap()
         .to_string();
-    // The scan still declares its ordering as an optimizer hint even though the
-    // sort is not yet eliminated (sound direction to build on).
     assert!(
         plan.contains("sort_order_for_reorder"),
-        "expected the scan to carry a declared ordering hint; plan was:\n{plan}"
+        "expected the predicated scan to declare its ordering; plan was:\n{plan}"
+    );
+
+    // Filterless unscoped scan: no declaration (`output_ordering=` absent
+    // from DataSourceExec even with the full sort key projected).
+    let store_url = url::Url::parse(STORE_URL).unwrap();
+    let operator = ukiel_query::context::operator_session(
+        &h.catalog,
+        h.store.clone(),
+        &store_url,
+        test_metadata_cache(),
+    )
+    .await
+    .unwrap();
+    let batches = operator
+        .sql("EXPLAIN SELECT tenant_id, ts FROM events")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let plan = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string();
+    assert!(
+        !plan.contains("output_ordering="),
+        "expected no declared ordering on a filterless scan (see provider.rs scan comment); plan was:\n{plan}"
     );
 }
 
