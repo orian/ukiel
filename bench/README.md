@@ -131,8 +131,27 @@ bench clickbench sql "SQL"                              # one statement (EXPLAIN
 bench clickbench compare --ukiel LABEL --raw LABEL      # per-query overhead ratios
 bench bluesky jsonbench [--iters N] [--label LABEL]     # JSONBench's 5 queries
 
+# ClickHouse reference (plan 34) — needs `docker compose --profile bench up -d clickhouse`
+bench clickhouse load --table official|cb|parquet [--files N]
+bench clickhouse run  --table official|cb|parquet [--iters N] [--label LABEL]
+
 bench --help
 ```
+
+**The ClickHouse reference** answers the question plan 32 could not: *2.1x of
+what?* Three fixtures, each in its own ClickHouse database so they cannot
+overwrite one another:
+
+- `official` — upstream's **verbatim** 105-column MergeTree and **verbatim**
+  queries. Zero adaptations. Its total is held against ClickHouse's *published*
+  ClickBench figure: the **machine calibration** that makes every other number in
+  this file interpretable.
+- `cb` — the same 25 columns as ukiel's fixture, with ukiel's sort key and day
+  partitioning mirrored, and ukiel's `int64`/`String` widths (so ClickHouse is
+  not handed narrower, cheaper data). The apples-to-apples OLAP ceiling.
+- `parquet` — ClickHouse reading **the same parquet files bare DataFusion
+  reads**, via `file()`. The only measurement where the two engines differ in
+  *nothing but the engine*. See §6 for what it found.
 
 ### `hits load [--files N]`
 
@@ -917,6 +936,103 @@ aggregate/TopK wins (ts-sized 42.4 s vs counter-loaded 38.6 s local).
 Labels: `local-loaded`, `raw ukiel-files`, `ab-*` (ordering A/B),
 `heuristic*`, `tslayout-*`. Anchor totals: raw 24.7 s / ukiel-local 38.6 s /
 ukiel-MinIO 53.4 s.
+
+### CLICKHOUSE REFERENCE — plan 34 (ClickHouse half), 2026-07-12
+
+SHA `098eb58`. Same machine (AMD Ryzen AI 9 HX 370, 12C/24T, 91 GB RAM, NVMe),
+ClickHouse **26.6** in the compose `bench` profile, HTTP interface, same 100
+ClickBench parquet files read **in place**. Same methodology as every other rung
+(1 cold + 3 hot, headline = hot minimum). All rows: **99,997,497**.
+
+#### Is this machine normal? (the calibration)
+
+`clickhouse run --table official` runs upstream's **verbatim** 105-column
+MergeTree and **verbatim** `queries.sql` — zero adaptations — so our total is
+directly comparable to ClickHouse's own published ClickBench numbers:
+
+| | 43-query hot-min total | load |
+|---|---|---|
+| **this machine** (Ryzen HX 370, 24T) | **20.9 s** | **38.5 s** |
+| published `c6a.4xlarge` (16 vCPU x86) | 32.3 s | 294 s |
+| published `c8g.4xlarge` (16 vCPU Graviton4) | 14.2 s | 293 s |
+| published `c6a.metal` (192 vCPU) | 7.7 s | 252 s |
+
+**The machine is ordinary and the harness is sane.** A 24-thread laptop landing
+between two 16-vCPU cloud boxes is exactly where it should land. Every other
+number in this file can now be read as "on a box a bit faster than a
+c6a.4xlarge" rather than "on some laptop." (Our load is far faster than the
+published one — local NVMe, no download in the timing.)
+
+#### The whole ladder, one table
+
+| engine / substrate | total (43 hot minima) | vs ClickHouse MergeTree |
+|---|---|---|
+| ClickHouse, 105-col MergeTree (upstream verbatim) | **20.9 s** | 0.91× |
+| **ClickHouse, 25-col MergeTree** (ukiel's sort key + day partitioning) | **22.9 s** | **1.00×** |
+| bare DataFusion, raw parquet, local disk | 24.7 s | 1.08× |
+| **ClickHouse, the *same* raw parquet** (`file()`) | **31.5 s** | **1.38×** |
+| ukiel, local-filesystem store | 38.6 s | 1.69× |
+| ukiel, MinIO — loaded / packed / sized | 53.4 / 52.4 / 52.9 s | ~2.3× |
+
+#### The finding I did not expect
+
+**On identical parquet bytes, DataFusion beats ClickHouse — 24.7 s vs 31.5 s
+(1.27×).** Same files, same local disk, same 25 columns, same queries; the only
+difference is the engine. ClickHouse's ClickBench dominance is therefore **not
+an execution-engine advantage over DataFusion — it is a storage-format
+advantage**: MergeTree (22.9 s) versus ClickHouse reading parquet (31.5 s) is
+**1.38×**, and that 1.38× is the entire gap between "ClickHouse the benchmark
+champion" and "an engine DataFusion outruns."
+
+That reframes ukiel's position. We are built on the engine that *wins* the
+same-substrate comparison. Our 2.3× to ClickHouse is not a wager on a slow
+engine — it decomposes into things we can name and fix:
+
+- **transport (52%)** — MinIO HTTP with no data-cache tier. Local bytes alone
+  take ukiel from 53.4 s to **38.6 s**. That is roadmap **row 15** (cache
+  tiering), already planned.
+- **stack (38%)** — dominated by issue **0010** (aggregates we scan for that the
+  catalog already knows: q07 is 78× raw). Roadmap **row 35**.
+- **layout (10%)** — int64 widening + ZSTD. Roadmap **row 36**.
+- **format** — the 1.38× MergeTree wins over parquet is the one *nobody* on a
+  parquet-on-object-storage architecture gets for free. It is the honest,
+  permanent tax of the lakehouse shape, and it is worth naming rather than
+  chasing.
+
+Fix transport and stack and the arithmetic says ukiel lands near
+DataFusion-on-parquet, i.e. **at or slightly ahead of ClickHouse-on-parquet**,
+with MergeTree still ~1.4× ahead on its own format. That is a defensible place
+for a multitenant lakehouse to be, and it is a claim this table can be held
+against.
+
+#### The narrow-types tax, measured but not over-claimed
+
+The 105-column table (20.9 s) beats our 25-column one (22.9 s) by **2.0 s**
+despite reading 4× the columns — because upstream keeps the source's narrow
+types (`Int16`/`Int32`/`UInt16`) while ours widens everything to `int64`, as
+ukiel's type system requires.
+
+But **~0.7 s of that 2.0 s is our own dialect adaptation, not types**: q28/q29
+use `lengthUTF8` (character length, to match DataFusion's `length` semantics so
+every rung returns the same answer) where upstream uses byte `length` — q28
+alone costs +613 ms. The remaining ~1.3 s sits in the group-by-heavy q31–q35,
+which is consistent with int64 keys, but the two tables also differ in column
+count, so this is **suggestive, not a clean measurement of type widening**. The
+clean one is roadmap row 36's.
+
+#### Reproduce
+
+```bash
+docker compose --profile bench up -d clickhouse       # opt-in; `make e2e` never starts it
+B="cargo run --release -p ukiel-e2e --bin bench --"
+$B clickhouse load --table official && $B clickhouse run --table official --label baseline
+$B clickhouse load --table cb       && $B clickhouse run --table cb       --label baseline
+$B clickhouse load --table parquet  && $B clickhouse run --table parquet  --label baseline
+```
+
+Each fixture lives in its own ClickHouse database (`bench_official`, `bench_cb`,
+`bench_parquet`) — `cb` and `parquet` both present a table called `hits_cb`, and
+sharing a database would have one silently overwrite the other.
 
 ### OFFICIAL SUITES — plan 15 (cache tiering), 2026-07-12
 
