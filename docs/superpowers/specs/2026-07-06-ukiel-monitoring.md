@@ -64,7 +64,8 @@ alert traces back to an invariant or an SLO.
 | `query_timeouts_total` | counter | statement-timeout expiries (plan 19 / issue 0002) — a rate here means tenants are hitting the rail; sustained growth is a capacity or pruning problem wearing a timeout costume |
 | `query_parts_scanned` / `query_parts_pruned` | histogram | pruning effectiveness in production, not just benchmarks |
 | `query_objectstore_requests_total{op}` | counter | the cost metric (same counting wrapper the perf spec defines) |
-| `cache_hits_total` / `cache_misses_total{tier}` | counter | NVMe file cache and Parquet metadata cache (plan 13's counters) — hit-ratio drop predicts latency regression and disk pressure |
+| `cache_hits_total` / `cache_misses_total{tier}` | counter | NVMe file cache and Parquet metadata cache (plan 13's counters) — hit-ratio drop predicts latency regression and disk pressure. Tiers now include `chunk` (plan 15's per-chunk accounting on the large-object path; `file` unchanged) |
+| `cache_prewarms_total{kind}` | counter | write-through prewarms (`put` and `multipart`, plan 15) — a prewarm rate far below the commit rate means writers are bypassing the cache tier |
 | `query_sessions_built_total` | counter | per-request session cost visibility |
 
 ### Compactor

@@ -96,10 +96,25 @@ layout (a follow-up data-collection run; row 16 revalidates the population).
     the 10 GB-tier per-tenant fan-out floor (67–108 footer reads/query,
     `bench/README.md` §6) — re-run `bench hits queries` vs the recorded
     baseline to measure.*
-12. **Write-through cache prewarm**: compactor L1 outputs are the hottest
-    files in the system; push them into the NVMe cache at write time.
-13. **Range-granular caching** for large dedicated files (whole-file caching
-    is right for small packed files, wasteful at 1GB).
+12. **Write-through cache prewarm** *(plan 15 — executed)*: `put_opts`
+    prewarms the local cache after a successful upload, and a multipart tee
+    mirrors the compactor's streamed outputs (plan 29) into the cache as they
+    upload — ingest L0, deletion rewrites, and every merge output land hot;
+    the compactor's post-close HEAD is served locally. HEADs never download
+    (`get_opts` head passthrough — pre-15 the cache downloaded on HEAD).
+13. **Range-granular caching** *(plan 15 — executed)*: objects over
+    `cache_large_object_threshold` (64 MiB default) cache as aligned
+    `cache_chunk_size` (8 MiB) chunk files fetched on demand; small objects
+    keep the whole-file path; prewarmed files of any size serve whole. One
+    memoized HEAD per object discovers the size.
+
+Cache growth after plan 15: the cache dir grows with every write (prewarm)
+and every large-object read (chunks); eviction remains future work —
+`ukield_cache_dir_free_ratio`/`_bytes` (plan 21) are the guardrail, and the
+collector's byte walk counts chunk files since it walks the dir. GC-deleted
+objects leave stale cache files — harmless (part paths are UUID-fresh, the
+catalog never reuses them) but they count toward disk usage; a `cache-gc`
+sweep is the natural follow-up.
 
 ## Sequencing
 

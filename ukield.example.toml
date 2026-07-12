@@ -20,7 +20,11 @@ allow_http = true
 listen = "127.0.0.1:8080"
 # Also serves GET /metrics (Prometheus) and GET /readyz on this listener.
 # A process without the query role emits metrics but has no endpoint (P2).
-cache_dir = "" # non-empty = local read-through cache directory
+cache_dir = "" # non-empty = local disk cache (read-through + write-through prewarm)
+# Cache tuning (defaults shown; uncomment only to override):
+# cache_write_through = true              # prewarm the cache with every written object
+# cache_large_object_threshold = 67108864 # objects over 64 MiB cache as aligned chunks
+# cache_chunk_size = 8388608              # 8 MiB chunk files for large objects
 statement_timeout_secs = 300 # must be < gc.tombstone_grace_secs (issue 0002)
 
 [ingest]

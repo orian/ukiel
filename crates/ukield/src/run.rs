@@ -14,7 +14,7 @@ use ukiel_compactor::compactor::{Compactor, CompactorConfig};
 use ukiel_gc::{Gc, GcConfig};
 use ukiel_ingest::config::{IngestConfig, TableRoute};
 use ukiel_ingest::consumer::IngestWorker;
-use ukiel_query::cache::CachingObjectStore;
+use ukiel_query::cache::{CacheConfig, CachingObjectStore};
 use ukiel_query::metadata_cache::ParquetMetadataCache;
 use ukiel_query::server::{AppState, router};
 
@@ -83,9 +83,14 @@ pub async fn run_with_bound_addr(
     let store: Arc<dyn ObjectStore> = if cfg.query.cache_dir.is_empty() {
         base_store
     } else {
-        Arc::new(CachingObjectStore::new(
+        Arc::new(CachingObjectStore::with_config(
             base_store,
             PathBuf::from(&cfg.query.cache_dir),
+            CacheConfig {
+                large_object_threshold: cfg.query.cache_large_object_threshold,
+                chunk_size: cfg.query.cache_chunk_size,
+                write_through: cfg.query.cache_write_through,
+            },
         ))
     };
 

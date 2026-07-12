@@ -82,8 +82,15 @@ fn default_region() -> String {
 #[serde(default)]
 pub struct QueryConfig {
     pub listen: String,
-    /// Non-empty = wrap the store in the local read-through cache.
+    /// Non-empty = wrap the store in the local cache (read-through +
+    /// write-through prewarm; chunked for large objects).
     pub cache_dir: String,
+    /// Prewarm the cache with written objects (ingest/compactor output).
+    pub cache_write_through: bool,
+    /// Objects larger than this many bytes are cached as chunks.
+    pub cache_large_object_threshold: u64,
+    /// Chunk size in bytes for large-object caching.
+    pub cache_chunk_size: u64,
     /// Statement timeout in seconds (issue 0002: must stay below
     /// gc.tombstone_grace_secs — validated at startup by `validate`).
     pub statement_timeout_secs: u64,
@@ -91,9 +98,14 @@ pub struct QueryConfig {
 
 impl Default for QueryConfig {
     fn default() -> Self {
+        // Cache defaults come from one place: the cache's own config.
+        let cache = ukiel_query::cache::CacheConfig::default();
         Self {
             listen: "127.0.0.1:8080".to_string(),
             cache_dir: String::new(),
+            cache_write_through: cache.write_through,
+            cache_large_object_threshold: cache.large_object_threshold,
+            cache_chunk_size: cache.chunk_size,
             statement_timeout_secs: 300,
         }
     }
@@ -392,6 +404,9 @@ mod tests {
             vec![Role::Ingest, Role::Query, Role::Compactor, Role::Gc]
         );
         assert_eq!(cfg.query.listen, "127.0.0.1:8080");
+        assert!(cfg.query.cache_write_through);
+        assert_eq!(cfg.query.cache_large_object_threshold, 64 * 1024 * 1024);
+        assert_eq!(cfg.query.cache_chunk_size, 8 * 1024 * 1024);
         assert_eq!(cfg.ingest.flush_interval_ms, 10_000);
         assert_eq!(cfg.gc.tombstone_grace_secs, 900.0);
         assert_eq!(cfg.object_store.kind, "s3");
