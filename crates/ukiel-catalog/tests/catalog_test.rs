@@ -902,7 +902,14 @@ async fn capacity_probes_count_l0_runs_and_candidates() {
             .unwrap(),
         0
     );
-    assert!(catalog.finalize_candidates(ht).await.unwrap().is_empty());
+    assert!(
+        catalog
+            .finalize_candidates(ht, Uuid::nil(), 0.0, 64, None)
+            .await
+            .unwrap()
+            .partitions
+            .is_empty()
+    );
 
     // Two L0 commits on day1, one on day2.
     add_l0_part(&catalog, ht, &day1).await;
@@ -933,8 +940,11 @@ async fn capacity_probes_count_l0_runs_and_candidates() {
     );
 
     // Only day1 has >= 2 live runs.
-    let candidates = catalog.finalize_candidates(ht).await.unwrap();
-    assert_eq!(candidates, vec![day1.clone()]);
+    let candidates = catalog
+        .finalize_candidates(ht, Uuid::nil(), 0.0, 64, None)
+        .await
+        .unwrap();
+    assert_eq!(candidates.partitions, vec![day1.clone()]);
 
     // live_partition_parts scopes to one partition.
     let parts = catalog.live_partition_parts(ht, &day1).await.unwrap();
@@ -972,7 +982,14 @@ async fn capacity_probes_count_l0_runs_and_candidates() {
         0
     );
     // day1 now has a single run (the L1 merge); day2 still has one L0 run.
-    assert!(catalog.finalize_candidates(ht).await.unwrap().is_empty());
+    assert!(
+        catalog
+            .finalize_candidates(ht, Uuid::nil(), 0.0, 64, None)
+            .await
+            .unwrap()
+            .partitions
+            .is_empty()
+    );
 }
 
 use ukiel_core::ColumnRange;
@@ -1305,15 +1322,19 @@ async fn compaction_candidates_come_from_live_state() {
     add_l0_part(&catalog, ht, &day1).await;
     add_l0_part(&catalog, ht, &day2).await;
 
-    let candidates = catalog.compaction_candidates(ht, 2, 2, 64).await.unwrap();
-    assert_eq!(candidates, vec![day1.clone()]);
+    let candidates = catalog
+        .compaction_candidates(ht, Uuid::nil(), 2, 2, 64, None)
+        .await
+        .unwrap();
+    assert_eq!(candidates.partitions, vec![day1.clone()]);
 
     // The trigger is per level: raising l0_fanout drops day1 out.
     assert!(
         catalog
-            .compaction_candidates(ht, 3, 2, 64)
+            .compaction_candidates(ht, Uuid::nil(), 3, 2, 64, None)
             .await
             .unwrap()
+            .partitions
             .is_empty()
     );
 
@@ -1348,9 +1369,10 @@ async fn compaction_candidates_come_from_live_state() {
         .unwrap();
     assert!(
         catalog
-            .compaction_candidates(ht, 2, 2, 64)
+            .compaction_candidates(ht, Uuid::nil(), 2, 2, 64, None)
             .await
             .unwrap()
+            .partitions
             .is_empty()
     );
 
@@ -1377,7 +1399,11 @@ async fn compaction_candidates_come_from_live_state() {
         .await
         .unwrap();
     assert_eq!(
-        catalog.compaction_candidates(ht, 2, 2, 64).await.unwrap(),
+        catalog
+            .compaction_candidates(ht, Uuid::nil(), 2, 2, 64, None)
+            .await
+            .unwrap()
+            .partitions,
         vec![day1.clone()],
         "two qualifying levels, one partition"
     );
@@ -1387,11 +1413,19 @@ async fn compaction_candidates_come_from_live_state() {
     add_l0_part(&catalog, ht, &day3).await;
     add_l0_part(&catalog, ht, &day3).await;
     assert_eq!(
-        catalog.compaction_candidates(ht, 2, 2, 64).await.unwrap(),
+        catalog
+            .compaction_candidates(ht, Uuid::nil(), 2, 2, 64, None)
+            .await
+            .unwrap()
+            .partitions,
         vec![day1.clone(), day2.clone(), day3.clone()]
     );
     assert_eq!(
-        catalog.compaction_candidates(ht, 2, 2, 2).await.unwrap(),
+        catalog
+            .compaction_candidates(ht, Uuid::nil(), 2, 2, 2, None)
+            .await
+            .unwrap()
+            .partitions,
         vec![day1, day2],
         "limit is honored"
     );
@@ -2148,4 +2182,183 @@ async fn an_invalid_url_is_a_permanent_error_at_build_time() {
             "a malformed URL will not fix itself: {e:?}"
         ),
     }
+}
+
+/// Issue 0012: a bounded candidate window must be a *moving* window. The old
+/// selector always returned the same lexical prefix and counted peer-held
+/// partitions against it, so a hot head could keep the tail unreachable and a
+/// busy fleet could spend a whole window on work nobody asking for it could
+/// take.
+#[tokio::test]
+async fn candidate_windows_are_lease_aware_and_resumable() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let days: Vec<serde_json::Value> = (1..=4).map(|d| json!({ "day": format!("d{d}") })).collect();
+    for day in &days {
+        add_l0_part(&catalog, ht, day).await;
+        add_l0_part(&catalog, ht, day).await;
+    }
+
+    // A window of two, then the next two: the cursor resumes strictly after the
+    // partition it names, so the tail is reached without widening the bound.
+    let first = catalog
+        .compaction_candidates(ht, Uuid::nil(), 2, 2, 2, None)
+        .await
+        .unwrap();
+    assert_eq!(first.partitions, days[..2]);
+    assert_eq!((first.eligible, first.leased, first.claimable()), (4, 0, 4));
+
+    let second = catalog
+        .compaction_candidates(ht, Uuid::nil(), 2, 2, 2, first.next_cursor.as_deref())
+        .await
+        .unwrap();
+    assert_eq!(second.partitions, days[2..]);
+    assert_eq!(second.eligible, 4, "the backlog is the set, not the window");
+
+    // Past the tail: no partitions, but the backlog is still reported — "swept
+    // out" and "nothing to do" are different states, and only one of them means
+    // the cursor should wrap.
+    let past_tail = catalog
+        .compaction_candidates(ht, Uuid::nil(), 2, 2, 2, second.next_cursor.as_deref())
+        .await
+        .unwrap();
+    assert!(past_tail.partitions.is_empty());
+    assert_eq!(past_tail.eligible, 4);
+    assert_eq!(past_tail.next_cursor, None);
+
+    // A peer's unexpired lease on the head no longer costs a window slot: the
+    // window fills with work this caller can actually claim.
+    let peer = Uuid::new_v4();
+    catalog
+        .try_acquire_compaction_lease(ht, &days[0], peer, TTL)
+        .await
+        .unwrap()
+        .expect("d1 is free");
+    let held = catalog
+        .compaction_candidates(ht, Uuid::nil(), 2, 2, 2, None)
+        .await
+        .unwrap();
+    assert_eq!(held.partitions, days[1..3]);
+    assert_eq!(
+        (held.eligible, held.leased, held.claimable()),
+        (4, 1, 3),
+        "the leased partition stays visible as backlog, just not as a candidate"
+    );
+
+    // ...but the *holder* still sees its own partition. A process rebuilt after
+    // a blip keeps its owner identity precisely so it can take back the work it
+    // already owns; hiding its own lease from it would lock it out until its own
+    // TTL ran down — a self-inflicted failover on every restart.
+    let mine = catalog
+        .compaction_candidates(ht, peer, 2, 2, 2, None)
+        .await
+        .unwrap();
+    assert_eq!(mine.partitions, days[..2]);
+    assert_eq!(mine.leased, 0, "a lease I hold is not a lease against me");
+
+    // Expiry — Postgres time, not the caller's — puts it back in everyone's
+    // window.
+    expire_lease(&catalog, ht, &days[0]).await;
+    let reclaimed = catalog
+        .compaction_candidates(ht, Uuid::nil(), 2, 2, 2, None)
+        .await
+        .unwrap();
+    assert_eq!(reclaimed.partitions, days[..2]);
+    assert_eq!(reclaimed.leased, 0);
+}
+
+/// Finalization shares the fair selector (issue 0012). Its sweep used to be
+/// unbounded and lease-blind: every replica walked the whole cold set each tick
+/// and offered each other partitions they already held.
+#[tokio::test]
+async fn finalize_windows_are_lease_aware_and_resumable() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let days: Vec<serde_json::Value> = (1..=3).map(|d| json!({ "day": format!("d{d}") })).collect();
+    for day in &days {
+        add_l0_part(&catalog, ht, day).await;
+        add_l0_part(&catalog, ht, day).await;
+    }
+
+    let first = catalog
+        .finalize_candidates(ht, Uuid::nil(), 0.0, 2, None)
+        .await
+        .unwrap();
+    assert_eq!(first.partitions, days[..2]);
+    assert_eq!((first.eligible, first.leased), (3, 0));
+
+    let rest = catalog
+        .finalize_candidates(ht, Uuid::nil(), 0.0, 2, first.next_cursor.as_deref())
+        .await
+        .unwrap();
+    assert_eq!(rest.partitions, days[2..]);
+
+    catalog
+        .try_acquire_compaction_lease(ht, &days[0], Uuid::new_v4(), TTL)
+        .await
+        .unwrap()
+        .expect("d1 is free");
+    let held = catalog
+        .finalize_candidates(ht, Uuid::nil(), 0.0, 2, None)
+        .await
+        .unwrap();
+    assert_eq!(held.partitions, days[1..]);
+    assert_eq!((held.eligible, held.leased), (3, 1));
+}
+
+/// Quietness is part of eligibility, not a post-claim filter (issue 0012).
+///
+/// ">= 2 live runs" describes nearly every partition that has been written to
+/// and not yet finalized. Bounding the window on *that* set — and only then
+/// claiming each partition to discover it is still hot — would spend the window
+/// on partitions that cannot be finalized and make a genuinely cold one wait for
+/// the cursor to rotate past all of them. The old sweep got away with it by
+/// being unbounded; a bounded one cannot.
+#[tokio::test]
+async fn a_hot_partition_never_occupies_a_finalize_window_slot() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let hot = json!({ "day": "d1" });
+    let cold = json!({ "day": "d2" });
+    for partition in [&hot, &cold] {
+        add_l0_part(&catalog, ht, partition).await;
+        add_l0_part(&catalog, ht, partition).await;
+    }
+
+    // Both partitions have two live runs; both had L0 arrivals just now, so with
+    // any real quiet period neither is finalizable.
+    let none_quiet = catalog
+        .finalize_candidates(ht, Uuid::nil(), 3600.0, 64, None)
+        .await
+        .unwrap();
+    assert_eq!(none_quiet.partitions, Vec::<serde_json::Value>::new());
+    assert_eq!(
+        none_quiet.eligible, 0,
+        "a hot partition is not backlog the finalizer can drain"
+    );
+
+    // Backdate d2's arrivals past the quiet period. d1 stays hot — and stays out
+    // of the window even though it sorts first and would have taken the only
+    // slot.
+    sqlx::query(
+        "UPDATE commits SET created_at = clock_timestamp() - INTERVAL '2 hours'
+         WHERE id IN (SELECT created_by_commit FROM parts
+                      WHERE hypertable_id = $1 AND partition_values = $2)",
+    )
+    .bind(ht.0)
+    .bind(&cold)
+    .execute(catalog.pool_for_tests())
+    .await
+    .unwrap();
+
+    let quiet = catalog
+        .finalize_candidates(ht, Uuid::nil(), 3600.0, 1, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        quiet.partitions,
+        vec![cold],
+        "the one window slot went to the partition that can actually finalize"
+    );
+    assert_eq!(quiet.eligible, 1);
 }

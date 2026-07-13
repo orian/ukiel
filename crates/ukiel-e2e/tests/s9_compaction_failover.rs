@@ -49,11 +49,12 @@ async fn a_dead_compactor_replica_hands_its_partition_to_a_peer() {
     ingest.stop().await;
 
     let ht = table.hypertable_id;
-    let partitions: Vec<_> = stack
+    let partitions = stack
         .catalog
-        .compaction_candidates(ht, 2, 2, 64)
+        .compaction_candidates(ht, uuid::Uuid::nil(), 2, 2, 64, None)
         .await
-        .expect("candidates");
+        .expect("candidates")
+        .partitions;
     assert!(
         !partitions.is_empty(),
         "the ingested L0 files must form a compaction backlog"

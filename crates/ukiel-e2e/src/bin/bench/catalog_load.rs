@@ -1019,8 +1019,10 @@ pub async fn mixed(cfg: LoadConfig, ht_name: &str) -> anyhow::Result<()> {
                         Ok((ev.len() as u64, 0))
                     }
                     1 => {
-                        let c = cat.finalize_candidates(ht_id).await?;
-                        Ok((c.len() as u64, 0))
+                        let c = cat
+                            .finalize_candidates(ht_id, uuid::Uuid::nil(), 3600.0, 64, None)
+                            .await?;
+                        Ok((c.partitions.len() as u64, 0))
                     }
                     _ => {
                         let n = cat.max_live_l0_parts(ht_id, &[]).await?;

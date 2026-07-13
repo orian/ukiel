@@ -1,6 +1,96 @@
 use ukiel_core::{CommitId, HypertableId, Part, PartId, PartMeta};
+use uuid::Uuid;
 
 use crate::{CatalogError, PostgresCatalog};
+
+/// One bounded, claimable slice of a partition sweep, plus what the sweep saw
+/// around it (issue 0012). The counts describe the *whole* eligible set, not
+/// the window: a worker cannot tell a healthy fleet from a starved sweep by
+/// looking only at the partitions it was handed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CandidateWindow {
+    /// Claimable partitions, in sweep order, starting after the caller's cursor.
+    pub partitions: Vec<serde_json::Value>,
+    /// The cursor to resume from — Postgres's own `partition_values::text` for
+    /// the last partition above. Never rebuilt in Rust: `jsonb` text rendering
+    /// (key order, spacing) is Postgres's, and it is what the ordering and the
+    /// `after` bound compare.
+    pub next_cursor: Option<String>,
+    /// Eligible partitions in this hypertable — the backlog the sweep is
+    /// rotating through, cursor position irrelevant.
+    pub eligible: i64,
+    /// Of those, held by a *peer's* unexpired lease: work that exists but
+    /// belongs to someone else right now, and so never occupies a window slot.
+    pub leased: i64,
+}
+
+impl CandidateWindow {
+    /// Eligible partitions no peer currently holds — what this sweep could take
+    /// if its window were unbounded.
+    pub fn claimable(&self) -> i64 {
+        self.eligible - self.leased
+    }
+
+    fn from_rows(rows: Vec<WindowRow>) -> Self {
+        // The counts row always comes back, even with nothing claimable to join
+        // to it (LEFT JOIN LATERAL), so "no window" and "no backlog" stay
+        // distinguishable.
+        let (eligible, leased) = rows.first().map_or((0, 0), |r| (r.0, r.1));
+        let next_cursor = rows.last().and_then(|r| r.3.clone());
+        Self {
+            partitions: rows.into_iter().filter_map(|r| r.2).collect(),
+            next_cursor,
+            eligible,
+            leased,
+        }
+    }
+}
+
+/// `(eligible, leased, partition_values, cursor)`; the last two are NULL on the
+/// single row that comes back when the window is empty.
+type WindowRow = (i64, i64, Option<serde_json::Value>, Option<String>);
+
+/// Wraps an `eligible` sub-select — one `partition_values` column, scoped to the
+/// hypertable in `$1` — in the shared fair selector: drop the partitions a peer
+/// holds, count the whole eligible set for the fairness metrics, and return one
+/// window of the rest after the caller's cursor. `owner`, `limit` and `after`
+/// name the bind parameters the caller left for them.
+///
+/// "A peer holds it" is the exact complement of what `try_acquire_compaction_lease`
+/// accepts: unexpired *and* someone else's. A worker's own lease must keep its
+/// partition visible, or a process rebuilt after a blip would be locked out of
+/// the work it already owns until its own lease expired.
+///
+/// Both sweeps share this so neither can quietly regain an unbounded or
+/// lease-blind candidate query.
+fn window_sql(eligible: &str, owner: &str, limit: &str, after: &str) -> String {
+    format!(
+        "WITH eligible AS ({eligible}),
+         marked AS (
+             SELECT e.partition_values,
+                    EXISTS (SELECT 1 FROM compaction_leases l
+                            WHERE l.hypertable_id = $1
+                              AND l.partition_values = e.partition_values
+                              AND l.expires_at > clock_timestamp()
+                              AND l.owner_id <> {owner}::uuid) AS leased
+             FROM eligible e
+         ),
+         counts AS (
+             SELECT count(*) AS eligible, count(*) FILTER (WHERE leased) AS leased
+             FROM marked
+         )
+         SELECT counts.eligible, counts.leased, w.partition_values, w.cursor
+         FROM counts
+         LEFT JOIN LATERAL (
+             SELECT partition_values, partition_values::text AS cursor
+             FROM marked
+             WHERE NOT leased
+               AND ({after}::text IS NULL OR partition_values::text > {after}::text)
+             ORDER BY partition_values::text
+             LIMIT {limit}
+         ) w ON true"
+    )
+}
 
 #[derive(sqlx::FromRow)]
 pub(crate) struct PartRow {
@@ -152,24 +242,61 @@ impl PostgresCatalog {
         Ok(max)
     }
 
-    /// Partitions holding more than one live run (distinct commits) —
-    /// finalization candidates, aggregated in Postgres so the sweep never
-    /// ships every live part row to the worker.
+    /// Cold partitions holding more than one live run (distinct commits) —
+    /// finalization candidates, aggregated in Postgres so the sweep never ships
+    /// every live part row to the worker. Same bounded, lease-aware, resumable
+    /// window as the ladder (see `compaction_candidates`).
+    ///
+    /// Quietness is part of *eligibility*, not a post-claim filter. ">= 2 live
+    /// runs" alone describes almost every partition that has been written to and
+    /// not yet finalized — hot ones included, since a ladder merge normally
+    /// leaves runs across levels. A window bounded on that set would spend most
+    /// of its slots claiming, probing and discarding partitions that cannot be
+    /// finalized, and would make a genuinely cold partition wait for the cursor
+    /// to rotate past all of them. `finalize_partition` still rechecks after the
+    /// claim: that one is the race guard, not the filter.
+    ///
+    /// `quiet_secs` matches `partition_l0_quiet_since` exactly, including that
+    /// arrivals count tombstoned L0 parts (part rows are never deleted, and this
+    /// measures arrivals, not liveness) and that a partition with no L0 part at
+    /// all is quiet.
+    ///
+    /// The runs are counted as a `DISTINCT (partition, commit)` set rather than
+    /// `count(DISTINCT created_by_commit)` per partition: same answer — the
+    /// column is `NOT NULL` — but it aggregates in `parts_compaction_idx` order
+    /// (migration 0009) instead of sorting every live part row on disk.
     pub async fn finalize_candidates(
         &self,
         hypertable_id: HypertableId,
-    ) -> Result<Vec<serde_json::Value>, CatalogError> {
-        let rows: Vec<serde_json::Value> = sqlx::query_scalar(
-            "SELECT partition_values FROM parts
-             WHERE hypertable_id = $1 AND deleted_by_commit IS NULL
-             GROUP BY partition_values
-             HAVING count(DISTINCT created_by_commit) >= 2
-             ORDER BY partition_values::text",
-        )
-        .bind(hypertable_id.0)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
+        owner_id: Uuid,
+        quiet_secs: f64,
+        limit: i64,
+        after: Option<&str>,
+    ) -> Result<CandidateWindow, CatalogError> {
+        let sql = window_sql(
+            "SELECT r.partition_values FROM (
+                 SELECT DISTINCT partition_values, created_by_commit FROM parts
+                 WHERE hypertable_id = $1 AND deleted_by_commit IS NULL) r
+             GROUP BY r.partition_values
+             HAVING count(*) >= 2
+                AND NOT EXISTS (
+                    SELECT 1 FROM parts p JOIN commits c ON c.id = p.created_by_commit
+                    WHERE p.hypertable_id = $1 AND p.partition_values = r.partition_values
+                      AND p.level = 0
+                      AND c.created_at >= now() - make_interval(secs => $5))",
+            "$2",
+            "$3",
+            "$4",
+        );
+        let rows: Vec<WindowRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(hypertable_id.0)
+            .bind(owner_id)
+            .bind(limit)
+            .bind(after)
+            .bind(quiet_secs)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(CandidateWindow::from_rows(rows))
     }
 
     /// Partitions holding at least one level whose live run count has reached
@@ -180,34 +307,50 @@ impl PostgresCatalog {
     /// abandoned when its worker died, and that backlog must stay discoverable
     /// with no new event to wake anyone (plan 41).
     ///
-    /// Distinct partitions, deterministic order, bounded by `limit`. The
-    /// migration-0007 `(hypertable_id, partition_values, level)` index serves
-    /// the GROUP BY.
+    /// The window is bounded by `limit`, ordered deterministically, and
+    /// *resumable*: `after` is an exclusive lower bound in that same order, so
+    /// a caller rotating its cursor sweeps the whole eligible set rather than
+    /// re-serving one hot prefix forever (issue 0012). Partitions a peer holds
+    /// under an unexpired lease are left out — acquisition remains the atomic
+    /// authority, this only stops the window being spent on work `owner_id`
+    /// cannot take.
+    ///
+    /// The run counts stream out of `parts_compaction_idx` (migration 0009) in
+    /// group order — an index-only scan, no sort. The 0007 index, which the old
+    /// docstring here credited, covers neither `created_by_commit` nor the
+    /// liveness predicate, so this aggregation was in fact a full sequential
+    /// scan of every live part with an external merge sort behind it.
     pub async fn compaction_candidates(
         &self,
         hypertable_id: HypertableId,
+        owner_id: Uuid,
         l0_fanout: i64,
         fanout: i64,
         limit: i64,
-    ) -> Result<Vec<serde_json::Value>, CatalogError> {
-        let rows: Vec<serde_json::Value> = sqlx::query_scalar(
+        after: Option<&str>,
+    ) -> Result<CandidateWindow, CatalogError> {
+        let sql = window_sql(
             "SELECT partition_values FROM (
                  SELECT partition_values, level, count(DISTINCT created_by_commit) AS runs
                  FROM parts
                  WHERE hypertable_id = $1 AND deleted_by_commit IS NULL
                  GROUP BY partition_values, level) g
-             WHERE runs >= CASE WHEN level = 0 THEN $2 ELSE $3 END
-             GROUP BY partition_values
-             ORDER BY partition_values::text
-             LIMIT $4",
-        )
-        .bind(hypertable_id.0)
-        .bind(l0_fanout)
-        .bind(fanout)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
+             WHERE runs >= CASE WHEN level = 0 THEN $3 ELSE $4 END
+             GROUP BY partition_values",
+            "$2",
+            "$5",
+            "$6",
+        );
+        let rows: Vec<WindowRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(hypertable_id.0)
+            .bind(owner_id)
+            .bind(l0_fanout)
+            .bind(fanout)
+            .bind(limit)
+            .bind(after)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(CandidateWindow::from_rows(rows))
     }
 
     /// Live part counts per `(hypertable, level)` — the `catalog_live_parts`
@@ -228,8 +371,9 @@ impl PostgresCatalog {
     }
 
     /// Count of `(partition, level)` groups at or over their merge trigger —
-    /// the `compactor_backlog_groups` gauge (metrics P2). The migration-0007
-    /// index `(hypertable_id, partition_values, level)` serves the GROUP BY.
+    /// the `compactor_backlog_groups` gauge (metrics P2). Same run counting as
+    /// the candidate sweeps, so `parts_compaction_idx` (migration 0009) serves
+    /// it as an index-only scan across every hypertable.
     pub async fn backlog_groups(&self, l0_fanout: i64, fanout: i64) -> Result<i64, CatalogError> {
         let count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM (

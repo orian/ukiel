@@ -11,13 +11,14 @@
 //! REPLACE — which ingest, deletion and operators race without any lease — stays
 //! the correctness backstop.
 
-use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
+use std::sync::{Arc, Mutex};
 
 use futures::FutureExt;
 use object_store::ObjectStore;
-use ukiel_catalog::{CatalogError, CompactionLease, PostgresCatalog};
-use ukiel_core::{Hypertable, Part, PartMeta};
+use ukiel_catalog::{CandidateWindow, CatalogError, CompactionLease, PostgresCatalog};
+use ukiel_core::{Hypertable, HypertableId, Part, PartMeta};
 use uuid::Uuid;
 
 use crate::CompactorError;
@@ -57,7 +58,8 @@ pub struct CompactorConfig {
     /// Loop tick for the merge pass in `run`.
     pub poll_interval_ms: u64,
     /// Most candidate partitions one pass considers per hypertable. Bounds the
-    /// pass, not the backlog: the rest come back next tick.
+    /// pass, not the backlog: a sweep cursor rotates through the rest on the
+    /// following ticks, so no partition is stuck behind a hot prefix.
     pub candidate_limit: i64,
     /// How long a partition claim survives without renewal. It bounds failover
     /// delay (a dead owner's partitions idle this long) and duplicate work, not
@@ -101,7 +103,29 @@ pub struct CompactionStats {
     pub parts_in: usize,
     pub parts_out: usize,
     pub conflicts: usize,
+    /// Partitions this pass's windows offered — how far the sweep got, not how
+    /// much work exists.
+    pub candidates: usize,
+    /// Partitions over their merge trigger, window or no window: the backlog
+    /// the sweep is rotating through.
+    pub eligible: usize,
+    /// Eligible partitions a peer's unexpired lease kept out of those windows.
+    pub leased_skips: usize,
+    /// Sweeps that reached the tail of their eligible set and rotated back to
+    /// the head (issue 0012). Zero for many consecutive passes over a large
+    /// backlog means the rotation is not completing.
+    pub sweep_wraps: usize,
 }
+
+/// Where each hypertable's sweep left off, keyed by hypertable id. The value is
+/// Postgres's `partition_values::text` of the last partition offered, so the
+/// next window resumes strictly after it.
+///
+/// Deliberately in memory: this is scheduling fairness, not durable state. A
+/// restart resumes at the head of the sweep — the head is exactly what a fresh
+/// process has no reason to skip — and the tail stays reachable because every
+/// pass advances the cursor whether or not it managed to claim anything.
+type SweepCursors = Mutex<HashMap<i64, String>>;
 
 pub struct Compactor {
     catalog: PostgresCatalog,
@@ -111,6 +135,8 @@ pub struct Compactor {
     /// Not a pod name: names are reused across restarts, and a reused identity
     /// would let a fresh process inherit a zombie's tenancy.
     owner_id: Uuid,
+    ladder_cursors: SweepCursors,
+    finalize_cursors: SweepCursors,
 }
 
 impl Compactor {
@@ -125,6 +151,8 @@ impl Compactor {
             store,
             config,
             owner_id,
+            ladder_cursors: SweepCursors::default(),
+            finalize_cursors: SweepCursors::default(),
         }
     }
 
@@ -185,6 +213,11 @@ impl Compactor {
         metrics::counter!("compactor_parts_in_total").increment(stats.parts_in as u64);
         metrics::counter!("compactor_parts_out_total").increment(stats.parts_out as u64);
         metrics::counter!("compactor_conflicts_total").increment(stats.conflicts as u64);
+        // Fairness (issue 0012): eligible is the backlog, claimable is what this
+        // fleet could take right now, and the gap between them is peer-held
+        // work. A backlog that stays high while claimable stays near zero is a
+        // fleet that has run out of parallelism, not a compactor that is stuck.
+        set_candidate_gauges("ladder", &stats);
         if result.is_ok() {
             metrics::gauge!("compactor_last_success_timestamp").set(unix_secs());
             // A clean pass means candidates were discovered from current live
@@ -204,10 +237,37 @@ impl Compactor {
     /// Returns the number of partitions finalized.
     pub async fn finalize_once(&self) -> Result<usize, CompactorError> {
         let mut finalized = 0;
+        let mut stats = CompactionStats::default();
         for hypertable in self.catalog.list_hypertables().await? {
-            // Aggregated in SQL: only partitions with >1 live run come back,
-            // as bare partition values — no part rows cross the wire here.
-            for partition in self.catalog.finalize_candidates(hypertable.id).await? {
+            // Aggregated in SQL: only cold partitions with >1 live run come
+            // back, as bare partition values — no part rows cross the wire here.
+            // Same bounded rotating window as the ladder (issue 0012), and
+            // quietness is *inside* the eligibility query: a window bounded on
+            // ">1 live run" alone would be filled with hot partitions it can only
+            // claim, probe and drop, and a cold one would wait for the cursor to
+            // rotate past every one of them.
+            let limit = self.config.candidate_limit;
+            let quiet_secs = self.config.finalize_after_secs as f64;
+            let window = self
+                .sweep(
+                    &self.finalize_cursors,
+                    hypertable.id,
+                    "finalize",
+                    &mut stats,
+                    |after: Option<String>| async move {
+                        self.catalog
+                            .finalize_candidates(
+                                hypertable.id,
+                                self.owner_id,
+                                quiet_secs,
+                                limit,
+                                after.as_deref(),
+                            )
+                            .await
+                    },
+                )
+                .await?;
+            for partition in window.partitions {
                 // The same partition lease the ladder takes: finalization and a
                 // level merge consume the same live parts, so they must not
                 // overlap. Claimed before the quiet/live-state rechecks, so the
@@ -229,6 +289,7 @@ impl Compactor {
                 }
             }
         }
+        set_candidate_gauges("finalize", &stats);
         Ok(finalized)
     }
 
@@ -274,21 +335,36 @@ impl Compactor {
         // The work list is current live state, not the feed. A shared fleet
         // cursor can pass an event whose compaction a dying worker abandoned;
         // gating on "unread events exist" would then hide that backlog forever.
-        let candidates = self
-            .catalog
-            .compaction_candidates(
+        let (l0_fanout, fanout) = (self.config.l0_fanout as i64, self.config.fanout as i64);
+        let limit = self.config.candidate_limit;
+        let window = self
+            .sweep(
+                &self.ladder_cursors,
                 hypertable.id,
-                self.config.l0_fanout as i64,
-                self.config.fanout as i64,
-                self.config.candidate_limit,
+                "ladder",
+                stats,
+                |after: Option<String>| async move {
+                    self.catalog
+                        .compaction_candidates(
+                            hypertable.id,
+                            self.owner_id,
+                            l0_fanout,
+                            fanout,
+                            limit,
+                            after.as_deref(),
+                        )
+                        .await
+                },
             )
             .await?;
 
-        for partition in candidates {
+        for partition in window.partitions {
             // Claim before any object work. Plan 40's finding: 32 same-partition
             // contenders land the same 58 useful swaps as 2, and in the product
             // every loser has already read, merged and uploaded Parquet by the
-            // time REPLACE tells it so. A peer's partition is simply skipped.
+            // time REPLACE tells it so. The window already dropped the
+            // partitions a peer held when it was built, but the claim — not the
+            // query — is the authority: a peer can take one in between.
             let Some(lease) = self.claim(hypertable.id, &partition, "ladder").await? else {
                 continue;
             };
@@ -299,12 +375,81 @@ impl Compactor {
 
         // Cursor advancement is wake/observability progress, never the work
         // ledger — so it happens whatever the merges did, and monotonically
-        // (a lagging peer sharing this name cannot pull it back).
+        // (a lagging peer sharing this name cannot pull it back). The sweep
+        // cursor above is a different thing entirely: in-memory scheduling
+        // state, private to this process, never consulted to decide whether
+        // work exists.
         let head = self.catalog.feed_head(hypertable.id).await?;
         self.catalog
             .set_cursor(&self.config.worker_name, hypertable.id, head)
             .await?;
         Ok(())
+    }
+
+    /// The next window of one hypertable's sweep, with its cursor rotated past
+    /// everything the window offered (issue 0012).
+    ///
+    /// Rotation is what makes the bound fair. A deterministic prefix re-serves
+    /// the same head every pass, so a partition that stays eligible forever —
+    /// deeply backlogged, or simply hot — can pin the window and starve the
+    /// tail behind it. Advancing past the offered partitions, claimed or not,
+    /// gives every eligible partition its turn within one rotation.
+    ///
+    /// A window the query could not fill means the eligible set is spent: the
+    /// cursor resets and the next pass starts again at the head. Running off the
+    /// tail outright is retried from the head immediately, so a wrap costs no
+    /// idle tick.
+    async fn sweep<F, Fut>(
+        &self,
+        cursors: &SweepCursors,
+        hypertable_id: HypertableId,
+        kind: &'static str,
+        stats: &mut CompactionStats,
+        window_at: F,
+    ) -> Result<CandidateWindow, CompactorError>
+    where
+        F: Fn(Option<String>) -> Fut,
+        Fut: Future<Output = Result<CandidateWindow, CatalogError>>,
+    {
+        let cursor = cursors
+            .lock()
+            .expect("sweep cursors")
+            .get(&hypertable_id.0)
+            .cloned();
+        let resumed = cursor.is_some();
+        let mut window = window_at(cursor).await?;
+
+        let ran_off_tail = resumed && window.partitions.is_empty();
+        if ran_off_tail {
+            window = window_at(None).await?;
+        }
+        let exhausted = window.partitions.len() < self.config.candidate_limit as usize;
+
+        let next = window.next_cursor.clone().filter(|_| !exhausted);
+        match next {
+            Some(next) => cursors
+                .lock()
+                .expect("sweep cursors")
+                .insert(hypertable_id.0, next),
+            None => cursors
+                .lock()
+                .expect("sweep cursors")
+                .remove(&hypertable_id.0),
+        };
+
+        // A rotation completed. Not counted on an empty backlog, where every
+        // tick would trivially "wrap" and drown the signal that matters: a large
+        // eligible set whose rotation never finishes.
+        let wrapped = window.eligible > 0 && (ran_off_tail || exhausted);
+        stats.candidates += window.partitions.len();
+        stats.eligible += window.eligible as usize;
+        stats.leased_skips += window.leased as usize;
+        stats.sweep_wraps += usize::from(wrapped);
+        metrics::counter!("compactor_candidates_offered_total", "kind" => kind)
+            .increment(window.partitions.len() as u64);
+        metrics::counter!("compactor_sweep_wraps_total", "kind" => kind)
+            .increment(u64::from(wrapped));
+        Ok(window)
     }
 
     /// One ladder merge on a claimed partition, planned from the live state as
@@ -564,6 +709,18 @@ impl Compactor {
             })?;
         Ok(count)
     }
+}
+
+/// Publishes what one pass's sweeps saw across every hypertable (issue 0012):
+/// the backlog, the part of it this fleet may take, and the part a peer already
+/// holds. Set per pass rather than per hypertable — a labelled gauge would grow
+/// with the tenant's hypertable count for a fleet-level question.
+fn set_candidate_gauges(kind: &'static str, stats: &CompactionStats) {
+    let leased = stats.leased_skips as f64;
+    let eligible = stats.eligible as f64;
+    metrics::gauge!("compactor_candidates_eligible", "kind" => kind).set(eligible);
+    metrics::gauge!("compactor_candidates_leased", "kind" => kind).set(leased);
+    metrics::gauge!("compactor_candidates_claimable", "kind" => kind).set(eligible - leased);
 }
 
 /// Renews `lease` until cancelled. Independent of merge/commit progress: a

@@ -1696,3 +1696,150 @@ async fn a_compactor_reclaims_its_own_lease_after_being_rebuilt() {
     assert_eq!(held.generation, 1);
     assert_eq!(env.catalog.live_parts(env.ht, None).await.unwrap().len(), 1);
 }
+
+/// Distinct live runs in one partition — what both merge triggers count.
+pub async fn live_runs(env: &Env, day: &str) -> usize {
+    let parts = env
+        .catalog
+        .live_partition_parts(env.ht, &json!({ "day": day }))
+        .await
+        .unwrap();
+    parts
+        .iter()
+        .map(|p| p.created_by_commit.0)
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+/// Live L0 parts in one partition — the arrivals a ladder merge consumes first.
+pub async fn live_l0_parts(env: &Env, day: &str) -> usize {
+    let parts = env
+        .catalog
+        .live_partition_parts(env.ht, &json!({ "day": day }))
+        .await
+        .unwrap();
+    parts.iter().filter(|p| p.meta.level == 0).count()
+}
+
+fn hot_row(day: &str, i: i64) -> Vec<serde_json::Value> {
+    vec![json!({"tenant_id": 1, "ts": i, "payload": format!("{day}-{i}")})]
+}
+
+/// A one-slot window, so "which partition does the sweep offer" is the whole
+/// assertion.
+fn narrow_config(name: &str) -> CompactorConfig {
+    CompactorConfig {
+        candidate_limit: 1,
+        ..worker_config(name)
+    }
+}
+
+#[tokio::test]
+async fn a_hot_prefix_does_not_starve_the_tail() {
+    // Issue 0012. The candidate query was a fixed lexical prefix, so a partition
+    // that is eligible again by the time the next pass looks — a continuously
+    // hot one, or a deep enough backlog — could hold the window forever and
+    // leave everything lexically after it uncompacted indefinitely. The bound is
+    // still one partition per pass here; what changed is that the window moves.
+    let env = setup().await;
+    for day in ["d1", "d2", "d3"] {
+        for i in 0..2 {
+            add_l0(&env, day, hot_row(day, i)).await;
+        }
+    }
+    let c = Compactor::new(env.catalog.clone(), env.store.clone(), narrow_config("c1"));
+
+    // Fresh arrivals put d1 back over its L0 trigger before every pass.
+    for pass in 0..3 {
+        for i in 0..2 {
+            add_l0(&env, "d1", hot_row("d1", 100 + pass * 10 + i)).await;
+        }
+        let stats = c.run_once().await.unwrap();
+        assert_eq!(stats.merged_groups, 1, "pass {pass}: {stats:?}");
+        assert_eq!(
+            stats.candidates, 1,
+            "the window is still one partition wide"
+        );
+    }
+
+    // Three passes, three partitions: the sweep rotated instead of re-serving
+    // the hot head.
+    assert_eq!(live_runs(&env, "d2").await, 1, "d2 was compacted");
+    assert_eq!(live_runs(&env, "d3").await, 1, "d3 was compacted");
+}
+
+#[tokio::test]
+async fn a_peers_lease_does_not_consume_a_window_slot() {
+    // Issue 0012. Leased partitions used to fill the window and be discovered
+    // only at the claim, so a fleet with its lexical prefix already in flight
+    // paid acquisition round trips to find nothing it could take. The claim is
+    // still the authority — the query only stops the window being spent on work
+    // that provably belongs to someone else right now.
+    let env = setup().await;
+    for day in ["d1", "d2"] {
+        for i in 0..2 {
+            add_l0(&env, day, hot_row(day, i)).await;
+        }
+    }
+    env.catalog
+        .try_acquire_compaction_lease(
+            env.ht,
+            &json!({ "day": "d1" }),
+            uuid::Uuid::new_v4(),
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap()
+        .expect("d1 is free");
+
+    let c = Compactor::new(env.catalog.clone(), env.store.clone(), narrow_config("c1"));
+    let stats = c.run_once().await.unwrap();
+
+    assert_eq!(
+        stats.merged_groups, 1,
+        "the one-slot window found claimable work past the peer's partition: {stats:?}"
+    );
+    assert_eq!(stats.leased_skips, 1, "{stats:?}");
+    assert_eq!(live_runs(&env, "d2").await, 1, "d2 was compacted");
+    assert_eq!(
+        live_runs(&env, "d1").await,
+        2,
+        "the peer's partition is untouched"
+    );
+}
+
+#[tokio::test]
+async fn the_sweep_wraps_at_the_tail_within_one_tick() {
+    // Rotation must be a cycle, not a one-way walk: a sweep that runs off the
+    // tail restarts at the head in the same tick, so nothing waits an idle pass
+    // for the cursor to come back around.
+    let env = setup().await;
+    for day in ["d1", "d2"] {
+        for i in 0..2 {
+            add_l0(&env, day, hot_row(day, i)).await;
+        }
+    }
+    let c = Compactor::new(env.catalog.clone(), env.store.clone(), narrow_config("c1"));
+
+    for pass in 0..2 {
+        let stats = c.run_once().await.unwrap();
+        assert_eq!(stats.merged_groups, 1, "pass {pass}: {stats:?}");
+        assert_eq!(stats.sweep_wraps, 0, "still walking the set: {stats:?}");
+    }
+    assert_eq!(live_runs(&env, "d1").await, 1);
+    assert_eq!(live_runs(&env, "d2").await, 1);
+
+    // The cursor now sits past d2, and the only eligible partition is behind it.
+    for i in 0..2 {
+        add_l0(&env, "d1", hot_row("d1", 200 + i)).await;
+    }
+    let stats = c.run_once().await.unwrap();
+    assert_eq!(stats.sweep_wraps, 1, "{stats:?}");
+    assert_eq!(
+        stats.merged_groups, 1,
+        "the wrap served the head in the same pass: {stats:?}"
+    );
+    // The new arrivals were merged away (the L1 run they became still has to
+    // meet the L1 run above it — that is the ladder, not this sweep's business).
+    assert_eq!(live_l0_parts(&env, "d1").await, 0);
+}

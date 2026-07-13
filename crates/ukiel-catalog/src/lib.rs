@@ -14,6 +14,7 @@ pub use error::{CatalogError, CatalogErrorClass};
 pub use gc::GcBacklogs;
 pub use leases::CompactionLease;
 pub use offsets::OffsetRange;
+pub use parts::CandidateWindow;
 
 #[cfg(test)]
 mod error_tests;

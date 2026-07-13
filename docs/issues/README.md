@@ -17,5 +17,5 @@ Create new issues from [TEMPLATE.md](TEMPLATE.md), then run `docs/issues/generat
 | 0009 | [Ingest guardrail defaults duplicated in four places](0009-guardrail-default-triplication.md) | Low | Resolved | `crates/ukiel-ingest`, `crates/ukield` |
 | 0010 | [Metadata-answerable aggregates rescan data the catalog already holds](0010-aggregates-rescan-what-the-catalog-already-knows.md) | Low | Open | `crates/ukiel-query` (provider / plan rewriting), `crates/ukiel-catalog` |
 | 0011 | [The million-tenant catalog conclusion is based on a 25k-part fixture](0011-million-tenant-catalog-proof-uses-small-fixture.md) | High | Open | `crates/ukiel-e2e` catalog benchmark, performance documentation |
-| 0012 | [The deterministic compaction candidate window can starve later partitions](0012-compaction-candidate-window-can-starve-tail-partitions.md) | Medium | Open | `crates/ukiel-catalog`, `crates/ukiel-compactor` |
+| 0012 | [The deterministic compaction candidate window can starve later partitions](0012-compaction-candidate-window-can-starve-tail-partitions.md) | Medium | Resolved | `crates/ukiel-catalog`, `crates/ukiel-compactor` |
 | 0013 | [Compaction lease generations reset after a clean release](0013-compaction-lease-generation-resets-after-release.md) | Medium | Open | `crates/ukiel-catalog`, `crates/ukiel-compactor` |
