@@ -4,5 +4,7 @@
 pub mod bootstrap;
 pub mod collector;
 pub mod config;
+pub mod health;
 pub mod metrics;
+pub mod recovery;
 pub mod run;
