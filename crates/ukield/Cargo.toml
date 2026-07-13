@@ -25,6 +25,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 rdkafka = { workspace = true }
+uuid = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]

@@ -171,6 +171,12 @@ pub async fn run_with_bound_addr(
     }
 
     if cfg.roles.contains(&Role::Compactor) {
+        // One lease identity per process start (plan 41). Not the pod name: a
+        // restarted pod reusing its name would inherit its own zombie's
+        // tenancy, which is exactly what the generation fence exists to stop.
+        // Logged so a lease-loss trace can be tied back to a process.
+        let owner_id = uuid::Uuid::new_v4();
+        tracing::info!(%owner_id, "compactor lease owner");
         let compactor = Compactor::new(
             catalog.clone(),
             store.clone(),
@@ -180,6 +186,10 @@ pub async fn run_with_bound_addr(
                 fanout: cfg.compactor.fanout,
                 finalize_after_secs: cfg.compactor.finalize_after_secs,
                 finalize_poll_interval_ms: cfg.compactor.finalize_poll_interval_ms,
+                candidate_limit: cfg.compactor.candidate_limit,
+                lease_ttl_ms: cfg.compactor.lease_ttl_secs * 1_000,
+                lease_renew_interval_ms: cfg.compactor.lease_renew_interval_secs * 1_000,
+                owner_id: Some(owner_id),
                 ..CompactorConfig::default()
             },
         );

@@ -160,6 +160,13 @@ impl Collector {
             .await?;
         gauge!("compactor_unfinalized_partitions").set(unfinalized as f64);
         gauge!("compactor_oldest_unfinalized_age_seconds").set(oldest);
+        // Plan 41. Active leases = partitions under compaction right now. An
+        // expired lease that keeps ageing is the wedged-fleet signal: nobody is
+        // reclaiming that partition. Database time on both sides — a worker's
+        // clock never decides whether a lease is alive.
+        let (active, oldest_expired) = self.catalog.compaction_lease_stats().await?;
+        gauge!("catalog_compaction_leases_active").set(active as f64);
+        gauge!("catalog_compaction_lease_oldest_expired_age_seconds").set(oldest_expired);
         Ok(())
     }
 

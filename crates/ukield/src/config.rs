@@ -127,6 +127,31 @@ pub fn validate(cfg: &UkieldConfig) -> anyhow::Result<()> {
             cfg.gc.tombstone_grace_secs
         );
     }
+    let (ttl, renew) = (
+        cfg.compactor.lease_ttl_secs,
+        cfg.compactor.lease_renew_interval_secs,
+    );
+    if ttl == 0 || renew == 0 {
+        anyhow::bail!(
+            "compactor.lease_ttl_secs ({ttl}) and lease_renew_interval_secs ({renew}) must be > 0"
+        );
+    }
+    // Three attempts inside one TTL. A renewal interval close to the TTL turns
+    // one slow catalog round-trip into a lost partition and a discarded merge
+    // (plan 41).
+    if renew * 3 > ttl {
+        anyhow::bail!(
+            "compactor.lease_renew_interval_secs ({renew}) must be <= lease_ttl_secs/3 ({}): \
+             a single stalled renewal would otherwise drop the partition mid-merge",
+            ttl / 3
+        );
+    }
+    if cfg.compactor.candidate_limit <= 0 {
+        anyhow::bail!(
+            "compactor.candidate_limit ({}) must be > 0",
+            cfg.compactor.candidate_limit
+        );
+    }
     Ok(())
 }
 
@@ -183,6 +208,17 @@ pub struct CompactorSection {
     pub finalize_after_secs: u64,
     /// Cadence of the finalization sweep.
     pub finalize_poll_interval_ms: u64,
+    /// How long a partition claim survives without renewal (plan 41). It bounds
+    /// failover delay — a dead owner's partitions idle for at most this plus a
+    /// poll interval before a peer reclaims them — and duplicate object work.
+    /// It is not a correctness knob: the REPLACE fence is what makes a late
+    /// owner harmless at any TTL.
+    pub lease_ttl_secs: u64,
+    /// Renewal cadence. Kept well under the TTL so a transient scheduler or
+    /// network stall costs a retry, not the partition.
+    pub lease_renew_interval_secs: u64,
+    /// Candidate partitions considered per hypertable per pass.
+    pub candidate_limit: i64,
 }
 
 impl Default for CompactorSection {
@@ -196,6 +232,12 @@ impl Default for CompactorSection {
             fanout: 10,
             finalize_after_secs: 3_600,
             finalize_poll_interval_ms: 60_000,
+            // 60s/20s: three renewal attempts inside one TTL, so a partition is
+            // lost only after a stall long enough that the merge was doomed
+            // anyway, while failover still lands inside a minute.
+            lease_ttl_secs: 60,
+            lease_renew_interval_secs: 20,
+            candidate_limit: 64,
         }
     }
 }
@@ -445,6 +487,40 @@ mod tests {
         let cfg: UkieldConfig = toml::from_str(&raw).unwrap();
         let err = validate(&cfg).unwrap_err().to_string();
         assert!(err.contains("issue 0002"), "{err}");
+    }
+
+    #[test]
+    fn lease_defaults_leave_room_for_three_renewals() {
+        let cfg: UkieldConfig = toml::from_str(EXAMPLE).unwrap();
+        assert_eq!(cfg.compactor.lease_ttl_secs, 60);
+        assert_eq!(cfg.compactor.lease_renew_interval_secs, 20);
+        assert_eq!(cfg.compactor.candidate_limit, 64);
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn a_renewal_interval_too_close_to_the_ttl_is_refused() {
+        // 30s renewals inside a 60s TTL: one stalled round-trip and the merge
+        // in flight loses its partition.
+        let raw = format!(
+            "{EXAMPLE}\n[compactor]\nlease_ttl_secs = 60\nlease_renew_interval_secs = 30\n"
+        );
+        let cfg: UkieldConfig = toml::from_str(&raw).unwrap();
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("lease_renew_interval_secs"), "{err}");
+    }
+
+    #[test]
+    fn zero_lease_timings_are_refused() {
+        for section in [
+            "lease_ttl_secs = 0",
+            "lease_renew_interval_secs = 0",
+            "candidate_limit = 0",
+        ] {
+            let raw = format!("{EXAMPLE}\n[compactor]\n{section}\n");
+            let cfg: UkieldConfig = toml::from_str(&raw).unwrap();
+            assert!(validate(&cfg).is_err(), "{section} must be rejected");
+        }
     }
 
     #[test]

@@ -43,6 +43,13 @@ poll_interval_ms = 5000
 l0_fanout = 2            # L0 merge trigger (demo; prod ~4) — L0 files are unpruned by key
 fanout = 2               # L1+ run-count trigger (demo; prod ~10) — runs are key-disjoint
 finalize_after_secs = 60 # fold quiet partitions into one run (demo; prod ~3600)
+# Partition leases (plan 41): a worker claims a (hypertable, partition) before it
+# reads any Parquet, so peers never duplicate its merge. The TTL bounds failover
+# delay and wasted work, never correctness — the REPLACE fence makes a late owner
+# harmless. renew_interval must be <= ttl/3 (three attempts inside one TTL).
+lease_ttl_secs = 60
+lease_renew_interval_secs = 20
+candidate_limit = 64     # candidate partitions considered per hypertable per pass
 
 [gc]
 poll_interval_ms = 60000

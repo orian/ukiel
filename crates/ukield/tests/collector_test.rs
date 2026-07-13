@@ -104,6 +104,10 @@ async fn collector_gauges_render_on_metrics() {
         "catalog_pending_objects",
         "catalog_unpurged_tombstones",
         "catalog_pool_connections",
+        // Plan 41: partitions under compaction now, and the wedged-fleet signal
+        // (an expired lease nobody is reclaiming).
+        "catalog_compaction_leases_active",
+        "catalog_compaction_lease_oldest_expired_age_seconds",
     ] {
         assert!(
             body.contains(family),
