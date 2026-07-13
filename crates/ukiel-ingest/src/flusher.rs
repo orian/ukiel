@@ -101,10 +101,29 @@ impl Flusher {
                 column_stats,
             });
         }
+        // A transport failure *around* this commit is the one case we cannot
+        // resolve: the transaction may have committed and the acknowledgement
+        // may have been lost. So it is counted as ambiguous and the worker is
+        // torn down — never retried in place, which could double-apply it.
+        //
+        // Recovery is safe without knowing the outcome, because Kafka and the
+        // catalog offsets are the log: the rebuilt worker reloads offsets and
+        // seeks. If the commit landed, its offsets seek past this batch; if it
+        // did not, Kafka replays it. Uploaded-but-uncommitted objects stay
+        // intent-covered and are reaped as orphans.
+        //
+        // Plan 43's deterministic operation keys are what will let us *ask*
+        // whether it landed instead of arranging not to need the answer.
         let result = self
             .catalog
             .commit_with_offsets(hypertable.id, CommitOp::Add { parts }, &offsets)
-            .await?;
+            .await
+            .inspect_err(|e| {
+                if e.is_recoverable_transport() {
+                    metrics::counter!("catalog_ambiguous_mutation_total", "role" => "ingest")
+                        .increment(1);
+                }
+            })?;
         Ok(result)
     }
 }

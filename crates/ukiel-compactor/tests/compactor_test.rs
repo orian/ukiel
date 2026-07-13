@@ -1560,3 +1560,139 @@ async fn a_catalog_outage_during_renewal_stops_the_merge() {
         1
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_compactor_rebuilt_after_an_outage_converges_from_live_state() {
+    // Plan 42's compactor contract. The worker that hit the outage is *dropped* —
+    // its lease, its live-part plan and its in-flight merge go with it — and a
+    // fresh one is constructed. It must converge on the same backlog with no new
+    // feed event, because nothing in the catalog remembers what it was doing.
+    let env = setup().await;
+    for i in 0..2 {
+        add_l0(
+            &env,
+            "d1",
+            vec![json!({"tenant_id": 1, "ts": i, "payload": format!("v{i}")})],
+        )
+        .await;
+    }
+    let before = live_payloads(&env).await;
+
+    // The doomed attempt: its catalog dies while it is merging.
+    let doomed_catalog = PostgresCatalog::connect(&env.url).await.unwrap();
+    let gate = Gate::new();
+    let (store, probe) = probe_store(env.store.clone(), Some(PreCommit::Gate(gate.clone())));
+    let owner = Uuid::new_v4();
+    let doomed = Compactor::new(
+        doomed_catalog.clone(),
+        store,
+        CompactorConfig {
+            worker_name: "fleet".into(),
+            owner_id: Some(owner),
+            lease_ttl_ms: 5_000,
+            lease_renew_interval_ms: 100,
+            ..CompactorConfig::default()
+        },
+    );
+    let attempt = tokio::spawn(async move { doomed.run_once().await });
+    gate.wait_for_arrival().await;
+    assert!(probe.uploads() > 0, "it had uploaded before the outage");
+    doomed_catalog.pool_for_tests().close().await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), attempt)
+            .await
+            .expect("the attempt must end, not hang")
+            .unwrap()
+            .is_err(),
+        "an unreachable catalog ends the attempt"
+    );
+
+    // Nothing was committed, and the cursor is already at head — so only live
+    // state can reveal the work.
+    assert_eq!(env.catalog.live_parts(env.ht, None).await.unwrap().len(), 2);
+    let head = env.catalog.feed_head(env.ht).await.unwrap();
+    env.catalog.set_cursor("fleet", env.ht, head).await.unwrap();
+
+    // The rebuilt worker: same process identity (so it reclaims its own
+    // partition rather than waiting out its own lease), everything else fresh.
+    let (store, _probe) = probe_store(env.store.clone(), None);
+    let rebuilt = Compactor::new(
+        env.catalog.clone(),
+        store,
+        CompactorConfig {
+            worker_name: "fleet".into(),
+            owner_id: Some(owner),
+            lease_ttl_ms: 5_000,
+            lease_renew_interval_ms: 100,
+            ..CompactorConfig::default()
+        },
+    );
+    let stats = rebuilt.run_once().await.expect("recovered pass");
+    assert_eq!(
+        stats.merged_groups, 1,
+        "the rebuilt worker replans from live state and finishes the job"
+    );
+
+    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
+    assert_eq!(parts.len(), 1, "{parts:?}");
+    assert_eq!(
+        live_payloads(&env).await,
+        before,
+        "no row lost or duplicated"
+    );
+    // The abandoned upload is an orphan with an intent row — GC's problem, and
+    // never deleted by the compactor as part of "recovery".
+    assert_eq!(
+        env.catalog
+            .orphaned_pending_objects(env.ht, 0.0)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_compactor_reclaims_its_own_lease_after_being_rebuilt() {
+    // The reason the owner UUID is allocated per *process*, not per worker
+    // attempt: a compactor that is reconstructed after an outage must be able to
+    // take back the partitions it already owns. With a fresh identity it would
+    // be locked out of its own leases until they expired — a self-inflicted
+    // failover on every blip.
+    let env = setup().await;
+    for i in 0..2 {
+        add_l0(
+            &env,
+            "d1",
+            vec![json!({"tenant_id": 1, "ts": i, "payload": format!("v{i}")})],
+        )
+        .await;
+    }
+
+    let owner = Uuid::new_v4();
+    let partition = json!({"day": "d1"});
+    let held = env
+        .catalog
+        .try_acquire_compaction_lease(env.ht, &partition, owner, TEST_TTL)
+        .await
+        .unwrap()
+        .expect("the pre-outage attempt held this partition");
+
+    let rebuilt = Compactor::new(
+        env.catalog.clone(),
+        env.store.clone(),
+        CompactorConfig {
+            owner_id: Some(owner),
+            ..worker_config("rebuilt")
+        },
+    );
+    let stats = rebuilt.run_once().await.unwrap();
+    assert_eq!(
+        stats.merged_groups, 1,
+        "the same process reclaims its own partition immediately"
+    );
+    // Same tenancy, not a takeover: reacquisition by the same owner preserves
+    // the generation (a fresh identity would have bumped it and waited).
+    assert_eq!(held.generation, 1);
+    assert_eq!(env.catalog.live_parts(env.ht, None).await.unwrap().len(), 1);
+}

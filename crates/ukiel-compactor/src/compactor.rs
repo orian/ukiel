@@ -549,7 +549,19 @@ impl Compactor {
         // objects are then orphans — harmless, cleaned by GC's orphan sweep.
         self.catalog
             .commit_compaction_replace(hypertable.id, lease, old, new_parts, None)
-            .await?;
+            .await
+            .inspect_err(|e| {
+                // A transport failure around the REPLACE leaves its outcome
+                // unknown: it may have committed and lost the acknowledgement.
+                // Counted, never replayed. The next pass replans from live
+                // state, which is correct either way — if it landed, the inputs
+                // are gone and there is nothing to redo; if it did not, they are
+                // still there. (Plan 43 makes the outcome *knowable* rather than
+                // merely survivable.)
+                if e.is_recoverable_transport() {
+                    metrics::counter!("compactor_ambiguous_commit_total").increment(1);
+                }
+            })?;
         Ok(count)
     }
 }

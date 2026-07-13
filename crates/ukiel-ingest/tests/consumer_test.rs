@@ -273,3 +273,93 @@ async fn backpressure_defers_flushes_until_pressure_clears() {
     let offsets = catalog.ingest_offsets(ht_id, TOPIC).await.unwrap();
     assert_eq!(offsets.values().sum::<i64>(), 3);
 }
+
+/// Plan 42: one route's catalog failure must take the WHOLE ingest worker down.
+///
+/// Routes share a catalog and a `group.id`. If a sibling kept polling and
+/// committing while another route's role was degraded, the fleet would have a
+/// half-degraded ingest that is still consuming — and the recovery contract
+/// ("drop everything, reload offsets from authority, re-seek") would be a lie
+/// for the half that never stopped.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_routes_catalog_failure_stops_every_route() {
+    let pg = Postgres::default().start().await.expect("postgres");
+    let pg_port = pg.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{pg_port}/postgres");
+    let catalog = PostgresCatalog::connect(&url).await.unwrap();
+    catalog.migrate().await.unwrap();
+
+    let schema = json!({"fields": [
+        {"name": "tenant_id", "type": "int64"},
+        {"name": "ts", "type": "timestamp_ms"},
+        {"name": "payload", "type": "utf8"}
+    ]});
+    // Only ONE of the two routes has a hypertable; the other's lookup fails.
+    catalog
+        .create_hypertable(
+            "events",
+            &schema,
+            &json!({"columns": ["day"]}),
+            &["tenant_id".to_string(), "ts".to_string()],
+            "tenant_id",
+        )
+        .await
+        .unwrap();
+
+    let kafka = Kafka::default().start().await.expect("kafka");
+    let brokers = format!(
+        "127.0.0.1:{}",
+        kafka.get_host_port_ipv4(KAFKA_PORT).await.unwrap()
+    );
+
+    let ready_fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = ready_fired.clone();
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let config = IngestConfig {
+        brokers,
+        group_id: "ukiel-multiroute".into(),
+        flush_interval_ms: 500,
+        max_buffer_rows: 10_000,
+        l0_slowdown_parts: 30,
+        l0_stop_parts: 200,
+        warn_partitions_per_flush: 64,
+        max_event_age_days: 30_000,
+        max_event_future_secs: 3600,
+        tables: vec![
+            TableRoute {
+                topic: TOPIC.into(),
+                hypertable: "events".into(),
+                ts_column: "ts".into(),
+            },
+            TableRoute {
+                topic: "other".into(),
+                hypertable: "missing_table".into(),
+                ts_column: "ts".into(),
+            },
+        ],
+        ready: Some(ukiel_core::ReadySignal::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })),
+    };
+
+    let worker = IngestWorker::new(catalog.clone(), store, config);
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        worker.run(CancellationToken::new()),
+    )
+    .await
+    .expect("the worker must fail, not hang");
+
+    assert!(
+        result.is_err(),
+        "a route whose hypertable cannot be read fails the whole worker"
+    );
+    // And the role never claimed to be ready: readiness needs EVERY route to
+    // have positioned itself from the catalog, so a half-started ingest is
+    // reported as what it is.
+    assert_eq!(
+        ready_fired.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "ingest must not report ready while a route never reconciled"
+    );
+}
