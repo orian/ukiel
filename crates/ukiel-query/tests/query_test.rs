@@ -123,11 +123,18 @@ pub async fn setup() -> Harness {
     }
 }
 
+/// Representation-agnostic: the query path reads strings as `Utf8View` (plan 39),
+/// but a test asserting *values* should not care which in-memory representation
+/// the engine picked. Cast to `Utf8` inside the helper rather than making every
+/// call site aware of it.
 pub fn all_strings(batches: &[RecordBatch], column: &str) -> Vec<String> {
+    use datafusion::arrow::datatypes::DataType;
     let mut out = Vec::new();
     for b in batches {
         let idx = b.schema().index_of(column).unwrap();
-        let arr: &StringArray = b.column(idx).as_any().downcast_ref().unwrap();
+        let col = datafusion::arrow::compute::cast(b.column(idx), &DataType::Utf8)
+            .expect("column is not string-like");
+        let arr: &StringArray = col.as_any().downcast_ref().unwrap();
         for i in 0..arr.len() {
             out.push(arr.value(i).to_string());
         }
@@ -1363,4 +1370,75 @@ async fn catalog_spans_preskip_row_groups() {
         .await
         .unwrap();
     assert_eq!(all_i64(&batches, "n"), vec![0]);
+}
+
+/// Plan 39: the query path reads strings as `Utf8View` — parity with
+/// DataFusion's own `schema_force_view_types` default, which the provider used
+/// to silently opt out of by handing the reader an explicit `Utf8` schema.
+/// Measured cost of that opt-out (plan 37's H6): +62% peak memory and +218%
+/// repartition time on a byte-identical scan.
+///
+/// Both schemas must flip together. If SQL still saw `Utf8`, DataFusion would
+/// insert a cast that re-materializes every string and hand the win straight
+/// back — so this asserts the type SQL sees, not just the type the scan produces.
+#[tokio::test]
+async fn query_path_reads_strings_as_utf8view() {
+    let h = setup().await;
+    let store_url = url::Url::parse(STORE_URL).unwrap();
+
+    // Scoped (the product path) and unscoped (the operator/bench path) must
+    // agree: the representation is a property of the provider, not the session.
+    let scoped = session_for_namespace(
+        &h.catalog,
+        NamespaceId(1),
+        h.store.clone(),
+        &store_url,
+        test_metadata_cache(),
+    )
+    .await
+    .unwrap();
+    let operator = ukiel_query::context::operator_session(
+        &h.catalog,
+        h.store.clone(),
+        &store_url,
+        test_metadata_cache(),
+    )
+    .await
+    .unwrap();
+
+    for (name, ctx) in [("scoped", &scoped), ("operator", &operator)] {
+        let batches = ctx
+            .sql("SELECT arrow_typeof(payload) AS t FROM events LIMIT 1")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            all_strings(&batches, "t"),
+            vec!["Utf8View"],
+            "{name} session must read strings as views"
+        );
+    }
+
+    // Values are unchanged — a different representation, not different data.
+    let batches = scoped
+        .sql("SELECT payload FROM events ORDER BY ts")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(all_strings(&batches, "payload"), vec!["a1", "a2"]);
+
+    // String predicates and grouping still work over views (this is the engine's
+    // default configuration, but ours is the schema that opted out of it).
+    let batches = scoped
+        .sql("SELECT count(*) AS n FROM events WHERE payload LIKE 'a%'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(all_i64(&batches, "n"), vec![2]);
 }

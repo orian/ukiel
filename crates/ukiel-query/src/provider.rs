@@ -196,8 +196,22 @@ impl UkielTableProvider {
         reader_factory: Arc<CachingParquetFileReaderFactory>,
     ) -> Result<Self, QueryError> {
         let columns = TableColumns::parse(&hypertable.table_schema)?;
-        let physical_schema = Arc::new(columns.physical_schema());
-        let query_schema = Arc::new(columns.query_schema());
+        // Plan 39: the query path reads strings as `Utf8View` — **parity with
+        // DataFusion's own `schema_force_view_types` default**, which handing the
+        // reader an explicit `Utf8` schema silently opted out of. Zero-copy views
+        // then flow through repartition and aggregation instead of owned copies;
+        // opting out cost +62% peak memory and +218% repartition time on a
+        // byte-identical scan (plan 37's H6).
+        //
+        // Query-side representation ONLY: `TableColumns` stays `Utf8`, so ingest,
+        // the compactor and materialized columns are untouched, and the Parquet
+        // bytes are identical either way.
+        //
+        // Both schemas flip together, and that is not cosmetic: if SQL still saw
+        // `Utf8`, DataFusion would insert a cast that re-materializes every
+        // string and hand the entire win back.
+        let physical_schema = Arc::new(crate::view_types::view_typed(&columns.physical_schema()));
+        let query_schema = Arc::new(crate::view_types::view_typed(&columns.query_schema()));
         Ok(Self {
             catalog,
             hypertable,
