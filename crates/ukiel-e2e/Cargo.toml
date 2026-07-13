@@ -46,3 +46,9 @@ flate2 = "1"
 [[bin]]
 name = "bench"
 path = "src/bin/bench/main.rs"
+
+[dev-dependencies]
+# S11 (plan 43) arms a fault at the commit boundary inside the process under
+# test. A dev-dependency, so the resolver keeps the seam out of `cargo build -p
+# ukield` — it exists in test builds and nowhere else.
+ukiel-catalog = { workspace = true, features = ["fault-injection"] }

@@ -15,14 +15,19 @@ e2e:
 	cargo test -p ukiel-e2e -- --ignored --test-threads=1
 	docker compose down -v
 
-# HA catalog-outage suite (plan 42, S10). Adds the opt-in Toxiproxy profile,
-# runs ONLY the S10 scenario serially, and always tears the stack down — the
-# trap matters: a failed run must not leave a toxic proxy in front of Postgres
-# for the next `make e2e`.
+# HA suite: S10 (catalog outage, plan 42) and S11 (lost commit acknowledgement,
+# plan 43). Adds the opt-in Toxiproxy profile, runs them serially, and always
+# tears the stack down — the trap matters: a failed run must not leave a toxic
+# proxy in front of Postgres for the next `make e2e`.
+#
+# S11 needs the commit-boundary fault seam, which lives behind ukiel-catalog's
+# `fault-injection` feature and is enabled from ukiel-e2e's dev-dependencies —
+# so it is present here and absent from `cargo build -p ukield`.
 e2e-ha:
 	docker compose --profile ha up -d --wait
 	trap 'docker compose --profile ha down -v' EXIT; \
-	  UKIEL_E2E_HA=1 cargo test -p ukiel-e2e --test s10_catalog_recovery -- --ignored --test-threads=1
+	  UKIEL_E2E_HA=1 cargo test -p ukiel-e2e --test s10_catalog_recovery -- --ignored --test-threads=1 && \
+	  UKIEL_E2E_HA=1 cargo test -p ukiel-e2e --test s11_ambiguous_mutation -- --ignored --test-threads=1
 
 e2e-up:
 	docker compose up -d --wait

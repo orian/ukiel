@@ -109,6 +109,23 @@ pub async fn run_with_bound_addr(
     shutdown: CancellationToken,
     bound: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
 ) -> anyhow::Result<()> {
+    run_with_catalog(cfg, shutdown, bound, None).await
+}
+
+/// `run_with_bound_addr`, optionally taking the catalog handle rather than
+/// building one from the config URL.
+///
+/// The only caller that passes `Some` is S11, which must hold the *same* handle
+/// the roles use in order to arm a fault at the commit boundary (plan 43). The
+/// fault machinery itself lives behind `ukiel-catalog`'s `fault-injection`
+/// feature and is compiled out of production builds; this parameter is just an
+/// injection point, and passing `None` is exactly today's behaviour.
+pub async fn run_with_catalog(
+    cfg: UkieldConfig,
+    shutdown: CancellationToken,
+    bound: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
+    catalog: Option<PostgresCatalog>,
+) -> anyhow::Result<()> {
     crate::config::validate(&cfg)?;
 
     // Install the process-wide Prometheus recorder before any worker emits;
@@ -132,9 +149,13 @@ pub async fn run_with_bound_addr(
     // listeners, and reports Starting; the first real call is what discovers
     // whether the writer is there. And because the pool outlives the outage, it
     // reaches the *promoted* writer without a restart.
-    let catalog =
-        PostgresCatalog::connect_lazy_with_config(&cfg.catalog.url, &cfg.catalog.pool_config())
-            .context("building the catalog pool")?;
+    let catalog = match catalog {
+        Some(catalog) => catalog,
+        None => {
+            PostgresCatalog::connect_lazy_with_config(&cfg.catalog.url, &cfg.catalog.pool_config())
+                .context("building the catalog pool")?
+        }
+    };
 
     let catalog_for_roles = catalog.clone();
 

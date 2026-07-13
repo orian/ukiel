@@ -3052,3 +3052,132 @@ async fn fingerprint_migration_applies_to_a_populated_catalog() {
         OperationLookup::Committed(_)
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Plan 43, task 7: the commit-boundary fault seam (test builds only).
+// ---------------------------------------------------------------------------
+
+/// The seam has to be *exact*, or S11 proves nothing: `BeforeCommit` must leave
+/// the operation absent, `AfterCommitBeforeReturn` must leave it durable, and
+/// the caller must not be able to tell them apart.
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+async fn the_commit_fault_seam_is_one_shot_instance_scoped_and_exact() {
+    use ukiel_catalog::CommitFault;
+
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+
+    let add = |catalog: ukiel_catalog::PostgresCatalog,
+               path: &'static str,
+               id: OperationIdentity| async move {
+        catalog
+            .commit(
+                ht,
+                CommitOp::Add {
+                    parts: vec![part_meta(path, 1, 10)],
+                },
+                Some(&id),
+            )
+            .await
+    };
+
+    // --- Before the commit: rolled back, and the caller cannot tell. ---------
+    let absent = op(ht, 0, 0, 9);
+    catalog.arm_commit_fault(CommitFault::BeforeCommit);
+    let err = add(catalog.clone(), "never.parquet", absent.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CatalogError::AmbiguousMutation { .. }),
+        "the caller sees an unknown outcome, not a rollback: {err:?}"
+    );
+    assert_eq!(err.class(), CatalogErrorClass::Transport);
+    assert_eq!(
+        catalog.lookup_operation(&absent).await.unwrap(),
+        OperationLookup::Absent,
+        "it really did roll back"
+    );
+    assert!(catalog.live_parts(ht, None).await.unwrap().is_empty());
+
+    // One-shot: the next commit is unaffected. A fault that fired every time
+    // would model a broken database, not a lost acknowledgement.
+    assert!(matches!(
+        add(catalog.clone(), "fine.parquet", op(ht, 0, 10, 19))
+            .await
+            .unwrap(),
+        CommitResult::Committed(_)
+    ));
+
+    // --- After the commit: durable, and the caller *still* cannot tell. ------
+    let durable = op(ht, 0, 20, 29);
+    catalog.arm_commit_fault(CommitFault::AfterCommitBeforeReturn);
+    let err = add(catalog.clone(), "landed.parquet", durable.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CatalogError::AmbiguousMutation { .. }),
+        "byte-for-byte the same failure as the rolled-back one: {err:?}"
+    );
+    assert!(
+        matches!(
+            catalog.lookup_operation(&durable).await.unwrap(),
+            OperationLookup::Committed(_)
+        ),
+        "the transaction is durable — only the catalog knows"
+    );
+    let live = catalog.live_parts(ht, None).await.unwrap();
+    assert_eq!(live.len(), 2);
+    assert!(live.iter().any(|p| p.meta.path == "landed.parquet"));
+
+    // Instance-scoped: arming one handle does not arm an unrelated catalog.
+    let (_pg2, other) = common::setup().await;
+    let other_ht = setup_hypertable(&other).await;
+    catalog.arm_commit_fault(CommitFault::BeforeCommit);
+    assert!(matches!(
+        other
+            .commit(
+                other_ht,
+                CommitOp::Add {
+                    parts: vec![part_meta("other.parquet", 1, 10)],
+                },
+                Some(&op(other_ht, 0, 0, 9)),
+            )
+            .await
+            .unwrap(),
+        CommitResult::Committed(_),
+        // (and the arming above is still pending on `catalog`, unspent)
+    ));
+}
+
+/// An unidentified mutation at the same boundary is undecidable, and says so.
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+async fn an_unidentified_mutation_at_the_boundary_is_loud_and_permanent() {
+    use ukiel_catalog::CommitFault;
+
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    catalog.arm_commit_fault(CommitFault::AfterCommitBeforeReturn);
+    let err = catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![part_meta("orphan.parquet", 1, 10)],
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CatalogError::UnidentifiedAmbiguousMutation { .. }),
+        "{err:?}"
+    );
+    assert_eq!(err.class(), CatalogErrorClass::PermanentDatabase);
+    assert!(
+        !err.is_recoverable_transport(),
+        "there is nothing to reconcile, so retrying is guessing"
+    );
+    // It did commit — the point is that nobody can prove it from here.
+    assert_eq!(catalog.live_parts(ht, None).await.unwrap().len(), 1);
+}

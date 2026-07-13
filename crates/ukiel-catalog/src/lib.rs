@@ -3,6 +3,8 @@
 mod commit;
 mod cursors;
 mod error;
+#[cfg(feature = "fault-injection")]
+mod faults;
 mod feed;
 mod gc;
 mod leases;
@@ -12,6 +14,8 @@ mod tables;
 
 pub use commit::OperationLookup;
 pub use error::{CatalogError, CatalogErrorClass};
+#[cfg(feature = "fault-injection")]
+pub use faults::CommitFault;
 pub use gc::GcBacklogs;
 pub use leases::CompactionLease;
 pub use offsets::OffsetRange;
@@ -29,6 +33,10 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 #[derive(Clone)]
 pub struct PostgresCatalog {
     pub(crate) pool: PgPool,
+    /// One-shot commit-boundary fault, shared with every clone. Compiled out
+    /// entirely without the `fault-injection` feature.
+    #[cfg(feature = "fault-injection")]
+    pub(crate) faults: faults::CommitFaults,
 }
 
 /// SQLx pool lifecycle, as a deployment concern rather than a constant (plan
@@ -114,7 +122,7 @@ impl PostgresCatalog {
         config: &CatalogPoolConfig,
     ) -> Result<Self, CatalogError> {
         let pool = config.options().connect(url).await?;
-        Ok(Self { pool })
+        Ok(Self::from_pool(pool))
     }
 
     /// Builds the pool **without** contacting the database (plan 42).
@@ -130,9 +138,15 @@ impl PostgresCatalog {
         config: &CatalogPoolConfig,
     ) -> Result<Self, CatalogError> {
         let options: PgConnectOptions = url.parse()?;
-        Ok(Self {
-            pool: config.options().connect_lazy_with(options),
-        })
+        Ok(Self::from_pool(config.options().connect_lazy_with(options)))
+    }
+
+    fn from_pool(pool: PgPool) -> Self {
+        Self {
+            pool,
+            #[cfg(feature = "fault-injection")]
+            faults: Default::default(),
+        }
     }
 
     pub async fn migrate(&self) -> Result<(), CatalogError> {

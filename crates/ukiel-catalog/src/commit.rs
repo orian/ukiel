@@ -283,9 +283,36 @@ impl PostgresCatalog {
         // conflict, an offset race, a lost lease, a bad statement — all of them
         // rolled back, all of them "no". Only here can the transaction be
         // durable while the answer is lost on the way home.
+        //
+        // The two fault points sit on either side of it, because that is the
+        // only place the difference exists. Both hand the caller the same
+        // transport error; only the catalog can tell them apart afterwards,
+        // which is the whole claim this plan has to prove.
+        #[cfg(feature = "fault-injection")]
+        if self.faults.take(crate::faults::CommitFault::BeforeCommit) {
+            drop(tx); // rolled back: the operation is definitely absent
+            return Err(ambiguous_or_definite(
+                identity,
+                crate::faults::injected_transport_error(),
+            ));
+        }
+
         if let Err(e) = tx.commit().await {
             return Err(ambiguous_or_definite(identity, e));
         }
+
+        #[cfg(feature = "fault-injection")]
+        if self
+            .faults
+            .take(crate::faults::CommitFault::AfterCommitBeforeReturn)
+        {
+            // Durable, and the caller will never learn it.
+            return Err(ambiguous_or_definite(
+                identity,
+                crate::faults::injected_transport_error(),
+            ));
+        }
+
         Ok(CommitResult::Committed(commit_id))
     }
 }

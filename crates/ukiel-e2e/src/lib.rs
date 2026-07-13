@@ -386,6 +386,32 @@ impl Stack {
         catalog_url: &str,
         shutdown: CancellationToken,
     ) -> (String, tokio::task::JoinHandle<anyhow::Result<()>>) {
+        self.spawn_ukield_inner(table, catalog_url, shutdown, None)
+            .await
+    }
+
+    /// `spawn_ukield_with_catalog`, with ukield running on a catalog handle the
+    /// caller already owns — the only way to arm a commit-boundary fault in the
+    /// process under test (S11, plan 43). The handle must point at the same
+    /// database as `catalog_url`; the URL still configures the pool.
+    pub async fn spawn_ukield_with_injected_catalog(
+        &self,
+        table: &Table,
+        catalog_url: &str,
+        shutdown: CancellationToken,
+        catalog: PostgresCatalog,
+    ) -> (String, tokio::task::JoinHandle<anyhow::Result<()>>) {
+        self.spawn_ukield_inner(table, catalog_url, shutdown, Some(catalog))
+            .await
+    }
+
+    async fn spawn_ukield_inner(
+        &self,
+        table: &Table,
+        catalog_url: &str,
+        shutdown: CancellationToken,
+        injected: Option<PostgresCatalog>,
+    ) -> (String, tokio::task::JoinHandle<anyhow::Result<()>>) {
         let cfg_toml = format!(
             r#"
             roles = ["ingest", "query", "compactor", "gc"]
@@ -460,7 +486,7 @@ impl Stack {
 
         let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
-            ukield::run::run_with_bound_addr(cfg, shutdown, Some(bound_tx)).await
+            ukield::run::run_with_catalog(cfg, shutdown, Some(bound_tx), injected).await
         });
         let addr = tokio::time::timeout(Duration::from_secs(60), bound_rx)
             .await
