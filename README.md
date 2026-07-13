@@ -54,21 +54,31 @@ scenarios (namespace-scoped, through the HTTP endpoint — the product's real qu
 shape), and the **official upstream suites** (ClickBench's 43 queries, JSONBench's
 5), vendored with a per-query adaptation log.
 
-**Official headline (2026-07-12):** on ClickBench at 100M rows, ukiel costs
-**~2.1× bare DataFusion 54** — the same engine, same files, same SQL, same
-Parquet reader settings, minus the catalog/provider/cache stack — and beats it on
-nothing. That is the price of admission for the multitenant layer, measured
-rather than asserted, and it is the number to beat. (The reference runner is in
-the repo: `bench clickbench raw` + `bench clickbench compare`, so you can check
-us.)
+**Official headline (2026-07-13):** on ClickBench at 100M rows, over identical
+local files, ukiel's full stack — catalog planning, provider, tenant-isolation
+machinery, caches — runs the 41 stack-comparable queries at **0.99× bare
+DataFusion 54** (27.4 s vs 27.7 s, median per-query 0.98×, every answer
+identical, ukiel ahead on 24 of 41). The plan-32 first measurement said 2.16×
+and "beats it on nothing"; the gap decomposed into transport (fixed by the
+plan-15 cache tier, 94% recovered), a doubly-evaluated predicate (plan 37),
+and a `Utf8`-vs-`Utf8View` opt-out (plan 39) — full decomposition in
+`docs/notes/2026-07-12-official-suite-gap.md`. Calibration (plan 34): on the
+same parquet, **DataFusion outruns ClickHouse** (24.7 s vs 31.5 s); ClickHouse's
+benchmark lead is MergeTree's storage format (~1.4×) — the named, deliberate
+cost of the open-format lakehouse shape. (All reference runners are in the
+repo: `bench clickbench raw|compare`, `bench clickhouse …` — check us.)
 
-**House headline:** the process-wide Parquet footer cache (plan 13) cut
-per-tenant read latency **~30–40%** at the 100M-row / 10 GB tier by removing the
-67–108-footer-reads fan-out floor.
+**House headline (the product's query shape):** catalog pruning makes
+per-tenant queries *cheaper than bare DataFusion* on the same files —
+key-filtered queries run 3–4.5× faster than raw, and the plan-16 key bitmaps
+make pruning exact: the median 100M-row tenant plans **7 files instead of
+108** (−93%), sparse-tenant scan scenarios drop 53–73%, and an in-range tenant
+with zero rows touches zero objects. The plan-13 footer cache had already cut
+per-tenant read latency ~30–40% by removing the footer-fan-out floor.
 
 ## Requirements
 
-This repo needs Rust. I run it on the newest stable version. Beware, the dependiecies for this project are crazy (DataFlow, Parquet, etc.)
+This repo needs Rust. I run it on the newest stable version. Beware, the dependiecies for this project are crazy (DataFusion, Parquet, etc.)
 and they can easily 80-100GB of disk space in ./target directory (sic).
 
 I develop on Apple M3 36GB ram and AMD Ryzen AI 9 HX 370, 96GB ram.
@@ -111,9 +121,12 @@ endpoint: `SELECT table_name FROM information_schema.tables`.
   transaction as the part commit; workers resume from catalog offsets and
   never commit Kafka group offsets.
 - `crates/ukiel-query` — DataFusion query serving: catalog-planned Parquet
-  scans (no object-store listings), namespace isolation injected into the
-  physical plan, HTTP SQL endpoint (`POST /api/query`), local-disk
-  read-through cache in front of the object store.
+  scans (no object-store listings; range stats + exact packing-key bitmaps +
+  row-group key spans prune before any I/O), namespace isolation injected
+  into the physical plan, `Utf8View` string scans (engine-default parity),
+  HTTP SQL endpoint (`POST /api/query`), process-wide Parquet footer cache,
+  and a local-disk cache tier with write-through prewarm and chunked
+  large-object caching in front of the object store.
 - `crates/ukiel-compactor` — background rewrite workers on the change feed:
   fanout-driven level-ladder compaction (a run = one commit's key-disjoint
   output; runs merge a level up at a two-tier trigger — eager `l0_fanout`
@@ -140,9 +153,9 @@ endpoint: `SELECT table_name FROM information_schema.tables`.
   + GC in one process (per-role deployment via `roles = [...]`), idempotent
   table bootstrap from TOML config, graceful shutdown. Exposes `GET /metrics`
   (Prometheus) and `GET /readyz` (catalog + object-store reachability) on the
-  query listener. **P1 limitation:** a process running *without* the query role
-  emits metrics but has no listener to serve them — a standalone metrics port
-  is monitoring phase P2.
+  query listener, plus a standalone `metrics_listen` port for processes
+  running without the query role; a periodic collector adds consumer/feed
+  lag, backlog, GC, pool, and cache-dir gauges (monitoring P2, plan 21).
 
 Tests: `cargo test` (integration tests spin up Postgres/Kafka via
 testcontainers — Docker must be running). End-to-end: `make e2e`.

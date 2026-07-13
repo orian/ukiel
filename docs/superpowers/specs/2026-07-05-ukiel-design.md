@@ -83,7 +83,7 @@ The bounds themselves are **boundary policy, not an engine concept** — pre-pip
 
 ### Query path
 
-Custom DataFusion `CatalogProvider`/`TableProvider`: resolve tenant's logical table → prune parts via catalog → scan Parquet with `tenant_id` predicate pushed down (files sorted by tenant → row-group pruning is effective). Tenant isolation enforced by injecting the tenant filter at plan time (not SQL rewriting); quotas/limits per tenant at the session level. V1 cache: local NVMe read-through cache; distributed cache tier is an interface with a no-op impl.
+Custom DataFusion `CatalogProvider`/`TableProvider`: resolve tenant's logical table → prune parts via catalog (Int64 range stats, and since plan 16 an **exact** per-part packing-key bitmap — an in-range tenant with zero rows plans zero files) → scan Parquet with `tenant_id` predicate pushed down (files sorted by tenant → row-group pruning is effective; catalog-stored row-group key spans additionally pre-skip groups via `ParquetAccessPlan` without footer reads). Tenant isolation enforced by injecting the tenant filter at plan time (not SQL rewriting); quotas/limits per tenant at the session level. Cache (plan 15): local NVMe tier with **write-through prewarm** (compactor/ingest output lands hot, including a multipart tee for streamed merges) and range-granular chunk caching for large files; a distributed tier remains future work. The read path deliberately matches engine defaults where they matter — strings scan as `Utf8View` (plan 39), and pushed-down filters are evaluated once, not twice (plan 37 F3) — which is what closed the measured stack overhead to ~parity with bare DataFusion on identical files.
 
 **Result formats.** `POST /api/query` returns results in one of three encodings (`docs/notes/2026-07-06-columnar-results.md`), selected by an optional `format` field (or the `Accept` header): `columns` (default; columnar JSON — one value array per column plus a `schema` block, ~half the size on wide results and chart/dataframe-ready), `rows` (row-oriented JSON with the same `schema` block), or `arrow` (Arrow IPC stream, lossless, zero re-parse for Arrow-native clients). Both JSON formats' `schema` block resolves each column's Ukiel type via an inert `ukiel:type` Arrow field-metadata hint (recovers `timestamp_ms`, which stores as `Int64`, and survives plain column references); computed columns fall back to the Arrow type. Errors are always JSON regardless of requested format. Formatting is strictly downstream of `df.collect()`, so isolation and `SQLOptions` are unaffected.
 
@@ -150,8 +150,8 @@ Not yet done (deferred): a documented restore runbook, automated `tombstone_grac
 
 ## What already works (implementation status)
 
-Executed: plans 1–7, 9–12, and 17–20; the authoritative per-plan status
-table is `docs/superpowers/plans/2026-07-05-ukiel-v1-roadmap.md`. Crates
+Executed: rows 1–7, 9–21, 27–30, 32, 34, 37, and 39; the authoritative
+per-plan status table is `docs/superpowers/plans/2026-07-05-ukiel-v1-roadmap.md`. Crates
 (`crates/*`): `ukiel-core`, `ukiel-catalog`, `ukiel-ingest`, `ukiel-query`,
 `ukiel-compactor`, `ukiel-gc`, `ukiel-expr`, `ukiel-e2e`, `ukield`. By
 capability:
@@ -184,8 +184,16 @@ capability:
 **Query path**
 - DataFusion provider: logical-table resolution, plan-time namespace
   isolation (S1; 1k-tenant scale in S5), catalog live-part pruning +
-  column-stats pruning, predicate/projection pushdown into Parquet,
-  declared output ordering, NVMe read-through cache.
+  column-stats pruning + **exact packing-key bitmaps and row-group key
+  spans** (plan 16: the median 100M-row tenant plans 7 files instead of
+  108), predicate/projection pushdown into Parquet (evaluated once —
+  plan 37 F3 removed a double evaluation), output ordering declared on
+  predicated scans (measured split, gap note), `Utf8View` string
+  representation (plan 39 — parity with the engine default).
+- Cache tier (plans 3/13/15): process-wide Parquet footer/metadata cache;
+  NVMe read-through data cache with write-through prewarm (94% of the
+  measured MinIO transport share recovered) and chunked large-object
+  caching.
 - HTTP SQL endpoint: three result formats (columnar JSON default / rows /
   Arrow IPC), per-namespace `information_schema` introspection, statement
   timeout with the `timeout < gc grace` startup invariant (issue 0002).
@@ -216,9 +224,26 @@ queries and JSONBench's 5, vendored and run whole-table through a new
 **operator (unscoped) session**, with a raw-DataFusion reference runner giving
 every query a `ukiel / raw` ratio (`bench/README.md` §6).
 
-**Not yet** (roadmap rows; recommended order 15 →
-16 → 8, then 31 → 22 → 23 → 24; 25/26 gated on design decisions):
-remaining read-side perf tiers (15/16), pipelines & MVs (8 — plan written),
+**The read-stack story is closed (2026-07-12/13,
+`docs/notes/2026-07-12-official-suite-gap.md`).** Plan 32's headline 2.16×
+over bare DataFusion decomposed into transport 52% / stack 38% / layout 10%
+under controlled anchors. Transport: plan 15's cache tier recovers 94% of it.
+Stack: plan 37's instrumented attribution refuted the folklore hypotheses and
+found two systematic overheads — a doubly-evaluated pushed-down predicate (F3)
+and a `Utf8`-vs-`Utf8View` opt-out (row 39) — removing which brings the
+same-bytes residual to **0.99× raw DataFusion** (41 in-scope queries, every
+answer identical, ukiel ahead on 24). The plan-34 ClickHouse reference
+calibrated the machine and reframed the target: on identical parquet
+**DataFusion beats ClickHouse** — MergeTree's lead is a storage-format
+advantage (~1.4×), the named, unchased cost of the lakehouse shape. Remaining
+named levers: metadata-answerable aggregates (row 35, ready) and narrow column
+types (row 36, needs a sketch).
+
+**Not yet** (roadmap rows; recommended order 35 →
+8, then 31 → 22 → 23 → 24; 25/26 gated on design decisions; 36 needs a design
+sketch; 38 blocked upstream — DataFusion 54 is current, audit note
+`docs/notes/2026-07-13-datafusion-upgrade-audit.md`): catalog aggregate
+pushdown (35 — plan written), pipelines & MVs (8 — plan written),
 streaming-merge phase 2 / slice sealing (31), partition coalescing + retention
 (22), feed horizon (23), egress (24), auth (25), horizontal ingest (26).
 
@@ -236,9 +261,12 @@ GC hygiene.
 - **The operator (unscoped) session** — *added by plan 32*: a library-only
   `ukiel_query::context::operator_session` builds the ordinary table provider
   with its isolation slice set to `None`: every live part, **no packing-key
-  predicate**. Catalog pruning, stats pruning, the footer cache, and the
-  declared output ordering are all unchanged — the only difference from a
-  namespace session is the absent isolation filter. It exists because the
+  predicate**. Catalog pruning, stats pruning, and the footer cache are all
+  unchanged — the only difference from a namespace session is the absent
+  isolation filter (which also means a filterless operator scan declares no
+  output ordering, per the predicate-gated declaration from the gap-note
+  investigation — a namespace session always carries a predicate and always
+  declares). It exists because the
   official benchmark suites (ClickBench, JSONBench) are whole-table while
   ukiel's product path is namespace-scoped by construction, and bending the
   benchmarks would have measured something other than what they measure. It is
