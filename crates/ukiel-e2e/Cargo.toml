@@ -7,6 +7,8 @@ edition.workspace = true
 # the docker-compose stack (see docs/superpowers/specs/2026-07-05-ukiel-testing-design.md).
 
 [dependencies]
+toml = { workspace = true }
+ukield = { workspace = true }
 ukiel-core = { workspace = true }
 ukiel-catalog = { workspace = true }
 ukiel-ingest = { workspace = true }

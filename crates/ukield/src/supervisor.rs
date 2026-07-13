@@ -26,7 +26,6 @@ use std::pin::Pin;
 use tokio_util::sync::CancellationToken;
 use ukiel_catalog::{CatalogError, PostgresCatalog};
 
-use crate::config::Role;
 use crate::health::{HealthRegistry, RoleHandle};
 use crate::recovery::{RecoveryPolicy, Shutdown, wait_for_catalog};
 
@@ -90,7 +89,6 @@ pub type RoleRun<'a, E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'a
 /// lease, no cursor — crosses the boundary between attempts. That is the whole
 /// safety argument.
 pub async fn supervise_role<E, Build>(
-    role: Role,
     mut build: Build,
     catalog: PostgresCatalog,
     health: HealthRegistry,
@@ -217,7 +215,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::config::CatalogConfig;
+    use crate::config::{CatalogConfig, Role};
     use crate::health::RoleState;
     use ukiel_catalog::CatalogPoolConfig;
 
@@ -293,7 +291,6 @@ mod tests {
         };
 
         let label = supervise_role(
-            Role::Gc,
             build,
             catalog,
             health.clone(),
@@ -328,7 +325,6 @@ mod tests {
             Box::pin(async move { Err(FakeError::Permanent) })
         };
         let err = supervise_role(
-            Role::Gc,
             build,
             catalog,
             health,
@@ -361,7 +357,6 @@ mod tests {
         let build =
             move || -> RoleRun<'static, FakeError> { Box::pin(async move { Err(transport()) }) };
         let label = supervise_role(
-            Role::Gc,
             build,
             catalog,
             health,

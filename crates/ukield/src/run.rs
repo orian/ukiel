@@ -66,7 +66,7 @@ fn spawn_supervised<E, Build>(
     );
     tasks.spawn(async move {
         let _up = WorkerUp::new(label);
-        supervisor::supervise_role(role, build, catalog, health, handle, policy, shutdown).await
+        supervisor::supervise_role(build, catalog, health, handle, policy, shutdown).await
     });
 }
 

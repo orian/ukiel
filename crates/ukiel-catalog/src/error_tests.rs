@@ -141,3 +141,18 @@ fn an_unreachable_database_is_transport_even_when_it_arrives_as_a_migration_erro
     assert_eq!(err.class(), CatalogErrorClass::PermanentDatabase);
     assert!(!err.is_recoverable_transport());
 }
+
+#[test]
+fn a_connection_killed_during_the_handshake_is_transport() {
+    // Found by the S10 fault-injection suite, not by reasoning: cutting the
+    // network mid-handshake does not produce an I/O error, it produces garbage
+    // on the wire — "unexpected response from SSLRequest: 0x00" — which sqlx
+    // reports as `Protocol`. Classified permanent, that failed the compactor
+    // role and took the whole process down on a failover: the exact crash loop
+    // plan 42 exists to prevent.
+    let err = CatalogError::Db(sqlx::Error::Protocol(
+        "unexpected response from SSLRequest: 0x00".into(),
+    ));
+    assert_eq!(err.class(), CatalogErrorClass::Transport);
+    assert!(err.is_recoverable_transport());
+}

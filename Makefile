@@ -1,6 +1,6 @@
 # Ukiel developer targets.
 
-.PHONY: test e2e e2e-up e2e-down play bench-fetch-hits bench-fetch-bluesky bench-report
+.PHONY: test e2e e2e-ha e2e-up e2e-down play bench-fetch-hits bench-fetch-bluesky bench-report
 
 # Unit + component tests (Docker required for testcontainers).
 # --test-threads=2: each component test starts its own containers; unbounded
@@ -14,6 +14,15 @@ e2e:
 	docker compose up -d --wait
 	cargo test -p ukiel-e2e -- --ignored --test-threads=1
 	docker compose down -v
+
+# HA catalog-outage suite (plan 42, S10). Adds the opt-in Toxiproxy profile,
+# runs ONLY the S10 scenario serially, and always tears the stack down — the
+# trap matters: a failed run must not leave a toxic proxy in front of Postgres
+# for the next `make e2e`.
+e2e-ha:
+	docker compose --profile ha up -d --wait
+	trap 'docker compose --profile ha down -v' EXIT; \
+	  UKIEL_E2E_HA=1 cargo test -p ukiel-e2e --test s10_catalog_recovery -- --ignored --test-threads=1
 
 e2e-up:
 	docker compose up -d --wait

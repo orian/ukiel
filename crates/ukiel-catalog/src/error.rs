@@ -112,6 +112,17 @@ fn class_for_db_error(e: &sqlx::Error) -> CatalogErrorClass {
         // inside its acquire timeout — both mean "the database is not reachable
         // right now", which is the failover signature we must survive.
         sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut => CatalogErrorClass::Transport,
+        // A connection killed *during the handshake* does not arrive as an I/O
+        // error — it arrives as garbage on the wire ("unexpected response from
+        // SSLRequest: 0x00"), which sqlx reports as `Protocol`. Found by S10:
+        // classifying it permanent made the compactor fail the process on a
+        // failover, which is precisely the crash loop this plan exists to stop.
+        //
+        // The trade: a genuine protocol incompatibility (wrong server, wrong
+        // version) now retries instead of failing fast. That is the better error
+        // to have — it backs off, stays Degraded, and says so in
+        // `catalog_retry_total`, rather than taking the fleet down.
+        sqlx::Error::Protocol(_) => CatalogErrorClass::Transport,
         // The pool was closed under us: that is our own shutdown, not the
         // database's, and reconnecting the same pool will never work.
         sqlx::Error::PoolClosed => CatalogErrorClass::PermanentDatabase,

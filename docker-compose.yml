@@ -106,3 +106,28 @@ services:
       interval: 3s
       timeout: 5s
       retries: 30
+
+  # Fault proxy for the HA catalog-outage suite (plan 42, S10).
+  # OPT-IN ONLY: `docker compose --profile ha up -d toxiproxy` (or `make e2e-ha`).
+  # Without the profile it never starts, so `make e2e`, `make test` and a plain
+  # `docker compose up -d` are completely untouched by it.
+  #
+  # It sits in front of PostgreSQL so a test can cut catalog traffic the way a
+  # managed failover does — connections dropped, nothing listening — and then
+  # restore it, all without stopping the database (which would also destroy the
+  # state the recovery is supposed to reload from).
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    profiles: [ha]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      # Control API, and the proxied PostgreSQL port ukield is pointed at.
+      - "${UKIEL_TOXIPROXY_API_PORT:-8474}:8474"
+      - "${UKIEL_TOXIPROXY_PG_PORT:-15432}:15432"
+    healthcheck:
+      test: ["CMD", "/toxiproxy-cli", "list"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

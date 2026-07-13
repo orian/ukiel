@@ -23,8 +23,10 @@ use ukiel_ingest::config::{IngestConfig, TableRoute};
 use ukiel_ingest::consumer::IngestWorker;
 use ukiel_query::server::{AppState, router};
 
+pub mod fault_proxy;
+
 /// Env with a compose-matching default.
-fn env_or(key: &str, default: &str) -> String {
+pub fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
@@ -374,6 +376,99 @@ impl Stack {
     }
 
     /// Spawns an in-process compactor loop (fast poll) over all hypertables.
+    /// Runs a **real ukield** — every role, its own HTTP server — with its
+    /// catalog pointed at `catalog_url` (plan 42's S10 points it at the fault
+    /// proxy). Returns the base URL and the process's join handle, so a test can
+    /// assert the process never exits.
+    pub async fn spawn_ukield_with_catalog(
+        &self,
+        table: &Table,
+        catalog_url: &str,
+        shutdown: CancellationToken,
+    ) -> (String, tokio::task::JoinHandle<anyhow::Result<()>>) {
+        let cfg_toml = format!(
+            r#"
+            roles = ["ingest", "query", "compactor", "gc"]
+
+            [catalog]
+            url = "{catalog_url}"
+            # Short and jittered: the outage must be *survived*, and the retry
+            # load it generates must stay bounded (that is half the point).
+            acquire_timeout_ms = 1000
+            retry_base_ms = 200
+            retry_max_ms = 2000
+            recovery_probe_timeout_ms = 1000
+            query_admission_timeout_ms = 1000
+            retry_after_secs = 1
+
+            [object_store]
+            kind = "s3"
+            endpoint = "{s3}"
+            bucket = "ukiel"
+            access_key_id = "minioadmin"
+            secret_access_key = "minioadmin"
+            allow_http = true
+
+            [query]
+            listen = "127.0.0.1:0"
+
+            [ingest]
+            brokers = "{brokers}"
+            group_id = "s10-{nonce}"
+            flush_interval_ms = 500
+            max_event_age_days = 30000
+
+            [compactor]
+            poll_interval_ms = 500
+
+            [gc]
+            poll_interval_ms = 1000
+
+            [collector]
+            interval_ms = 500
+
+            [[tables]]
+            name = "{ht}"
+            topic = "{topic}"
+            ts_column = "ts"
+            packing_key = "tenant_id"
+            sort_key = ["tenant_id", "ts"]
+            partition_columns = ["day"]
+            namespaces = [{ns}]
+
+            [[tables.columns]]
+            name = "tenant_id"
+            type = "int64"
+
+            [[tables.columns]]
+            name = "ts"
+            type = "timestamp_ms"
+
+            [[tables.columns]]
+            name = "payload"
+            type = "utf8"
+            "#,
+            s3 = env_or("UKIEL_E2E_S3", "http://127.0.0.1:19000"),
+            brokers = self.brokers,
+            nonce = self.nonce,
+            ht = table.hypertable_name,
+            topic = table.topic,
+            ns = table.namespace.0,
+        );
+        let cfg: ukield::config::UkieldConfig =
+            toml::from_str(&cfg_toml).expect("s10 ukield config");
+
+        let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            ukield::run::run_with_bound_addr(cfg, shutdown, Some(bound_tx)).await
+        });
+        let addr = tokio::time::timeout(Duration::from_secs(60), bound_rx)
+            .await
+            .expect("ukield must bind its listener even if the catalog is unreachable")
+            .expect("ukield died before binding");
+        (format!("http://{addr}"), handle)
+    }
+
     pub fn spawn_compactor(&self) -> CompactorHandle {
         let compactor = Compactor::new(
             self.catalog.clone(),
