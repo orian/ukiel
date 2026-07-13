@@ -1,119 +1,158 @@
-# Catalog scalability under surge — what to measure, and the options
+# Catalog scalability under surge — demand, ceilings, and options
 
-Ukiel's horizontal story rests on stateless workers over shared storage — but
-every query and every flush serializes through **one Postgres catalog**. It is
-the component whose ceiling nobody has measured. This note dimensions the
-problem, designs the catalog-only benchmark (roadmap row 40), and lays out the
-scaling options with their correctness constraints, so the measurement can
-hand each one a verdict instead of a vibe.
+Ukiel's horizontal story rests on stateless workers over shared storage, but
+every query admission and durable write currently crosses one PostgreSQL
+primary. Now that cached-MinIO query execution is within 3% of bare DataFusion,
+the catalog is the largest unmeasured horizontal dependency. Roadmap row 40
+must measure when one primary stops being sufficient for Ukiel's
+million-tenant/PB+ target, and make each scaling option earn its complexity.
 
-## What one unit of load actually costs the catalog
+## Start with a product demand envelope
 
-Verified against `crates/ukiel-catalog` (2026-07-13):
+A ceiling without a target cannot decide whether to cache, replicate, or shard.
+Every report carries configurable demand scenarios. Suggested defaults are:
+
+| scenario | registered tenants | active fraction | query rate | ingest lanes / flush |
+|---|---:|---:|---:|---:|
+| steady | 1,000,000 | 1% | 1 query/min active tenant | 256 / 10 s |
+| dashboard surge | 1,000,000 | 10% | 1 query/min active tenant | 256 / 10 s |
+| backfill | 1,000,000 | 1% | 1 query/min active tenant | 2,048 / 10 s |
+
+These are benchmark defaults, not product promises. Derive required read QPS,
+write TPS, and background QPS from the recorded inputs. Verdicts use measured
+headroom over these targets. The provisional capacity gate is p99 within the
+declared admission SLO, zero timeouts, and at least 2x steady / 1.25x surge
+throughput headroom. The run must state the SLO rather than silently invent it.
+
+## What one unit of load costs
 
 | load unit | catalog work | shape |
 |---|---|---|
-| one product query | `live_parts_pruned` (1 SELECT over `parts` with key/range clauses) | read; plus session build (`get_hypertable`, `list_logical_tables`) which is per-session and trivially cacheable |
-| one ingest flush | `commit_with_offsets` (1 transaction: `commits` insert, `parts` inserts ×K, `ingest_offsets` CAS, `pending_objects` clear) + `max_live_l0_parts` probe per flush tick | write txn + 1 read |
-| compactor pass | `changes_since` poll, `live_parts`, REPLACE `commit` (conflict → rollback + replan) | read + contended write |
-| finalization sweep | `finalize_candidates` + `partition_l0_quiet_since` + `live_partition_parts` per candidate | reads (0007 index) |
-| GC / collector | backlog aggregates, cursor upserts, gauges every tick | background reads |
+| product query | live_parts_pruned plus session metadata reads | read admission, then JSONB/bitmap decode |
+| ingest flush | commit_with_offsets: commit, K part inserts, offset CAS, intent clear; grouped L0 probe | write transaction + guardrail read |
+| compactor | feed poll, live-part replan, optimistic REPLACE | reads + contended write |
+| finalization | candidates, quiet check, partition parts | background reads |
+| GC/collector/pipeline | aggregates, pending/tombstone queries, cursors and feed polls | low-rate broad work |
 
-Two structural facts before any measurement:
+The SQLx maximum of 16 connections is per process. Horizontal deployment
+multiplies pools and connections; one 64-connection pool is not equivalent to
+eight processes with eight connections each. Catalog QPS bounds query admission,
+not scan concurrency.
 
-- **The pool is hardcoded**: `PgPoolOptions::max_connections(16)`
-  (`lib.rs:27–29`) — per process. A query surge beyond 16 in-flight catalog
-  calls queues in sqlx, invisible except via `catalog_pool_connections`
-  (plan 21). Pool size is a bench axis, then a config knob (it is neither
-  today).
-- **QPS ceiling ≠ query ceiling.** Queries touch the catalog once at plan
-  time; the scan itself is object-store work. So catalog QPS bounds *query
-  admission rate*, not query concurrency — and cheap plan-time reads are
-  exactly what Postgres is good at. The realistic risk order is: pool
-  starvation first, then Postgres CPU on `parts` scans at high cardinality,
-  then commit contention under ingest+compaction storms. The bench exists to
-  confirm or reorder that list.
+## State model: history, liveness, and hot-table fan-out
 
-## The benchmark (row 40): catalog-only, cores-limited
+One parts count is insufficient. Vary independently:
 
-No Kafka, no object store, no DataFusion — drive `PostgresCatalog` directly
-against the compose `postgres` service (postgres:17, stock config), with CPU
-as the controlled variable: `docker update --cpus=N <project>-postgres-1`
-changes the limit **live**, so one seeded catalog serves the whole
-cores-sweep. Seeding is synthetic `commit()`s with fake paths — parts rows
-need no objects behind them, which is what makes catalog-only benching cheap
-at high cardinality (millions of `parts` rows in minutes).
+- total historical rows, including tombstoned feed history;
+- currently live rows covered by the partial live index;
+- live rows in one hot hypertable;
+- candidate and returned rows for one packing key;
+- tables, partitions, packing keys, and L0/L1+ mix.
 
-Workloads (each a `bench catalog` subcommand; N async workers over one pool,
-measured as achieved ops/s + latency percentiles + saturation signature):
+Use four named states:
 
-1. **read-surge** — `live_parts_pruned` storms with realistic key
-   distributions over T tables × P parts; the query-admission ceiling.
-2. **write-surge** — `commit_with_offsets` storms across W distinct
-   topic-partitions (no CAS conflicts) + the flush-tick probe; the ingest
-   ceiling.
-3. **conflict-storm** — concurrent REPLACE `commit`s targeting the same
-   hypertable (the compactor-vs-compactor and plan-8 MV shape); measures
-   useful-work fraction under optimistic-concurrency churn.
-4. **mixed surge** — the product ratio (reads ≫ writes, background probes on
-   ticks) to find which side degrades first.
+| state | history/live shape | purpose |
+|---|---|---|
+| fresh | mostly live, modest history | new deployment |
+| mature-compacted | large history, small live fraction, bounded runs | intended steady state |
+| backlogged | large history and elevated live L0/run counts | backfill or compactor lag |
+| pathological | mostly live and concentrated in one hypertable | failure envelope only |
 
-Axes: PG cores (1/2/4/8+), pool size (16/32/64), `parts` cardinality (10⁴ →
-10⁷ rows), tables/namespaces count. Saturation attribution: sample
-`pg_stat_activity` wait events + `pg_stat_database` from a side connection
-during each run — pool-wait vs PG-CPU vs lock-wait vs IO-wait is the whole
-diagnosis, and it must be recorded per run, not inferred afterward.
+Fixtures include realistic plan-16 column_stats: Int64 bounds, roaring key
+bitmaps and row-group spans where applicable, the 10k-key omission case, and
+dedicated parts without redundant bitmaps. This preserves row width, TOAST
+pressure, transfer, JSON decode, and provider filtering costs.
 
-## The options (to be verdicted by measurement, not adopted a priori)
+Large fixtures use set-based SQL or COPY-style bulk seeding while preserving
+commits, foreign keys, live/tombstoned ratios, and indexes. Product write
+throughput is measured separately through commit_with_offsets. Seed time and
+product TPS must never be conflated.
 
-**Parallelize the catalog?** Postgres already parallelizes across
-connections; the real questions are sharper:
+## Load topology and modes
 
-- **Read replicas for plan-time reads.** `live_parts_pruned` on a replica
-  serves a *stale snapshot* — which ukiel already tolerates by design: a
-  query planned at T sees parts live at T, and objects stay readable for
-  `gc.tombstone_grace` after tombstoning. The correctness rule is the same
-  invariant family as issue 0002: **replica lag + statement timeout <
-  tombstone grace**, enforceable at startup. Writes (commits, CAS) stay on
-  the primary. This is the cleanest true-parallelization path and it needs
-  zero schema change — but it only pays if the bench shows reads saturating
-  the primary's CPU rather than the pool.
-- **Sharding by hypertable** (multiple catalogs) is mechanically plausible —
-  every hot query is single-hypertable — but it breaks the global change
-  feed and cross-table GC/collector sweeps into per-shard loops, and nothing
-  yet suggests the write path needs it. File under "if commit TPS on one
-  primary is really the wall."
+Vary PostgreSQL cores, process-equivalent pool count, connections per pool,
+global connection budget, workers, offered rate, cardinality, and uniform versus
+Zipf keys. Include topologies such as 1x16, 4x16, 32x8, and 64x4.
 
-**What can be cached?** In risk order of staleness:
+Every workload has two modes:
 
-- **Hypertable/logical-table metadata** — changes only at DDL; per-process
-  cache with change-feed (or TTL) invalidation is nearly free and removes
-  the session-build reads entirely.
-- **Live-parts snapshots** — the big one (plan 37's F2 explicitly deferred
-  it here): a per-process `(hypertable → parts)` cache invalidated by
-  `changes_since` polling. Staleness is bounded by the poll interval and
-  guarded by the same tombstone-grace arithmetic as replicas. Turns the
-  per-query catalog cost from one SELECT into zero for hot tables. The bench
-  quantifies what it buys (pool pressure and PG CPU at read-surge) before
-  anyone builds it.
-- **Not cacheable**: anything the ingest transaction reads for correctness
-  (the offsets CAS *is* the exactly-once mechanism) and the backpressure
-  probe (its freshness is the guardrail's point — though plan 28 already
-  grouped it to one query per tick).
+1. Closed loop: N workers issue the next request after completion. This finds
+   the throughput knee and service-time curve.
+2. Open loop: a rate scheduler submits at fixed QPS/TPS. This exposes queue
+   growth, overload latency, timeouts, shedding, and recovery without
+   coordinated omission.
 
-**Bottleneck priors to test** (each falsifiable by the matrix): sqlx pool
-exhaustion at surge (fix: knob + right-size); `parts` scan CPU at 10⁶⁺ rows
-per hypertable (fix: index tuning — 0007 covers partition probes but
-`live_parts_pruned`'s key/stat clauses deserve `EXPLAIN ANALYZE` under load);
-`commits` insert serialization on one hypertable's optimistic concurrency
-(fix: nothing cheap — this is the sharding trigger if real); JSONB
-`column_stats` extraction cost in pruning clauses (fix: promote hot bounds to
-real columns).
+Report offered, started, completed, timed-out, and failed operations. Every
+operation has a deadline. Label hot-cache and cold/evicted-cache runs separately.
 
-## Relation to the roadmap
+## Workloads
 
-Row 26 (horizontal ingest) multiplies write-side catalog load by the worker
-count; row 8 (pipelines/MVs) adds feed consumers; both make this measurement
-prerequisite knowledge rather than curiosity. Follow-up rows come out of the
-verdict table (likely candidates: pool knob + snapshot cache; possibly
-replica reads), not out of this note.
+1. Read surge: live_parts_pruned with key and timestamp mixes, optionally
+   followed by actual key-bitmap decode/filter. Report SQL, deserialize, and
+   filter time plus returned rows and bytes.
+2. Write surge: conflict-free commit_with_offsets over distinct lanes with
+   realistic parts per commit and the real flush-tick probe ratio. Record
+   cardinality at start and end.
+3. Conflict storm: same partition, same hypertable/different partitions, and
+   Zipf-hot partitions. Model the real reread/replan/backoff policy. Report
+   useful swaps, attempts, rolled-back work, and latency per success.
+4. Mixed surge: demand-envelope reads and writes plus compactor replanning,
+   finalization, feed polls and cursor advances, GC queries, and monitoring
+   aggregates at their real tick rates.
+5. Connection surge: start process-equivalent pools concurrently and measure
+   establishment latency, exhaustion, and recovery.
+
+## Saturation attribution
+
+Use a side connection for pg_stat_activity, pg_stat_database, locks, transaction
+and block statistics. Measure PostgreSQL and driver CPU from cgroup/process
+CPU-time deltas or continuous samples, not a single docker-stats snapshot.
+Record WAL bytes/fsyncs, I/O, memory, shared_buffers, storage driver,
+dataset-to-RAM ratio, max_connections, and non-default PostgreSQL settings.
+
+Sample size, idle count, and waiters where available for every client pool. A
+separate acquire probe is only a canary and must not be called the workload's
+acquire-latency distribution. Record EXPLAIN (ANALYZE, BUFFERS, WAL) at each
+cardinality knee and include result rows/bytes with every latency claim.
+
+## Options receive measured verdicts
+
+- Per-process pool knob and global connection budget: only if pool queueing
+  dominates before PostgreSQL saturates.
+- PgBouncer: if many pools or connection surges are the wall; compare
+  transaction pooling with direct SQLx pools.
+- Batched part inserts: if multi-part commits spend material time in the current
+  per-part INSERT loop, while preserving transaction and offset-CAS semantics.
+- Metadata cache: justified by measured session-build share.
+- Live-parts snapshot cache: only if reads saturate the primary and memory plus
+  invalidation beats replicas. It requires atomic snapshot/feed-high-watermark
+  bootstrap and bounded memory.
+- Read replicas: only if primary read CPU is the wall.
+- Typed-column/index promotion: if JSONB/range pruning is the measured wall.
+- Feed horizon or physical table partitioning: if history, vacuum, or index
+  bloat damages the live path; this directly informs row 23.
+- Hypertable sharding: last resort, only if useful commit TPS misses the demand
+  envelope after cheaper fixes.
+
+A pool knob without a fleet-wide connection budget can make the system worse.
+
+## Correctness boundary for stale reads
+
+Cache or replica lag has two independent consequences:
+
+1. A stale deletion can reference a tombstoned object. The condition
+   lag + query lifetime < tombstone grace preserves object availability.
+2. A stale addition is omitted and returns incomplete recent data. Only the
+   declared query-freshness SLO can authorize that lag.
+
+Tombstone grace does not solve freshness. Any cache or replica follow-up must
+specify freshness, race-free snapshot/feed bootstrap, read-your-writes,
+failover, memory bounds, and behavior when lag exceeds the limit.
+
+## Roadmap relation
+
+Row 40 supplies prerequisite evidence for row 26, which multiplies pools and
+write lanes; row 8, which adds feed consumers; and row 23, which bounds catalog
+history. The final answer is not merely QPS at N cores. It is: at what tenant
+activity, ingest rate, catalog age, and fleet size does one primary miss the
+SLO, and which least-complex option restores the required headroom?

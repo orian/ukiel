@@ -1,136 +1,342 @@
-# Ukiel Plan 40: Catalog Scalability Bench (surge ceilings, cores-limited, options verdicts) Implementation Plan
+# Ukiel Plan 40: Catalog Scalability Bench
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
->
-> **Investigation-first, plan-37 shape:** Tasks 1–3 build permanent instruments, Task 4 runs the measurement matrix, Task 5 hands each pre-registered option a **verdict** (pursue as its own row / decline with the number that declined it). No product code ships from this plan — a confirmed fix files a roadmap row (the plan-37 sizing rule); the deliverable is the ceiling numbers and the verdict table.
+> Investigation first. Tasks 1–4 build permanent benchmark capabilities, Task
+> 5 runs the matrix, and Task 6 gives every pre-registered option a measured
+> verdict. No performance fix ships from this plan; a confirmed fix earns its
+> own roadmap row.
 
-**Goal:** Measure what the single-Postgres catalog sustains under query/ingest surges — the horizontal-scaling question in `docs/notes/2026-07-13-catalog-scalability.md` (the sketch; read it first). Concretely: achieved ops/s + latency percentiles + **saturation attribution** for the four workloads (read-surge / write-surge / conflict-storm / mixed) across PG cores × pool size × `parts` cardinality, and a verdict for each pre-registered scaling option (pool knob, metadata cache, live-parts snapshot cache, replica reads, hypertable sharding). Driver: roadmap row 40; prerequisite knowledge for rows 26 and 8.
+## Goal
 
-**Architecture:** everything lands in the bench binary (`crates/ukiel-e2e/src/bin/bench/`, new `catalog.rs` module + `main.rs` wiring) driving `PostgresCatalog` **directly** — no Kafka, no object store, no DataFusion session. Seeding uses real `commit()`s with synthetic paths (`bench/ht/{i}/L1/{uuid}.parquet` — parts rows need no objects behind them), real per-part Int64 `column_stats`, and a keyspace shaped like the product (packed multi-key parts with overlapping ranges, a configurable dedicated-part fraction). The CPU limit is applied to the compose `postgres` service **live** (`docker update --cpus=<n> $(docker compose ps -q postgres)`), so one seeded catalog serves the whole cores sweep — seeding is the expensive step and happens once per cardinality point. Wait-event sampling runs on a **separate single connection** (never the bench pool — the instrument must not consume what it measures), polling `pg_stat_activity`/`pg_stat_database` at ~250 ms during every run and folding the samples into the run report.
+Measure when the single PostgreSQL primary stops meeting Ukiel's query-admission
+and durable-write SLO under the million-tenant/PB+ target. Report sustainable
+open- and closed-loop read QPS, write TPS, useful conflict TPS, latency,
+timeouts, recovery, and saturation attribution across:
 
-Nothing here touches product code or existing tests; the only shared surface is the bench binary. One measurement-honesty rule carried from the house protocol: the bench process and Postgres share this machine, so every run records the *bench side's* CPU too — a run where the driver is the bottleneck is a driver bug, not a ceiling, and the report must be able to tell them apart (drivers are cheap async loops; if driver CPU exceeds ~2 cores at saturation, raise workers' efficiency before trusting numbers).
+- product demand scenario;
+- PostgreSQL cores and memory/working-set posture;
+- process-equivalent pool topology and global connections;
+- historical, live, and hot-hypertable part cardinality;
+- fresh, mature-compacted, backlogged, and pathological states.
 
-**Tech Stack:** existing deps only (`sqlx` via `ukiel-catalog`, `tokio`, `serde_json`; percentiles by sorting a `Vec<f64>` — no new histogram crate for a manual bench). Compose service verified: `postgres` (postgres:17, stock config — record `shared_buffers` etc. once in the report header via `SHOW ALL` so runs are self-describing).
+The output must answer: at what tenant activity, ingest rate, catalog age, and
+fleet size does one primary miss the declared SLO, and which least-complex
+option restores the required headroom?
 
-**Prerequisites:** none unexecuted — `PostgresCatalog` API verified 2026-07-13 (`connect` with hardcoded `max_connections(16)` at `lib.rs:27–29`; `live_parts_pruned`, `commit_with_offsets`, `max_live_l0_parts`, `changes_since`, `finalize_candidates` per the sketch's cost table). Pool size is a bench axis, so Task 1 needs a way to open pools of configurable size: add `connect_with_pool_size(url, n)` to `ukiel-catalog` — the one tiny library addition, behavior-identical for all existing callers (`connect` delegates with 16).
+Driver: roadmap row 40 and
+docs/notes/2026-07-13-catalog-scalability.md. Read that note first.
 
-## Global Constraints
+## Architecture
 
-- Rust edition 2024, toolchain ≥ 1.96; pinned deps; conventional commits, no Claude/AI attribution; fmt + `clippy -D warnings` per task.
-- **Every existing test stays green after every task** (the `connect_with_pool_size` addition is delegation-only; everything else is bench code).
-- **Measurement protocol:** ≥ 2 runs per matrix point, interleaved when comparing configs; report achieved ops/s, p50/p95/p99, error/conflict counts, wait-event profile, PG CPU%, driver CPU%; state cardinality, cores, pool, worker count with every number; results JSON to `bench/results/catalog-*.json` (append-only, labeled).
-- Runs are manual-only (never CI); `docker update --cpus` is restored to unlimited after each session (record in the runbook).
+Everything lives in the manual bench binary under
+crates/ukiel-e2e/src/bin/bench/catalog.rs, plus main.rs wiring. It drives
+PostgresCatalog directly: no Kafka, object store, or DataFusion.
 
----
+One small library addition is allowed:
+PostgresCatalog::connect_with_pool_size(url, n); existing connect delegates to
+it with 16. Multi-pool tests create several PostgresCatalog instances to model
+separate ukield processes. A single large pool must never stand in for a fleet.
 
-### Task 1: Catalog workload drivers (`bench catalog seed|read|write|conflict|mixed`)
+Large fixture creation uses bench-only set-based SQL or COPY-style insertion,
+not millions of product API calls. It preserves commits, foreign keys,
+live/tombstoned ratios, indexes, realistic partition/key distributions, and
+plan-16 column_stats. The write benchmark itself always uses the real
+commit_with_offsets path, including its current per-part INSERT loop.
 
-**Files:**
-- Create: `crates/ukiel-e2e/src/bin/bench/catalog.rs`
-- Modify: `crates/ukiel-e2e/src/bin/bench/main.rs` (subcommands + usage), `crates/ukiel-catalog/src/lib.rs` (`connect_with_pool_size`)
-- Test: pure helpers in-module (`cargo test -p ukiel-e2e --bin bench` if the bin has unit tests today — else the crate's convention; plus one `#[ignore]`d smoke against the compose stack)
+Every workload supports:
 
-**Interfaces:**
-- `bench catalog seed --tables T --parts-per-table P [--dedicated-frac F]` — creates T hypertables (`bench_cat_{i}`), commits P parts each in batches (realistic `PartMeta`: overlapping key ranges for packed parts, `key_min == key_max` for the dedicated fraction, Int64 `column_stats` with plausible ts bounds, day-partition values across ~30 days). Idempotent per label: refuses to re-seed an existing table count mismatch loudly.
-- `bench catalog read --workers N --duration S [--pool P] [--key-dist uniform|zipf]` — N tasks looping `live_parts_pruned(ht, Some(key), &ranges)` with keys drawn from the distribution and a ts-range predicate on half the calls (the product mix). Zipf matters: pool and PG cache behavior differ between uniform and hot-key skew — implement zipf as a pure helper with a unit test (house rule: decision logic extracted pure).
-- `bench catalog write --workers N --duration S [--pool P] [--parts-per-commit K]` — each worker owns a distinct `(topic, partition)` lane and loops `commit_with_offsets` (monotonic offsets — CAS always succeeds; that is the *conflict-free* ingest shape) plus one `max_live_l0_parts` probe per M commits (the flush-tick ratio).
-- `bench catalog conflict --workers N --duration S --tables 1` — workers race REPLACE `commit`s over the same hypertable's parts (read live set → commit swap); reports useful-work fraction = successful swaps / attempts, and the conflict-retry latency distribution.
-- `bench catalog mixed --read-workers R --write-workers W --duration S` — both at once plus a background tick loop (`finalize_candidates` + `changes_since`) at the compactor cadence.
-- Every subcommand: warmup period excluded from stats; results JSON `{label, workload, axes…, achieved_ops, p50, p95, p99, errors, conflicts, driver_cpu_pct}`.
+- closed-loop workers for the service-capacity knee;
+- open-loop fixed arrival rate for queueing, timeout, overload, and recovery;
+- per-operation deadlines;
+- multiple process-equivalent pools;
+- warmup excluded from results;
+- hot and cold/evicted PostgreSQL-cache labels.
 
-- [ ] **Step 1: failing unit tests** — zipf sampler distribution sanity; seed-plan generator (part ranges overlap/dedicated fraction as specified) as a pure fn.
-- [ ] **Step 2–4: fail → implement → unit tests + one smoke** (`seed --tables 2 --parts-per-table 100` then `read --workers 4 --duration 5` against the compose stack; numbers print, JSON written).
-- [ ] **Step 5: lint and commit**
+A separate observer connection samples PostgreSQL. Driver and database resource
+use are measured continuously or from CPU/cgroup counter deltas, never from one
+point-in-time docker-stats sample.
 
-```bash
-git commit -m "bench: catalog workload drivers - seed, read/write/conflict/mixed surges"
-```
+## Demand scenarios and capacity rule
 
----
+Reports contain the raw inputs and derived load:
 
-### Task 2: Saturation attribution sampler
+- registered tenants;
+- active fraction;
+- queries per active tenant per second;
+- ingest lanes and effective flush interval;
+- compactor, pipeline, GC, and collector tick rates;
+- declared query-admission and commit p99 SLOs.
 
-**Files:**
-- Modify: `crates/ukiel-e2e/src/bin/bench/catalog.rs`
+Default scenarios, explicitly overrideable:
 
-**Interfaces:**
-- A sampler task on its own **single** connection (not the bench pool), started by every workload run: every ~250 ms record `pg_stat_activity` rows for the bench DB (state, `wait_event_type`/`wait_event`) and `pg_stat_database` deltas (xact_commit/rollback, blks_hit/read); on run end, fold into the report: `{active_avg, waiting_by_event: {…}, xact_per_s, cache_hit_ratio}` plus PG container CPU% (`docker stats --no-stream`) and driver process CPU%. The report's one-line verdict field is derived, not vibed: dominant wait class ∈ {pool-wait (bench-side queue time — measured as acquire latency on the sqlx pool), pg-cpu, lock, io}.
-- Pool acquire time: wrap catalog calls with an acquire-latency measurement (sqlx exposes pool acquire via timing the call itself minus query time is unreliable — simplest honest instrument: `pool.acquire()` timing in a probe task at 4 Hz, reported as its own percentile series).
+| scenario | tenants | active | query rate | ingest lanes / flush |
+|---|---:|---:|---:|---:|
+| steady | 1,000,000 | 1% | 1/min | 256 / 10 s |
+| dashboard-surge | 1,000,000 | 10% | 1/min | 256 / 10 s |
+| backfill | 1,000,000 | 1% | 1/min | 2,048 / 10 s |
 
-- [ ] **Steps: unit test the folding (pure over synthetic samples) → implement → smoke (sampler output present in the JSON) → lint and commit**
+The provisional capacity verdict requires zero timeouts, p99 within the declared
+SLO, and at least 2x headroom over steady demand / 1.25x over surge demand.
+Results without a stated target and SLO are measurements, not capacity verdicts.
 
-```bash
-git commit -m "bench: catalog saturation sampler - wait events, xact rates, pool acquire latency"
-```
+## Global constraints
 
----
+- Rust edition 2024 and pinned workspace dependencies.
+- Existing behavior and tests stay green after every task.
+- Manual-only runs; JSON reports append under bench/results/catalog-*.json.
+- At least two runs per matrix point; interleave comparisons.
+- Every result records offered/started/completed/failed/timed-out ops, p50/p95/
+  p99/max, queue depth, conflicts, returned rows/bytes, pool topology, catalog
+  state, PostgreSQL resources/settings, driver resources, and cache posture.
+- Detect coordinated omission: open-loop latency starts at scheduled arrival,
+  not when a worker finally begins the database call.
+- If driver CPU exceeds about two cores or its queue drops work before the
+  database knee, the point is invalid and the driver must be fixed.
+- The benchmark writes only bench_cat_* objects in disposable compose
+  PostgreSQL. Restore any live CPU limit after a run session.
+- No cache, replica, index, batching, pooling, or sharding product change lands
+  here. Task 6 files follow-up rows with measured motivation.
 
-### Task 3: Cores-limit + runbook wiring
+## Task 1: Demand model, fixture states, and feasible seeding
 
-**Files:**
-- Modify: `crates/ukiel-e2e/src/bin/bench/catalog.rs` (record the current `--cpus` limit in every report by reading the container's `NanoCpus` via `docker inspect`), `bench/README.md` (§commands + a new §catalog runbook)
+Files:
 
-**Interfaces:**
-- The bench does **not** change the limit itself (state-changing docker ops stay manual and visible); it *records* it. Runbook documents the sweep loop:
+- Create crates/ukiel-e2e/src/bin/bench/catalog.rs
+- Modify crates/ukiel-e2e/src/bin/bench/main.rs
+- Modify crates/ukiel-catalog/src/lib.rs
+- Add pure unit tests in the bench module and one ignored compose smoke test
 
-```bash
-PG=$(docker compose ps -q postgres)
-for n in 1 2 4 8; do
-  docker update --cpus=$n $PG
-  ./target/release/bench catalog read --workers 64 --duration 30 --label cores$n
-done
-docker update --cpus=0 $PG   # unlimited again — always restore
-```
+Interfaces:
 
-- [ ] **Steps: implement recording + runbook → smoke (report carries the limit) → lint and commit**
+- bench catalog seed --label L --tables T --history-parts H --live-parts V
+  --hot-table-live X --state fresh|mature|backlogged|pathological
+  --packing-keys K --dedicated-frac F
+- bench catalog demand with scenario inputs prints and serializes derived read
+  QPS, write TPS, and background QPS.
+- connect_with_pool_size(url, n), with connect delegating to n=16.
 
-```bash
-git commit -m "bench: catalog runs record the live PG cpu limit; cores-sweep runbook"
-```
+The seed plan must create:
 
----
+- independent historical, live, and hot-table populations;
+- realistic live/tombstoned rows and L0/L1+ levels;
+- about 30 day partitions and configurable table/key skew;
+- Int64 min/max plus realistic roaring bitmap and row-group-span payloads;
+- dense bitmap-omission and dedicated-part cases;
+- deterministic labels and loud mismatch refusal.
 
-### Task 4: The measurement matrix
+Use set-based SQL/COPY for million-row fixtures. Include a small
+--via-product-api validation mode proving the synthetic rows match the schema
+and query behavior; do not use it for 10M seeding.
 
-No product code. On the compose stack, release build, per the sketch's axes — recorded labels, ≥ 2 runs each:
+Tests:
 
-- [ ] **Step 1 (cardinality × read ceiling):** seed 10⁴ / 10⁶ / 10⁷ parts-per-catalog points (one table count, e.g. T=16); `read` sweep workers 16/64/256 at pool 16 vs 64, cores 4. Deliverable: QPS ceiling vs cardinality, and whether the wall is pool-wait or PG CPU at each point. `EXPLAIN (ANALYZE, BUFFERS)` one representative `live_parts_pruned` at 10⁷ and record the plan (index-or-seqscan is a finding, not a guess).
-- [ ] **Step 2 (cores sweep):** at the middle cardinality, `read` and `write` across cores 1/2/4/8, fixed workers/pool. Deliverable: ops/s-per-core curves — the "how many QPS at N cores" answer, both directions.
-- [ ] **Step 3 (write + conflict):** `write` worker sweep (TPS ceiling, commit latency percentiles); `conflict` at 2/8/32 workers (useful-work fraction curve — the optimistic-concurrency tax under compactor/MV-shaped contention).
-- [ ] **Step 4 (mixed surge):** product-ratio mix at the read ceiling's edge; which side degrades first and what the sampler blames.
-- [ ] **Step 5:** write all of it into the sketch note (new "Measured" section: the ceilings table + saturation attributions + the EXPLAIN finding), commit:
+- demand arithmetic and capacity-gate boundaries;
+- deterministic state generator and exact live/history counts;
+- dedicated fraction, L0/L1+, bitmap presence/omission, and hot-table skew;
+- connect delegation;
+- ignored seed/read smoke.
 
-```bash
-git commit -m "bench: catalog surge matrix recorded - ceilings, per-core curves, conflict tax"
-```
+Commit:
 
----
+    bench: catalog demand model and realistic bulk-seeded states
 
-### Task 5: Options verdicts + close out
+## Task 2: Closed- and open-loop workload engine
 
-**Files:**
-- Modify: `docs/notes/2026-07-13-catalog-scalability.md` (verdict per option), `bench/README.md` (results addendum), `docs/superpowers/plans/2026-07-05-ukiel-v1-roadmap.md` (row 40 → **Executed**; file follow-up rows the verdicts earn)
+Interfaces shared by read, write, conflict, mixed, and connection workloads:
 
-Each pre-registered option gets a verdict **derived from the matrix**, with the number that decided it: pool knob (expected: cheap win if pool-wait dominates anywhere — file the config row); hypertable/table metadata cache (session-build read share); **live-parts snapshot cache** (what fraction of read-surge load it would remove; the tombstone-grace staleness argument from the sketch rides along); replica reads (only if PG CPU is the read wall); hypertable sharding (only if single-primary commit TPS is a real wall at product-shaped load — say the measured TPS and the target that would exceed it). Declined options get declined *in writing with numbers* — the sketch's whole point.
+- --mode closed|open
+- --workers N or --rate R
+- --duration S --warmup S --timeout-ms N
+- --pools N --connections-per-pool N
+- --key-dist uniform|zipf
+- --label L
 
-- [ ] **Step 1:** verdict table into the sketch note; follow-up roadmap rows for pursued options (each with its measured motivation, plan-37-style).
-- [ ] **Step 2:** full-workspace check — `cargo fmt --check && cargo clippy --all-targets -- -D warnings && make test`; restore the PG cpu limit; roadmap flip.
-- [ ] **Step 3: commit**
+Open-loop scheduling records latency from scheduled arrival, bounded queue depth,
+late starts, dropped submissions, completed work after the offered phase, and
+recovery time. It must not allocate one Tokio task per arrival without a bound.
 
-```bash
-git commit -m "docs: catalog scalability measured - ceilings recorded, options verdicted, row 40 executed"
-```
+Workloads:
 
----
+1. read: live_parts_pruned with key-only, key+time, and unscoped/operator mix.
+   Optionally run actual plan-16 bitmap decode/filter. Split SQL+deserialize from
+   client filtering and report result rows/bytes.
+2. write: commit_with_offsets on distinct lanes, configurable parts/commit, and
+   max_live_l0_parts at the real flush-tick ratio. Record start/end cardinality.
+3. conflict: same partition, same hypertable/different partitions, and Zipf-hot
+   partitions. Re-read/replan/backoff matches the current compactor behavior.
+   Report attempts, successful swaps, conflicts, rollback work, and latency per
+   useful success.
+4. mixed: demand-scenario read/write load plus changes_since, cursor advance,
+   live-part replanning, finalization, pending/tombstone GC queries, and
+   monitoring aggregates at declared tick rates.
+5. connection: concurrently create process-equivalent pools and measure
+   establishment, exhaustion, steady admission, and recovery.
 
-## Self-review notes
+Tests:
 
-**Coverage mapping.** The user question decomposes as: "how many QPS at N cores" → Task 4 Steps 1–2 (ceilings + per-core curves, both read and write); "can the catalog be parallelized" → replica/sharding verdicts (Task 5) fed by saturation attribution (Task 2); "what could be cached" → the two cache options with measured shares (Task 5, sketch §options); "where are the bottlenecks" → the sampler's dominant-wait classification per run + the 10⁷-row EXPLAIN. Sketch note carries the standing analysis; row 40 the charter.
+- open-loop scheduler does not coordinate-omit queued latency;
+- bounded queue and timeout accounting conservation;
+- Zipf sanity;
+- mixed-rate derivation;
+- conflict useful-work accounting.
 
-**Type consistency.** Drivers consume the verified `PostgresCatalog` API exactly as product code does (`live_parts_pruned(HypertableId, Option<i64>, &[ColumnRange])`, `commit_with_offsets`, probes); `connect_with_pool_size(url, n)` is the only library addition and `connect` delegates to it with today's 16 — all existing callers unchanged. Seeded `PartMeta` matches the struct the writers build (path/partition_values/key range/row_count/size/level/column_stats).
+Commit:
 
-**Sequencing.** 1 → 2 → 3 (instruments; each committable and independently useful) → 4 (matrix; needs all three) → 5 (verdicts need 4). Independent of every in-flight row: new bench module, one delegation-only library fn.
+    bench: catalog open-loop surges and process-equivalent pool topology
 
-**Safety argument.** No product behavior changes. The bench writes only to its own `bench_cat_*` hypertables in the disposable compose Postgres; seeding commits synthetic paths that no reader ever fetches (nothing scans these tables through the query path); `docker update --cpus` affects only the local compose container and the runbook restores it. The one library addition cannot change behavior (pure delegation). Measurement honesty risks are named in-plan: driver-side saturation is detected (driver CPU recorded), the sampler runs outside the measured pool, and every claim carries its axes.
+## Task 3: Saturation and resource attribution
 
-**Sizing.** 5 tasks, ~5 commits. The follow-up work (pool knob, snapshot cache, replicas) is deliberately out — rows file from verdicts.
+Run a side observer connection outside every measured pool. Sample approximately
+every 250 ms:
+
+- pg_stat_activity state and wait events;
+- pg_stat_database transaction, block, temp, and conflict deltas;
+- locks and long transactions;
+- WAL bytes/fsync/checkpoint counters available in PostgreSQL 17;
+- every pool's size, idle count, and waiters where exposed;
+- PostgreSQL cgroup CPU/memory/I/O counters;
+- driver process CPU and RSS.
+
+Record SHOW ALL once per report header plus PostgreSQL version, max_connections,
+shared_buffers, storage driver/filesystem, container CPU limit, host RAM, and
+dataset-to-RAM ratio.
+
+A separate pool-acquire probe is a canary only. Do not label it as the workload's
+acquire distribution. The derived saturation class may be pool-queue,
+connection-limit, PostgreSQL CPU, lock, WAL/fsync, data I/O, or driver; preserve
+raw samples so the classification can be challenged.
+
+Record EXPLAIN (ANALYZE, BUFFERS, WAL) for representative live_parts_pruned and
+multi-part commit shapes at every observed cardinality knee.
+
+Tests:
+
+- pure folding over synthetic samples;
+- CPU counter delta conversion;
+- dominant-class classification with ambiguous/mixed fallback;
+- JSON backward compatibility.
+
+Commit:
+
+    bench: catalog saturation attribution across pools, CPU, WAL and IO
+
+## Task 4: Runbook, CPU limits, and cache posture
+
+The benchmark records but does not mutate Docker CPU limits. Document:
+
+- cores sweep and mandatory restore to unlimited;
+- PostgreSQL hot-cache run;
+- cold/evicted-cache procedure, labeled destructive to cache state;
+- multi-pool topology sweep;
+- open-loop arrival sweep around the closed-loop knee;
+- fixture disk estimates and bulk-seed time;
+- how to stop safely and preserve append-only reports.
+
+A run is invalid if the recorded CPU limit/settings differ from its label.
+
+Commit:
+
+    bench: catalog scalability runbook and self-describing environment
+
+## Task 5: Measurement matrix
+
+Run release builds, at least twice per point.
+
+### 5.1 Cardinality and state
+
+At representative 10K, 1M, and 10M historical rows, compare fresh,
+mature-compacted, and backlogged states. Hold total history while varying live
+fraction; hold live total while varying hot-hypertable rows. Measure read surge
+with uniform/Zipf keys and key-only/key+time shapes. Record returned rows/bytes
+and EXPLAIN at each knee.
+
+Deliverable: distinguish history/vacuum/index-bloat cost from live-index,
+hot-table, JSONB, transfer, and client-decode cost.
+
+### 5.2 Fleet topology and connection surge
+
+Compare 1x16, 4x16, 32x8, and 64x4 (bounded by PostgreSQL max_connections),
+then a same-total-connections topology comparison. Run connection-surge and
+steady read admission.
+
+Deliverable: local pool queue versus global connection wall; evidence for a
+fleet budget or PgBouncer, not merely a larger per-process pool.
+
+### 5.3 Cores and offered load
+
+At the middle mature state, sweep 1/2/4/8 PostgreSQL cores. First find closed-
+loop knees for reads and writes; then drive open-loop rates below, at, and above
+each knee. Measure queue growth, p99, timeouts, shedding, and post-surge recovery.
+
+Deliverable: sustainable QPS/TPS per core under the SLO, not only maximum ops/s.
+
+### 5.4 Write shape and conflicts
+
+Sweep write workers/rates and parts-per-commit. Attribute current per-part INSERT
+cost. Run all three conflict shapes at 2/8/32 contenders with product backoff.
+
+Deliverable: conflict-free commit TPS, useful replacement TPS, rollback tax, and
+whether batching or sharding earns a follow-up.
+
+### 5.5 Mixed product envelopes
+
+Run steady, dashboard-surge, and backfill scenarios with all background ticks.
+Measure which foreground SLO fails first and the sampler's attribution. Include
+hot and cold PostgreSQL cache postures where the dataset/working-set ratio makes
+both meaningful.
+
+Commit measured tables and raw-report labels to the scalability note:
+
+    bench: catalog matrix recorded - demand headroom and saturation knees
+
+## Task 6: Verdicts and close-out
+
+Each option receives pursue/decline/not-yet-measurable with the deciding number:
+
+- per-process pool knob plus fleet-wide connection budget;
+- PgBouncer;
+- batched part inserts;
+- DDL metadata cache;
+- live-parts snapshot cache;
+- read replicas;
+- typed stats columns/index changes;
+- feed horizon and/or physical partitioning;
+- hypertable sharding.
+
+Cache and replica verdicts must address two separate invariants:
+
+1. deletion safety: lag + query lifetime < tombstone grace;
+2. freshness: replica/cache lag <= declared freshness SLO.
+
+A live-parts cache additionally requires atomic snapshot plus feed high-watermark
+bootstrap, bounded memory, read-your-writes behavior, lag breach behavior, and
+failover semantics. Tombstone grace alone never authorizes missing new parts.
+
+Sharding is pursued only when useful primary commit TPS misses a named demand
+scenario after cheaper fixes. A pool knob is pursued only with a global
+connection budget.
+
+Update:
+
+- docs/notes/2026-07-13-catalog-scalability.md with measured tables/verdicts;
+- bench/README.md with commands and headline results;
+- roadmap row 40 to Executed;
+- rows 8, 23, and 26 with any gate the measurements establish;
+- new follow-up rows only for options that earned them.
+
+Run fmt, clippy, make test, restore PostgreSQL CPU limits, and commit:
+
+    docs: catalog scalability measured - demand ceilings and option verdicts
+
+## Exit criteria
+
+Plan 40 is complete only when:
+
+- the three demand scenarios have explicit pass/fail headroom;
+- open-loop and closed-loop knees are both recorded;
+- process-equivalent multi-pool topology is measured;
+- mature history/live separation and backlogged state are measured;
+- read, write, conflict, mixed, and connection workloads have saturation causes;
+- every option has a numbered verdict;
+- no stale-read option is recommended using tombstone grace as a substitute for
+  freshness semantics;
+- all raw reports are labeled and reproducible, and the CPU limit is restored.
