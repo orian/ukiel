@@ -170,6 +170,12 @@ struct Counters {
     offered: AtomicU64,
     started: AtomicU64,
     completed: AtomicU64,
+    /// Completions **inside the measured window** only. Throughput is
+    /// `completed_measured / duration`, never `completed / duration` — the
+    /// latter divides warmup completions by the post-warmup duration and inflates
+    /// every rate by (warmup + duration) / duration. It reported 1,250 op/s for a
+    /// 1,000/s offered rate, which is how it was caught.
+    completed_measured: AtomicU64,
     failed: AtomicU64,
     timed_out: AtomicU64,
     dropped: AtomicU64,
@@ -399,7 +405,8 @@ where
     services.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
     let completed = counters.completed.load(Ordering::Relaxed);
-    let achieved_qps = completed as f64 / cfg.duration_s.max(f64::MIN_POSITIVE);
+    let completed_measured = counters.completed_measured.load(Ordering::Relaxed);
+    let achieved_qps = completed_measured as f64 / cfg.duration_s.max(f64::MIN_POSITIVE);
     let p99 = percentile(&totals, 99.0);
     let timed_out = counters.timed_out.load(Ordering::Relaxed);
     let verdict = capacity_verdict(&demand, achieved_qps, p99, timed_out);
@@ -470,6 +477,9 @@ fn record(
         }
         Ok(Ok((rows, bytes))) => {
             c.completed.fetch_add(1, Ordering::Relaxed);
+            if measuring {
+                c.completed_measured.fetch_add(1, Ordering::Relaxed);
+            }
             c.rows.fetch_add(rows, Ordering::Relaxed);
             c.bytes.fetch_add(bytes, Ordering::Relaxed);
         }
@@ -708,11 +718,29 @@ pub async fn conflict(cfg: LoadConfig, ht_name: &str, shape: &str) -> anyhow::Re
     let shape = shape.to_string();
     let attempts = Arc::new(AtomicU64::new(0));
     let conflicts = Arc::new(AtomicU64::new(0));
+    // USEFUL swaps are counted here, not taken from `completed`. A merge that
+    // found nothing left to merge is a no-op, and counting it as a swap is how a
+    // conflict benchmark reports 62,000 useful merges/s from a partition that
+    // only ever held 25 parts. Ask me how I know.
+    let useful = Arc::new(AtomicU64::new(0));
+    let noops = Arc::new(AtomicU64::new(0));
 
     let report = {
-        let (attempts, conflicts, shape) = (attempts.clone(), conflicts.clone(), shape.clone());
+        let (attempts, conflicts, useful, noops, shape) = (
+            attempts.clone(),
+            conflicts.clone(),
+            useful.clone(),
+            noops.clone(),
+            shape.clone(),
+        );
         run_load("conflict", &cfg, pools.clone(), move |pools, seq| {
-            let (attempts, conflicts, shape) = (attempts.clone(), conflicts.clone(), shape.clone());
+            let (attempts, conflicts, useful, noops, shape) = (
+                attempts.clone(),
+                conflicts.clone(),
+                useful.clone(),
+                noops.clone(),
+                shape.clone(),
+            );
             async move {
                 let cat = &pools[(seq as usize) % pools.len()];
                 let day = match shape.as_str() {
@@ -739,7 +767,11 @@ pub async fn conflict(cfg: LoadConfig, ht_name: &str, shape: &str) -> anyhow::Re
                         .take(4)
                         .collect();
                     if inputs.len() < 2 {
-                        return Ok((0, 0)); // nothing to merge here
+                        // The partition is merged out. NOT a useful swap — and if
+                        // this dominates, the fixture was exhausted and the point
+                        // is about the fixture, not about conflict.
+                        noops.fetch_add(1, Ordering::Relaxed);
+                        return Ok((0, 0));
                     }
                     let old: Vec<_> = inputs.iter().map(|p| p.id).collect();
                     let new = vec![PartMeta {
@@ -764,7 +796,10 @@ pub async fn conflict(cfg: LoadConfig, ht_name: &str, shape: &str) -> anyhow::Re
                         .commit(ht_id, CommitOp::Replace { old, new }, None)
                         .await
                     {
-                        Ok(_) => return Ok((inputs.len() as u64, 0)),
+                        Ok(_) => {
+                            useful.fetch_add(1, Ordering::Relaxed);
+                            return Ok((inputs.len() as u64, 0));
+                        }
                         Err(ukiel_catalog::CatalogError::Conflict { .. }) => {
                             // Lost the race. Every byte of work in this attempt is
                             // thrown away — that is the rollback tax, and it is
@@ -783,24 +818,35 @@ pub async fn conflict(cfg: LoadConfig, ht_name: &str, shape: &str) -> anyhow::Re
 
     let a = attempts.load(Ordering::Relaxed);
     let c = conflicts.load(Ordering::Relaxed);
+    let u = useful.load(Ordering::Relaxed);
+    let no = noops.load(Ordering::Relaxed);
+    let secs = report.duration_s.max(1.0);
     print_report(&report);
     println!(
-        "  conflict shape '{shape}': {a} attempts -> {} USEFUL swaps, {c} conflicts \
-         ({:.0}% of attempts wasted)\n\
-         \x20 useful swaps/s {:.1} — the number that matters; 'commits attempted' would be {:.1}",
-        report.completed,
+        "  conflict '{shape}': {a} attempts -> {u} USEFUL swaps, {c} conflicts, {no} no-ops\n  \
+         useful swaps/s {:.1}   |   attempted commits/s {:.1} (the number that would flatter us)\n  \
+         rollback tax: {:.1}% of attempts thrown away",
+        u as f64 / secs,
+        a as f64 / secs,
         if a > 0 {
             100.0 * c as f64 / a as f64
         } else {
             0.0
         },
-        report.achieved_qps,
-        a as f64 / report.duration_s.max(1.0),
     );
+    if no > u * 2 {
+        println!(
+            "  ! {no} no-ops vs {u} real swaps — the partition merged OUT during the run, so this\n  \
+             point measures an exhausted fixture, not contention. Seed more parts per partition."
+        );
+    }
     let mut v = serde_json::to_value(&report)?;
     v["conflict_shape"] = shape.into();
     v["attempts"] = a.into();
     v["conflicts"] = c.into();
+    v["useful_swaps"] = u.into();
+    v["noops"] = no.into();
+    v["useful_swaps_per_s"] = (u as f64 / secs).into();
     crate::report::write_json(&format!("catalog-conflict-{}.json", cfg.label), &v)?;
     Ok(())
 }
