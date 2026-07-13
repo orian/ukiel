@@ -42,14 +42,19 @@ impl PostgresCatalog {
     /// transaction. Used by ingest workers for exactly-once delivery: on a
     /// failed commit, offsets do not move and the worker replays from the
     /// catalog's stored position.
+    ///
+    /// The identity is **required**. An ingest commit whose acknowledgement is
+    /// lost is precisely the case plan 43 exists to decide, and one that carries
+    /// no key cannot be decided at all — so the type system refuses it rather
+    /// than leaving it to a convention nobody checks at 3am.
     pub async fn commit_with_offsets(
         &self,
         hypertable_id: HypertableId,
         op: CommitOp,
         offsets: &[OffsetRange],
-        identity: Option<&OperationIdentity>,
+        identity: &OperationIdentity,
     ) -> Result<CommitResult, CatalogError> {
-        self.commit_inner(hypertable_id, op, identity, offsets, None)
+        self.commit_inner(hypertable_id, op, Some(identity), offsets, None)
             .await
     }
 

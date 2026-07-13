@@ -16,6 +16,11 @@ pub enum IngestError {
     Expr(#[from] ukiel_expr::ExprError),
     #[error(transparent)]
     SortKey(#[from] ukiel_core::SortKeyError),
+    /// A flush whose offset ranges cannot name a coherent operation — inverted
+    /// or overlapping ranges, an empty topic. A consumer bug, caught before the
+    /// batch costs an upload.
+    #[error(transparent)]
+    Operation(#[from] ukiel_core::OperationError),
     #[error("row {row} is missing required i64 column '{column}'")]
     MissingColumn { row: usize, column: String },
     #[error("flush called with no rows")]

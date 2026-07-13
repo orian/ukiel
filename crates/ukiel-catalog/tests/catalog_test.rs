@@ -443,14 +443,16 @@ async fn duplicate_offset_commit_is_rejected_and_rolled_back() {
     };
     let commit_add =
         |catalog: ukiel_catalog::PostgresCatalog, path: &'static str, r: OffsetRange| async move {
+            let ranges = [r];
+            let identity = offsets_op(ht, &ranges);
             catalog
                 .commit_with_offsets(
                     ht,
                     CommitOp::Add {
                         parts: vec![part_meta(path, 1, 10)],
                     },
-                    &[r],
-                    None,
+                    &ranges,
+                    &identity,
                 )
                 .await
         };
@@ -461,8 +463,31 @@ async fn duplicate_offset_commit_is_rejected_and_rolled_back() {
         .unwrap();
     let live_before = catalog.live_parts(ht, None).await.unwrap().len();
 
-    // Writer B (a duplicate consumer) tries to commit the same offsets.
-    let err = commit_add(catalog.clone(), "p-b.parquet", range(0, 9))
+    // Another attempt at *exactly* those offsets — a retry whose acknowledgement
+    // was lost, or a duplicate consumer that read the same records — is the same
+    // logical operation: the same Kafka offsets under the same transformation
+    // produce the same rows. Plan 43 reconciles it instead of failing it, which
+    // is what stops an honest retry from being told it is a duplicate worker.
+    // Issue 0003's guarantee is unchanged and is what the assertion below pins:
+    // nothing is duplicated.
+    let replay = commit_add(catalog.clone(), "p-b.parquet", range(0, 9))
+        .await
+        .unwrap();
+    assert!(
+        matches!(replay, CommitResult::AlreadyApplied(_)),
+        "{replay:?}"
+    );
+    assert_eq!(
+        catalog.live_parts(ht, None).await.unwrap().len(),
+        live_before,
+        "the replay applied nothing"
+    );
+
+    // A *genuinely different* operation that overlaps an already-consumed range
+    // is the duplicate-consumer case issue 0003 exists for, and it is still a
+    // loud OffsetRace: idempotency answers duplicate intent, it does not replace
+    // the offset CAS.
+    let err = commit_add(catalog.clone(), "p-overlap.parquet", range(5, 14))
         .await
         .unwrap_err();
     assert!(
@@ -470,7 +495,7 @@ async fn duplicate_offset_commit_is_rejected_and_rolled_back() {
         "{err:?}"
     );
 
-    // The whole transaction rolled back: no duplicate part appeared.
+    // The whole transaction rolled back: no part appeared.
     assert_eq!(
         catalog.live_parts(ht, None).await.unwrap().len(),
         live_before
@@ -503,27 +528,28 @@ async fn commit_with_offsets_is_atomic() {
     );
 
     // Successful commit advances offsets.
+    let ranges = [
+        OffsetRange {
+            topic: "events".into(),
+            partition: 0,
+            first: 0,
+            last: 41,
+        },
+        OffsetRange {
+            topic: "events".into(),
+            partition: 1,
+            first: 0,
+            last: 9,
+        },
+    ];
     catalog
         .commit_with_offsets(
             ht,
             CommitOp::Add {
                 parts: vec![part_meta("p1.parquet", 1, 10)],
             },
-            &[
-                OffsetRange {
-                    topic: "events".into(),
-                    partition: 0,
-                    first: 0,
-                    last: 41,
-                },
-                OffsetRange {
-                    topic: "events".into(),
-                    partition: 1,
-                    first: 0,
-                    last: 9,
-                },
-            ],
-            None,
+            &ranges,
+            &offsets_op(ht, &ranges),
         )
         .await
         .unwrap();
@@ -534,6 +560,12 @@ async fn commit_with_offsets_is_atomic() {
 
     // A conflicting commit must NOT advance offsets (same transaction).
     let bogus_old = vec![ukiel_core::PartId(999_999)];
+    let next = [OffsetRange {
+        topic: "events".into(),
+        partition: 0,
+        first: 42,
+        last: 99,
+    }];
     let err = catalog
         .commit_with_offsets(
             ht,
@@ -541,13 +573,8 @@ async fn commit_with_offsets_is_atomic() {
                 old: bogus_old,
                 new: vec![part_meta("p2.parquet", 1, 10)],
             },
-            &[OffsetRange {
-                topic: "events".into(),
-                partition: 0,
-                first: 42,
-                last: 99,
-            }],
-            None,
+            &next,
+            &offsets_op(ht, &next),
         )
         .await
         .unwrap_err();
@@ -560,20 +587,18 @@ async fn commit_with_offsets_is_atomic() {
         "failed commit must not move offsets"
     );
 
-    // A later flush upserts over the existing row.
+    // A later flush upserts over the existing row. It is a *different* operation
+    // from the conflicting one above even though it consumes the same offsets —
+    // the failed one added no parts, so its intent never landed and its identity
+    // is free to be reused by the attempt that does the work.
     catalog
         .commit_with_offsets(
             ht,
             CommitOp::Add {
                 parts: vec![part_meta("p3.parquet", 1, 10)],
             },
-            &[OffsetRange {
-                topic: "events".into(),
-                partition: 0,
-                first: 42,
-                last: 99,
-            }],
-            None,
+            &next,
+            &offsets_op(ht, &next),
         )
         .await
         .unwrap();
@@ -1701,6 +1726,21 @@ async fn lease_migration_applies_to_a_populated_pre_0008_catalog() {
     assert!(lease.generation > 0);
     // The pre-existing data is untouched by the upgrade.
     assert_eq!(catalog.live_parts(ht, None).await.unwrap().len(), 1);
+}
+
+/// The identity an ingest flush would build for these ranges. Derived, never
+/// hand-assembled, so the offset tests exercise the real reconcilable path.
+fn offsets_op(ht: HypertableId, ranges: &[OffsetRange]) -> OperationIdentity {
+    let ranges: Vec<IngestRange> = ranges
+        .iter()
+        .map(|r| IngestRange {
+            topic: r.topic.clone(),
+            partition: r.partition,
+            first: r.first,
+            last: r.last,
+        })
+        .collect();
+    OperationIdentity::ingest(ht, &ranges, 1).unwrap()
 }
 
 /// A factory-built identity. The catalog boundary only ever sees a (key,

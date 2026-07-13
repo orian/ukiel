@@ -669,7 +669,10 @@ pub async fn write(cfg: LoadConfig, ht_name: &str, parts_per_commit: usize) -> a
                     first,
                     last: first,
                 }];
-                cat.commit_with_offsets(ht_id, CommitOp::Add { parts }, &ranges, None)
+                // The real path, identity and all (plan 43): the fingerprint is
+                // built and stored on every commit, so the benchmark prices it.
+                let identity = ukiel_ingest::flusher::ingest_identity(ht_id, &ranges)?;
+                cat.commit_with_offsets(ht_id, CommitOp::Add { parts }, &ranges, &identity)
                     .await?;
                 Ok((parts_per_commit as u64, 0))
             }
@@ -1006,7 +1009,10 @@ pub async fn mixed(cfg: LoadConfig, ht_name: &str) -> anyhow::Result<()> {
                     first: i,
                     last: i,
                 }];
-                cat.commit_with_offsets(ht_id, CommitOp::Add { parts }, &ranges, None)
+                // The real path, identity and all (plan 43): the fingerprint is
+                // built and stored on every commit, so the benchmark prices it.
+                let identity = ukiel_ingest::flusher::ingest_identity(ht_id, &ranges)?;
+                cat.commit_with_offsets(ht_id, CommitOp::Add { parts }, &ranges, &identity)
                     .await?;
                 Ok((1, 0))
             } else {

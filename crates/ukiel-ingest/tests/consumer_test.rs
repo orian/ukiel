@@ -363,3 +363,169 @@ async fn one_routes_catalog_failure_stops_every_route() {
         "ingest must not report ready while a route never reconciled"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Plan 43: the ingest operation identity is the offsets, and nothing else.
+// ---------------------------------------------------------------------------
+
+use ukiel_catalog::{OffsetRange, OperationLookup};
+use ukiel_core::{CommitResult, OperationError};
+use ukiel_ingest::flusher::{INGEST_TRANSFORMATION_VERSION, ingest_identity};
+
+fn range(topic: &str, partition: i32, first: i64, last: i64) -> OffsetRange {
+    OffsetRange {
+        topic: topic.into(),
+        partition,
+        first,
+        last,
+    }
+}
+
+#[test]
+fn the_ingest_identity_is_stable_across_range_enumeration_order() {
+    let ht = HypertableId(1);
+    let a = ingest_identity(ht, &[range("events", 1, 10, 19), range("events", 0, 0, 9)]).unwrap();
+    let b = ingest_identity(ht, &[range("events", 0, 0, 9), range("events", 1, 10, 19)]).unwrap();
+    assert_eq!(
+        a.key(),
+        b.key(),
+        "the order the flusher happened to collect its ranges in is not intent"
+    );
+
+    // Every field of the intent is load-bearing.
+    for other in [
+        ingest_identity(HypertableId(2), &[range("events", 0, 0, 9)]).unwrap(),
+        ingest_identity(ht, &[range("other", 0, 0, 9)]).unwrap(),
+        ingest_identity(ht, &[range("events", 1, 0, 9)]).unwrap(),
+        ingest_identity(ht, &[range("events", 0, 0, 10)]).unwrap(),
+    ] {
+        assert_ne!(a.key(), other.key());
+    }
+    assert_eq!(INGEST_TRANSFORMATION_VERSION, 1);
+}
+
+#[test]
+fn a_malformed_batch_fails_before_it_costs_an_upload() {
+    // Overlapping ranges on one partition are a consumer bug. Hashing them would
+    // hide it behind a stable-looking key; the flusher builds the identity
+    // before it registers intent or uploads a byte, so the bug surfaces here.
+    let err = ingest_identity(
+        HypertableId(1),
+        &[range("events", 0, 0, 9), range("events", 0, 9, 12)],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ukiel_ingest::IngestError::Operation(OperationError::OverlappingOffsetRanges { .. })
+        ),
+        "{err:?}"
+    );
+}
+
+/// The lost-acknowledgement case, end to end at the catalog boundary: the same
+/// offsets, re-flushed with *different* output objects, must reconcile to the
+/// original commit rather than double-applying.
+#[tokio::test]
+async fn a_replayed_flush_reconciles_to_the_original_commit() {
+    let pg = Postgres::default().start().await.unwrap();
+    let port = pg.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+    let catalog = PostgresCatalog::connect(&url).await.unwrap();
+    catalog.migrate().await.unwrap();
+    let ht = catalog
+        .create_hypertable(
+            "events",
+            &json!({"fields": [
+                {"name": "tenant_id", "type": "int64"},
+                {"name": "ts", "type": "timestamp_ms"}
+            ]}),
+            &json!({"columns": ["day"]}),
+            &["tenant_id".to_string()],
+            "tenant_id",
+        )
+        .await
+        .unwrap();
+
+    let offsets = [range("events", 0, 0, 99)];
+    let identity = ingest_identity(ht, &offsets).unwrap();
+    assert_eq!(
+        catalog.lookup_operation(&identity).await.unwrap(),
+        OperationLookup::Absent
+    );
+
+    let part = |path: &str| PartMeta {
+        path: path.to_string(),
+        partition_values: json!({"day": "2026-07-01"}),
+        packing_key_min: 1,
+        packing_key_max: 1,
+        row_count: 100,
+        size_bytes: 100,
+        level: 0,
+        column_stats: None,
+    };
+
+    let CommitResult::Committed(first) = catalog
+        .commit_with_offsets(
+            ht,
+            CommitOp::Add {
+                parts: vec![part("first.parquet")],
+            },
+            &offsets,
+            &identity,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected a commit")
+    };
+    assert_eq!(
+        catalog.lookup_operation(&identity).await.unwrap(),
+        OperationLookup::Committed(first)
+    );
+
+    // The retry re-read the same Kafka offsets, re-encoded them, and uploaded to
+    // fresh paths — as any retry must, since paths carry a UUID.
+    let replay = catalog
+        .commit_with_offsets(
+            ht,
+            CommitOp::Add {
+                parts: vec![part("retry.parquet")],
+            },
+            &offsets,
+            &ingest_identity(ht, &offsets).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay, CommitResult::AlreadyApplied(first));
+
+    let live = catalog.live_parts(ht, None).await.unwrap();
+    assert_eq!(live.len(), 1, "the replay applied nothing");
+    assert_eq!(live[0].meta.path, "first.parquet");
+    assert_eq!(
+        catalog.ingest_offsets(ht, "events").await.unwrap().get(&0),
+        Some(&100),
+        "offsets advanced exactly once"
+    );
+
+    // And a *genuinely different* operation that overlaps an already-consumed
+    // range is still an OffsetRace — a second ingest worker on one topic, not a
+    // retry. Idempotency answers duplicate intent; it does not replace the CAS.
+    let overlapping = [range("events", 0, 50, 149)];
+    let err = catalog
+        .commit_with_offsets(
+            ht,
+            CommitOp::Add {
+                parts: vec![part("duplicate-worker.parquet")],
+            },
+            &overlapping,
+            &ingest_identity(ht, &overlapping).unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ukiel_catalog::CatalogError::OffsetRace { .. }),
+        "{err:?}"
+    );
+    assert_eq!(catalog.live_parts(ht, None).await.unwrap().len(), 1);
+}
