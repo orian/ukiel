@@ -1186,6 +1186,57 @@ byte-identical scan): peak memory **+62%**, repartition time **+218%**, wall
 fixed here because `physical_schema()` is shared with ingest, the compactor and
 alias compilation — a design change, not a micro-fix.
 
+### UTF8VIEW PARITY — plan 39, 2026-07-13
+
+SHA `e5d4d3e`. Local store, `hits_cb`, 100 files, 99,997,497 rows, 1,102 parts —
+the same fixture and commands as plan 37, so the numbers stack.
+
+**The bug:** DataFusion 54 defaults `schema_force_view_types = true`, so a stock
+deployment reads Parquet strings as `Utf8View` — zero-copy views that flow through
+repartition and aggregation without being copied. Ukiel's provider handed the
+reader an explicit `Utf8` schema and **silently opted out**: `arrow_typeof("URL")`
+returned `Utf8` on ukiel and `Utf8View` on raw DataFusion **over the same files**.
+
+**The fix:** view-type both provider schemas. Query-side representation only —
+`TableColumns` stays `Utf8`, so ingest, the compactor and materialized columns are
+untouched and the Parquet bytes are identical. Both schemas must flip *together*:
+had SQL still seen `Utf8`, DataFusion would insert a cast that re-materializes
+every string and hand the win back.
+
+**q34** (`GROUP BY "URL"`, no predicate, byte-identical scan) — every metric now
+matches raw:
+
+| | before | after | raw |
+|---|---|---|---|
+| wall | 3,864 ms | **2,479 ms** | 2,533 ms |
+| `peak_mem_used` | 14.9 GB | **9.17 GB** | 9.2 GB |
+| `repartition_time` | 3,449 ms | **1,055 ms** | 1,086 ms |
+
+**The residual is closed:**
+
+| 41 in-scope queries (q01/q07 are row 35's) | total | vs raw, same bytes | median per-query |
+|---|---|---|---|
+| raw DataFusion over ukiel's own files | 27.7 s | 1.00× | 1.00× |
+| ukiel — before plan 37 | 38.5 s | 1.39× | 1.19× |
+| ukiel + F3 (plan 37) | 35.3 s | 1.27× | 1.09× |
+| **ukiel + Utf8View (plan 39)** | **27.4 s** | **0.99×** | **0.98×** |
+
+Reproduced across two runs (27.4 s both). **Every answer identical to raw**, and
+ukiel now beats raw outright on **24 of the 41**. The string-heavy band collapses
+onto raw: q23 −44%, q22 −43%, q28 −42%, q26 −40%, q35 −37%, q34 −34%, q21 −33%.
+
+This does **not** mean the stack is free. It means the catalog's pruning advantage
+on key-filtered queries (q38–q43 at 0.22–0.34× of raw) now roughly cancels what
+the stack costs elsewhere, because the two *systematic* overheads that sat on top
+of it — a doubly-evaluated scan predicate (plan 37's F3) and a string
+representation that opted out of the engine's default — are gone.
+
+**Product guard.** Heavy tenant: `search_phrases` **73.0 → 46 ms (−35%)**,
+`top_urls` **265 → 229 ms (−12%)** — both well outside their 3–5% same-config
+spread. The median/light scenarios move ±10–18%, but those run in **2–10 ms**,
+where the **measured same-config spread is up to 22%** — so that movement is
+noise, not signal, and it is reported as noise rather than dressed up either way.
+
 ### 100M / 1B tiers — optional / stretch
 
 100M Bluesky is a documented long run; 1B needs `--wave-files` and hours.

@@ -213,8 +213,7 @@ decode was (q28 −22%, q31 −27%, q32 −21%, q21 −18%). Product-suite guard
 (same-binary A/B, scoped path): predicated scenarios improve, nothing regresses
 beyond the noise floor.
 
-**H6 — the provider defeats `Utf8View`. (Named, measured, filed as roadmap row
-39 — NOT fixed here.)** DataFusion 54 defaults `schema_force_view_types = true`,
+**H6 — the provider defeats `Utf8View`. (FIXED — roadmap row 39, 2026-07-13.)** DataFusion 54 defaults `schema_force_view_types = true`,
 so the raw reference reads string columns as **`Utf8View`**. Ukiel's provider
 builds its scan schema from `TableColumns::physical_schema()`, which forces plain
 **`Utf8`** — `SELECT arrow_typeof("URL")` returns `Utf8` on ukiel and `Utf8View`
@@ -238,19 +237,47 @@ switching the *scan* schema to view types is a design change with a blast radius
 Plan-37's own sizing rule says such a thing files its own row rather than growing
 this one. **Roadmap row 39.**
 
+**Resolved (row 39).** The provider now view-types both of its schemas
+(`Utf8 → Utf8View`), which is *parity with the engine's own default*, not a
+departure from it. The boundary sits at the ukiel-query crate line:
+`TableColumns` stays `Utf8`, so ingest, the compactor and materialized columns are
+untouched and the Parquet bytes are byte-identical — view-vs-owned is an
+in-memory representation, not a storage format. Both schemas had to flip
+together: had SQL still seen `Utf8`, DataFusion would have inserted a cast that
+re-materializes every string and handed the whole win back.
+
+q34, the query the mechanism was named on — **every metric now matches raw**:
+
+| q34 | before | after | raw |
+|---|---|---|---|
+| wall | 3,864 ms | **2,479 ms** | 2,533 ms |
+| `peak_mem_used` | 14.9 GB | **9.17 GB** | 9.2 GB |
+| `repartition_time` | 3,449 ms | **1,055 ms** | 1,086 ms |
+| `bytes_scanned` | 1,730,466,741 | 1,730,466,741 | 1,730,466,405 |
+
+The string-heavy band collapses onto raw: q23 −44%, q22 −43%, q28 −42%, q26 −40%,
+q35 −37%, q34 −34%, q21 −33%.
+
 ### Where the residual stands
 
 | | 41 in-scope queries | vs raw (same bytes) | median per-query |
 |---|---|---|---|
 | raw DataFusion over ukiel's files | 27.7 s | 1.00× | 1.00× |
 | ukiel, local store (before plan 37) | 38.5 s | 1.39× | 1.19× |
-| **ukiel, local store + F3** | **35.3 s** | **1.27×** | **1.09×** |
+| ukiel, local store + F3 (plan 37) | 35.3 s | 1.27× | 1.09× |
+| **ukiel, + Utf8View (row 39)** | **27.4 s** | **0.99×** | **0.98×** |
 
-**Ukiel now beats raw DataFusion outright on 15 of the 41 queries.** The exit
-criterion of ≤ 1.15× on the *total* is not met (1.27×), and the plan's alternative
-exit applies: every remaining component is attributed to a named mechanism with a
-disposition — H1/H2/H3/H5 refuted with evidence, F3 fixed, **H6 named, measured,
-and filed as row 39**.
+**The same-bytes read-stack residual is closed.** On identical files ukiel now
+runs the 41 in-scope queries in 27.4 s against raw DataFusion's 27.7 s — **0.99×,
+reproduced across two runs (27.4 s both), with every answer identical** — and it
+beats raw outright on **24 of the 41**.
+
+Read that honestly: it does *not* mean the stack is free. It means the catalog's
+pruning advantage on key-filtered queries (q38–q43 at 0.22–0.34× of raw) now
+roughly cancels what the stack costs elsewhere, because the two *systematic*
+overheads that used to sit on top of it — a doubly-evaluated scan predicate (F3)
+and a string representation that opted out of the engine's default (H6) — are
+gone. Plan 37's ≤ 1.15× exit arm, unmet when it closed, **is met now.**
 
 **Shipped since this note: the key index (roadmap row 16, 2026-07-13).** The
 q38–q43-class advantage below now extends to the *sparse* tenant — the case
