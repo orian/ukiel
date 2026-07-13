@@ -42,6 +42,27 @@ async fn wait_for_parts(catalog: &PostgresCatalog, ht: HypertableId, min_parts: 
     panic!("timed out waiting for {min_parts} parts");
 }
 
+/// Waits on *rows*, not on part count. How many parts a flush produces is a
+/// scheduling detail — a time-based tick can split one day's rows across two —
+/// so waiting for a part count can be satisfied by the previous round's own
+/// splits and let the assertion race the flush it is meant to observe.
+async fn wait_for_rows(catalog: &PostgresCatalog, ht: HypertableId, min_rows: i64) -> i64 {
+    for _ in 0..120 {
+        let rows: i64 = catalog
+            .live_parts(ht, None)
+            .await
+            .unwrap()
+            .iter()
+            .map(|p| p.meta.row_count)
+            .sum();
+        if rows >= min_rows {
+            return rows;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    panic!("timed out waiting for {min_rows} rows");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn consumes_flushes_and_resumes_exactly_once() {
     let pg = Postgres::default().start().await.expect("postgres");
@@ -113,8 +134,9 @@ async fn consumes_flushes_and_resumes_exactly_once() {
         tokio::spawn(async move { worker.run(token).await })
     };
 
-    // Two day-partitions -> at least 2 parts.
+    // Two day-partitions -> at least 2 parts, and all six rows.
     wait_for_parts(&catalog, ht_id, 2).await;
+    wait_for_rows(&catalog, ht_id, 6).await;
     shutdown.cancel();
     handle.await.unwrap().unwrap();
 
@@ -138,7 +160,7 @@ async fn consumes_flushes_and_resumes_exactly_once() {
         let token = shutdown.clone();
         tokio::spawn(async move { worker.run(token).await })
     };
-    wait_for_parts(&catalog, ht_id, 3).await;
+    wait_for_rows(&catalog, ht_id, 9).await;
     shutdown.cancel();
     handle.await.unwrap().unwrap();
 
