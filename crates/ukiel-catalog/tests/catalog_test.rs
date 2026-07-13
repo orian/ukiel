@@ -1179,3 +1179,220 @@ async fn create_hypertable_rejects_unsound_sort_key() {
         .await
         .unwrap();
 }
+
+/// `updated_at` of a cursor row — the progress timestamp a stale writer must
+/// not be able to refresh.
+async fn cursor_updated_at(
+    catalog: &ukiel_catalog::PostgresCatalog,
+    worker: &str,
+    ht: HypertableId,
+) -> chrono::DateTime<chrono::Utc> {
+    sqlx::query_scalar(
+        "SELECT updated_at FROM worker_cursors WHERE worker = $1 AND hypertable_id = $2",
+    )
+    .bind(worker)
+    .bind(ht.0)
+    .fetch_one(catalog.pool_for_tests())
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn cursors_never_retreat() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+
+    catalog.set_cursor("c", ht, CommitId(7)).await.unwrap();
+    catalog.set_cursor("c", ht, CommitId(9)).await.unwrap();
+    // A delayed replica replays an older position: a successful no-op.
+    catalog.set_cursor("c", ht, CommitId(8)).await.unwrap();
+    assert_eq!(catalog.get_cursor("c", ht).await.unwrap(), CommitId(9));
+
+    // A stale (or equal) write must not refresh the progress timestamp:
+    // otherwise a stuck worker looks alive to feed-lag alerting.
+    let stamped = cursor_updated_at(&catalog, "c", ht).await;
+    catalog.set_cursor("c", ht, CommitId(3)).await.unwrap();
+    catalog.set_cursor("c", ht, CommitId(9)).await.unwrap();
+    assert_eq!(cursor_updated_at(&catalog, "c", ht).await, stamped);
+
+    // A real advance does refresh it.
+    catalog.set_cursor("c", ht, CommitId(10)).await.unwrap();
+    assert!(cursor_updated_at(&catalog, "c", ht).await > stamped);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_cursor_writers_leave_the_maximum() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+
+    // Three workers race on one shared cursor name (the compactor fleet).
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+    let mut handles = Vec::new();
+    for pos in [7i64, 11, 9] {
+        let (catalog, barrier) = (catalog.clone(), barrier.clone());
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            catalog
+                .set_cursor("fleet", ht, CommitId(pos))
+                .await
+                .unwrap();
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+    assert_eq!(catalog.get_cursor("fleet", ht).await.unwrap(), CommitId(11));
+}
+
+#[tokio::test]
+async fn gc_fence_survives_a_stale_cursor_write() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+
+    catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![part_meta("old.parquet", 1, 10)],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let old: Vec<_> = catalog
+        .live_parts(ht, None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|p| p.id)
+        .collect();
+    let CommitResult::Committed(replace_id) = catalog
+        .commit(
+            ht,
+            CommitOp::Replace {
+                old,
+                new: vec![part_meta("new.parquet", 1, 10)],
+            },
+            None,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected commit")
+    };
+
+    // The consumer passes the replace, so its tombstone is reapable...
+    catalog.set_cursor("mv", ht, replace_id).await.unwrap();
+    assert_eq!(catalog.reapable_parts(ht, 0.0).await.unwrap().len(), 1);
+
+    // ... and a delayed replica of that same consumer replaying an old
+    // position cannot re-fence it (monotonicity is what makes the GC fence
+    // a one-way gate).
+    catalog.set_cursor("mv", ht, CommitId(0)).await.unwrap();
+    assert_eq!(catalog.reapable_parts(ht, 0.0).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn compaction_candidates_come_from_live_state() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let day1 = json!({ "day": "2026-07-01" });
+    let day2 = json!({ "day": "2026-07-02" });
+    let day3 = json!({ "day": "2026-07-03" });
+
+    // day1: two L0 runs (over an l0_fanout of 2). day2: one L0 run (under).
+    add_l0_part(&catalog, ht, &day1).await;
+    add_l0_part(&catalog, ht, &day1).await;
+    add_l0_part(&catalog, ht, &day2).await;
+
+    let candidates = catalog.compaction_candidates(ht, 2, 2, 64).await.unwrap();
+    assert_eq!(candidates, vec![day1.clone()]);
+
+    // The trigger is per level: raising l0_fanout drops day1 out.
+    assert!(
+        catalog
+            .compaction_candidates(ht, 3, 2, 64)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Tombstoned parts do not count: merging day1's two L0s into one L1 run
+    // leaves nothing above the trigger.
+    let l0: Vec<_> = catalog
+        .live_partition_parts(ht, &day1)
+        .await
+        .unwrap()
+        .iter()
+        .map(|p| p.id)
+        .collect();
+    catalog
+        .commit(
+            ht,
+            CommitOp::Replace {
+                old: l0,
+                new: vec![PartMeta {
+                    path: "l1-a.parquet".into(),
+                    partition_values: day1.clone(),
+                    packing_key_min: 1,
+                    packing_key_max: 1,
+                    row_count: 2,
+                    size_bytes: 2,
+                    level: 1,
+                    column_stats: None,
+                }],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        catalog
+            .compaction_candidates(ht, 2, 2, 64)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // A partition qualifying at two levels at once is returned exactly once.
+    add_l0_part(&catalog, ht, &day1).await;
+    add_l0_part(&catalog, ht, &day1).await;
+    catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![PartMeta {
+                    path: "l1-b.parquet".into(),
+                    partition_values: day1.clone(),
+                    packing_key_min: 1,
+                    packing_key_max: 1,
+                    row_count: 2,
+                    size_bytes: 2,
+                    level: 1,
+                    column_stats: None,
+                }],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog.compaction_candidates(ht, 2, 2, 64).await.unwrap(),
+        vec![day1.clone()],
+        "two qualifying levels, one partition"
+    );
+
+    // Several qualifying partitions: deterministic order, bounded by `limit`.
+    add_l0_part(&catalog, ht, &day2).await;
+    add_l0_part(&catalog, ht, &day3).await;
+    add_l0_part(&catalog, ht, &day3).await;
+    assert_eq!(
+        catalog.compaction_candidates(ht, 2, 2, 64).await.unwrap(),
+        vec![day1.clone(), day2.clone(), day3.clone()]
+    );
+    assert_eq!(
+        catalog.compaction_candidates(ht, 2, 2, 2).await.unwrap(),
+        vec![day1, day2],
+        "limit is honored"
+    );
+}

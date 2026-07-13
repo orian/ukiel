@@ -22,6 +22,14 @@ impl PostgresCatalog {
         Ok(CommitId(id.unwrap_or(0)))
     }
 
+    /// Advances a worker cursor; never retreats it. A stale or equal write is a
+    /// successful no-op that leaves `updated_at` alone — a delayed replica must
+    /// not be able to move a cursor backwards (prolonging the GC reap fence and
+    /// falsifying feed lag) nor to impersonate progress with a replayed write.
+    ///
+    /// Several processes may share one cursor name: the row then means "the
+    /// fleet has observed this feed prefix", never "every derived rewrite
+    /// completed" — durable completion is the live part set, not this number.
     pub async fn set_cursor(
         &self,
         worker: &str,
@@ -32,7 +40,8 @@ impl PostgresCatalog {
             "INSERT INTO worker_cursors (worker, hypertable_id, last_commit_id)
              VALUES ($1, $2, $3)
              ON CONFLICT (worker, hypertable_id)
-             DO UPDATE SET last_commit_id = EXCLUDED.last_commit_id, updated_at = now()",
+             DO UPDATE SET last_commit_id = EXCLUDED.last_commit_id, updated_at = now()
+             WHERE worker_cursors.last_commit_id < EXCLUDED.last_commit_id",
         )
         .bind(worker)
         .bind(hypertable_id.0)

@@ -4,6 +4,19 @@ use crate::parts::{PART_COLUMNS, PartRow};
 use crate::{CatalogError, PostgresCatalog};
 
 impl PostgresCatalog {
+    /// Newest commit id for this hypertable (0 when it has none) — the feed
+    /// prefix a worker can declare observed. One index probe on
+    /// `commits_feed_idx`, unlike `changes_since`, which materializes every
+    /// commit's parts; workers that plan from live state want this instead.
+    pub async fn feed_head(&self, hypertable_id: HypertableId) -> Result<CommitId, CatalogError> {
+        let head: Option<i64> =
+            sqlx::query_scalar("SELECT max(id) FROM commits WHERE hypertable_id = $1")
+                .bind(hypertable_id.0)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(CommitId(head.unwrap_or(0)))
+    }
+
     /// Ordered change feed: commits with id > `after`, oldest first.
     /// Consumers persist the last processed commit id as their cursor.
     pub async fn changes_since(

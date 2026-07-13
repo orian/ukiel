@@ -878,3 +878,39 @@ async fn merges_stream_without_a_cap() {
     let rows: i64 = parts.iter().map(|p| p.meta.row_count).sum();
     assert_eq!(rows, 2, "both rows survive the merge");
 }
+
+#[tokio::test]
+async fn backlog_is_compacted_without_a_new_feed_event() {
+    // The crash-after-cursor regression (plan 41): a worker (or a peer sharing
+    // the fleet cursor) advanced past the events that created this backlog and
+    // then died before merging. No new event will ever arrive for these parts,
+    // so a feed-gated pass would leave them unmerged forever.
+    let env = setup().await;
+    add_l0(
+        &env,
+        "d1",
+        vec![json!({"tenant_id": 1, "ts": 1, "payload": "a"})],
+    )
+    .await;
+    add_l0(
+        &env,
+        "d1",
+        vec![json!({"tenant_id": 1, "ts": 2, "payload": "b"})],
+    )
+    .await;
+
+    let config = CompactorConfig::default();
+    let head = env.catalog.feed_head(env.ht).await.unwrap();
+    env.catalog
+        .set_cursor(&config.worker_name, env.ht, head)
+        .await
+        .unwrap();
+
+    let compactor = Compactor::new(env.catalog.clone(), env.store.clone(), config);
+    let stats = compactor.run_once().await.unwrap();
+    assert_eq!(
+        stats.merged_groups, 1,
+        "live state, not the feed, is the work ledger"
+    );
+    assert_eq!(env.catalog.live_parts(env.ht, None).await.unwrap().len(), 1);
+}

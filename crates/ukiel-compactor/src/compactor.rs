@@ -4,7 +4,7 @@
 //! safely retried next pass. A run = one commit's key-disjoint output set;
 //! `fanout` runs at a level merge into one run a level up.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use futures::FutureExt;
@@ -48,6 +48,9 @@ pub struct CompactorConfig {
     pub finalize_poll_interval_ms: u64,
     /// Loop tick for the merge pass in `run`.
     pub poll_interval_ms: u64,
+    /// Most candidate partitions one pass considers per hypertable. Bounds the
+    /// pass, not the backlog: the rest come back next tick.
+    pub candidate_limit: i64,
 }
 
 impl Default for CompactorConfig {
@@ -61,6 +64,7 @@ impl Default for CompactorConfig {
             finalize_after_secs: 3600,
             finalize_poll_interval_ms: 60_000,
             poll_interval_ms: 5000,
+            candidate_limit: 64,
         }
     }
 }
@@ -202,74 +206,74 @@ impl Compactor {
         hypertable: &Hypertable,
         stats: &mut CompactionStats,
     ) -> Result<(), CompactorError> {
-        // Wake-up signal: skip hypertables with no feed activity since our cursor.
-        let cursor = self
+        // The work list is current live state, not the feed. A shared fleet
+        // cursor can pass an event whose compaction a dying worker abandoned;
+        // gating on "unread events exist" would then hide that backlog forever.
+        let candidates = self
             .catalog
-            .get_cursor(&self.config.worker_name, hypertable.id)
+            .compaction_candidates(
+                hypertable.id,
+                self.config.l0_fanout as i64,
+                self.config.fanout as i64,
+                self.config.candidate_limit,
+            )
             .await?;
-        let events = self
-            .catalog
-            .changes_since(hypertable.id, cursor, 1000)
-            .await?;
-        if events.is_empty() {
-            return Ok(());
-        }
 
-        // Plan from live state, never from the events themselves.
-        let live = self.catalog.live_parts(hypertable.id, None).await?;
-        let mut partitions: HashMap<String, Vec<Part>> = HashMap::new();
-        for part in live {
-            partitions
-                .entry(part.meta.partition_values.to_string())
-                .or_default()
-                .push(part);
-        }
-
-        for (_, parts) in partitions {
-            // Runs per level: parts committed together form one key-disjoint
-            // run, so distinct commits = distinct runs (each L0 file is its
-            // own ingest commit).
-            let mut by_level: BTreeMap<i16, Vec<Part>> = BTreeMap::new();
-            for part in parts {
-                by_level.entry(part.meta.level).or_default().push(part);
-            }
-            for (level, group) in by_level {
-                let runs: HashSet<i64> = group.iter().map(|p| p.created_by_commit.0).collect();
-                // Two-tier trigger: L0 files are unpruned by key (merge
-                // eagerly), L1+ runs are key-disjoint (merge lazily).
-                let trigger = if level == 0 {
-                    self.config.l0_fanout
-                } else {
-                    self.config.fanout
-                };
-                if runs.len() < trigger {
-                    continue;
+        for partition in candidates {
+            let parts = self
+                .catalog
+                .live_partition_parts(hypertable.id, &partition)
+                .await?;
+            // Raced since the candidate query: recheck against this snapshot.
+            let Some((level, group)) = self.eligible_level(parts) else {
+                continue;
+            };
+            match self.merge_parts(hypertable, &group, level + 1).await {
+                Ok(parts_out) => {
+                    stats.merged_groups += 1;
+                    stats.parts_in += group.len();
+                    stats.parts_out += parts_out;
                 }
-                match self.merge_parts(hypertable, &group, level + 1).await {
-                    Ok(parts_out) => {
-                        stats.merged_groups += 1;
-                        stats.parts_in += group.len();
-                        stats.parts_out += parts_out;
-                    }
-                    // Another writer got here first: replan next pass.
-                    Err(CompactorError::Catalog(CatalogError::Conflict { .. })) => {
-                        stats.conflicts += 1;
-                    }
-                    Err(e) => return Err(e),
+                // Another writer got here first: replan next pass.
+                Err(CompactorError::Catalog(CatalogError::Conflict { .. })) => {
+                    stats.conflicts += 1;
                 }
-                // One merge per partition per pass: bounded commits; the
-                // ladder cascades over subsequent passes.
-                break;
+                Err(e) => return Err(e),
             }
         }
 
-        // Advance past everything we saw. Crash before this line only means
-        // re-scanning: replanning from live state finds no L0s left to merge.
-        let last = events.last().expect("non-empty").commit_id;
+        // Cursor advancement is wake/observability progress, never the work
+        // ledger — so it happens whatever the merges did, and monotonically
+        // (a lagging peer sharing this name cannot pull it back).
+        let head = self.catalog.feed_head(hypertable.id).await?;
         self.catalog
-            .set_cursor(&self.config.worker_name, hypertable.id, last)
+            .set_cursor(&self.config.worker_name, hypertable.id, head)
             .await?;
         Ok(())
+    }
+
+    /// The lowest level of this partition whose live runs have reached its
+    /// merge trigger, with that level's parts. One merge per partition per
+    /// pass: bounded commits; the ladder cascades over subsequent passes.
+    fn eligible_level(&self, parts: Vec<Part>) -> Option<(i16, Vec<Part>)> {
+        // Runs per level: parts committed together form one key-disjoint run,
+        // so distinct commits = distinct runs (each L0 file is its own ingest
+        // commit).
+        let mut by_level: BTreeMap<i16, Vec<Part>> = BTreeMap::new();
+        for part in parts {
+            by_level.entry(part.meta.level).or_default().push(part);
+        }
+        by_level.into_iter().find(|(level, group)| {
+            let runs: HashSet<i64> = group.iter().map(|p| p.created_by_commit.0).collect();
+            // Two-tier trigger: L0 files are unpruned by key (merge eagerly),
+            // L1+ runs are key-disjoint (merge lazily).
+            let trigger = if *level == 0 {
+                self.config.l0_fanout
+            } else {
+                self.config.fanout
+            };
+            runs.len() >= trigger
+        })
     }
 
     /// Streams the given live parts (all one partition) through a bounded-memory

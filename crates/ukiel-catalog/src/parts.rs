@@ -172,6 +172,44 @@ impl PostgresCatalog {
         Ok(rows)
     }
 
+    /// Partitions holding at least one level whose live run count has reached
+    /// that level's merge trigger — the compactor's work list, aggregated in
+    /// Postgres so a sweep never ships part rows for partitions it will not
+    /// touch. Derived from *current live state*, never from the change feed: a
+    /// shared fleet cursor may have moved past an event whose compaction was
+    /// abandoned when its worker died, and that backlog must stay discoverable
+    /// with no new event to wake anyone (plan 41).
+    ///
+    /// Distinct partitions, deterministic order, bounded by `limit`. The
+    /// migration-0007 `(hypertable_id, partition_values, level)` index serves
+    /// the GROUP BY.
+    pub async fn compaction_candidates(
+        &self,
+        hypertable_id: HypertableId,
+        l0_fanout: i64,
+        fanout: i64,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>, CatalogError> {
+        let rows: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT partition_values FROM (
+                 SELECT partition_values, level, count(DISTINCT created_by_commit) AS runs
+                 FROM parts
+                 WHERE hypertable_id = $1 AND deleted_by_commit IS NULL
+                 GROUP BY partition_values, level) g
+             WHERE runs >= CASE WHEN level = 0 THEN $2 ELSE $3 END
+             GROUP BY partition_values
+             ORDER BY partition_values::text
+             LIMIT $4",
+        )
+        .bind(hypertable_id.0)
+        .bind(l0_fanout)
+        .bind(fanout)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// Live part counts per `(hypertable, level)` — the `catalog_live_parts`
     /// gauge (metrics P2). The scan is bounded by live parts, exactly the
     /// quantity being measured (partial `parts_live_idx` covers live rows).
