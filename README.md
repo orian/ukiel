@@ -36,6 +36,31 @@ soon, but i'd like to run it in prod to test query performance.
 8. Q: how to handle deletes? as the database would be multitenant, we could have a worker rewriting the data, that's all.
 9. conflicts between: mutations and merges
 
+# The pitch:
+
+1. Ukiel makes multitenancy a file-management problem. Millions of logical
+   tenant tables can share thousands of physical hypertables.
+2. Small tenants share Parquet files. Large tenants separate into dedicated
+   files as they grow. This avoids both the tiny-file explosion and the
+   one-layout-fits-nobody trap.
+3. The Postgres catalog is the transaction layer for the lake. A Kafka offset
+   and its new Parquet parts become visible in one commit.
+4. Ingest, compaction, deletion, retention, and materialized views use the same
+   atomic ADD/REPLACE/DELETE primitive. Races become ordinary optimistic
+   conflicts. The loser replans from fresh state.
+5. Every catalog commit is also an ordered event. Background workers get a
+   durable change feed without polling S3 or inventing another control plane.
+6. Queries never list the object store. Range stats, exact tenant-key bitmaps,
+   and row-group spans decide which bytes can matter before any file is opened.
+7. Compaction is a bounded-memory streaming merge. A 500 GB tenant can become
+   several time-prunable files instead of one impossible file or one impossible
+   in-memory job.
+8. Storage stays open: Parquet on S3, DataFusion for compute, Postgres for
+   coordination. Query and worker fleets remain disposable and horizontal.
+9. The performance is measured. With cached object storage, the full Ukiel
+   stack is within 3% of bare DataFusion on the same files. Tenant pruning can
+   make real product queries 3–4.5x faster than scanning those files directly.
+
 ## Development
 
 Rust workspace. Design spec: `docs/superpowers/specs/2026-07-05-ukiel-design.md`,
