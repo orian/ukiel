@@ -4,7 +4,7 @@
 //! `docs/notes/2026-07-06-columnar-results.md`.
 
 use datafusion::arrow::array::{
-    Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
+    Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, StringViewArray,
 };
 use datafusion::arrow::datatypes::SchemaRef;
 use serde::Deserialize;
@@ -124,6 +124,20 @@ fn append_column_values(array: &dyn Array, out: &mut Vec<Value>) {
                 });
             }
         }
+        // Plan 39: the query path reads strings as `Utf8View` (parity with
+        // DataFusion's own `schema_force_view_types` default), so results arrive
+        // as `StringViewArray`. Same values, different in-memory representation —
+        // the JSON must be identical, and a test pins that.
+        DataType::Utf8View => {
+            let a = array.as_any().downcast_ref::<StringViewArray>().unwrap();
+            for i in 0..a.len() {
+                out.push(if a.is_null(i) {
+                    Value::Null
+                } else {
+                    json!(a.value(i))
+                });
+            }
+        }
         DataType::Boolean => {
             let a = array.as_any().downcast_ref::<BooleanArray>().unwrap();
             for i in 0..a.len() {
@@ -148,5 +162,60 @@ fn append_column_values(array: &dyn Array, out: &mut Vec<Value>) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    /// Plan 39: the query path reads strings as `Utf8View`. A view array and an
+    /// owned array carrying the same values must serialize to the *same* JSON —
+    /// clients cannot be asked to care which in-memory representation the engine
+    /// happened to pick. Without the `Utf8View` arm this panics on the unwrap,
+    /// so this test is what makes the flip safe rather than merely fast.
+    #[test]
+    fn utf8view_serializes_identically_to_utf8() {
+        let values = vec![
+            Some("a"),
+            None,
+            Some("a rather longer string than 12 bytes"),
+        ];
+
+        let owned = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(values.clone()))],
+        )
+        .unwrap();
+        let viewed = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8View, true)])),
+            vec![Arc::new(StringViewArray::from(values))],
+        )
+        .unwrap();
+
+        let (o_batch, v_batch) = (std::slice::from_ref(&owned), std::slice::from_ref(&viewed));
+        for (o, v) in [
+            (
+                to_rows(o_batch, &owned.schema()).unwrap(),
+                to_rows(v_batch, &viewed.schema()).unwrap(),
+            ),
+            (
+                to_columns(o_batch, &owned.schema()).unwrap(),
+                to_columns(v_batch, &viewed.schema()).unwrap(),
+            ),
+        ] {
+            assert_eq!(o, v, "view and owned strings must serialize identically");
+        }
+        // Nulls survive as JSON null, not as the empty string.
+        let body = to_rows(v_batch, &viewed.schema()).unwrap();
+        let rows = &body["rows"];
+        assert_eq!(rows[0]["s"], json!("a"));
+        assert_eq!(rows[1].get("s"), None, "a null is absent, as for Utf8");
+
+        // And the *declared* type on the wire stays `utf8`: the view is an
+        // in-memory representation, not a schema change a client should see.
+        assert_eq!(body["schema"][0]["type"], json!("utf8"));
     }
 }

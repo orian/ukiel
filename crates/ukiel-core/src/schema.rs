@@ -31,7 +31,11 @@ pub fn ukiel_type_of(field: &Field) -> String {
     match field.data_type() {
         DataType::Int64 => "int64".to_string(),
         DataType::Float64 => "float64".to_string(),
-        DataType::Utf8 => "utf8".to_string(),
+        // `Utf8View` is the same declared `utf8` type in a different *in-memory*
+        // representation — the query path reads strings as views (plan 39), and
+        // that is an engine detail, not a schema change. It must never surface on
+        // the wire: a client asking for its schema gets `utf8` either way.
+        DataType::Utf8 | DataType::Utf8View => "utf8".to_string(),
         DataType::Boolean => "bool".to_string(),
         other => format!("{other:?}").to_lowercase(),
     }
