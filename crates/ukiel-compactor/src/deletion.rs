@@ -11,10 +11,15 @@ use object_store::ObjectStore;
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use ukiel_catalog::PostgresCatalog;
-use ukiel_core::{CommitOp, Hypertable, PartMeta};
+use ukiel_core::{CommitOp, DeleteKeyIntent, Hypertable, OperationIdentity, PartMeta};
 
 use crate::CompactorError;
 use crate::rewrite;
+
+/// The version of "what erasing this key means" (plan 43). Inside the operation
+/// fingerprint. Bump it when a change would make the same key over the same
+/// inputs produce materially different remaining data.
+pub const DELETION_TRANSFORMATION_VERSION: u32 = 1;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct DeletionStats {
@@ -33,6 +38,24 @@ pub async fn delete_key(
     if overlapping.is_empty() {
         return Ok(DeletionStats::default());
     }
+
+    // Named from the authoritative read, before the first rewrite: "erase this
+    // key from exactly these live parts". The rewritten files are the attempt —
+    // fresh UUIDs on every try — and stay out of it, so a retry after a lost
+    // acknowledgement reconciles instead of erasing twice (which, for a
+    // *deletion*, would mean tombstoning parts a peer has since rebuilt).
+    let input_parts: Vec<ukiel_core::PartId> = overlapping.iter().map(|p| p.id).collect();
+    let identity = OperationIdentity::delete_key(
+        hypertable.id,
+        DeleteKeyIntent {
+            packing_key: key,
+            input_parts: &input_parts,
+            table_schema: &hypertable.table_schema,
+            sort_key: &hypertable.sort_key,
+            placement: hypertable.placement,
+            transformation_version: DELETION_TRANSFORMATION_VERSION,
+        },
+    )?;
 
     let cols = ukiel_core::TableColumns::parse(&hypertable.table_schema)?;
     let schema = Arc::new(cols.physical_schema());
@@ -104,15 +127,14 @@ pub async fn delete_key(
     }
 
     // One atomic swap: readers see all of the key's data or none of it.
-    let old = overlapping.iter().map(|p| p.id).collect();
     catalog
         .commit(
             hypertable.id,
             CommitOp::Replace {
-                old,
+                old: input_parts,
                 new: new_parts,
             },
-            None,
+            Some(&identity),
         )
         .await?;
     Ok(stats)

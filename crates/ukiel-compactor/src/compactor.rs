@@ -18,11 +18,44 @@ use std::sync::{Arc, Mutex};
 use futures::FutureExt;
 use object_store::ObjectStore;
 use ukiel_catalog::{CandidateWindow, CatalogError, CompactionLease, PostgresCatalog};
-use ukiel_core::{Hypertable, HypertableId, Part, PartMeta};
+use ukiel_core::{CompactionIntent, Hypertable, HypertableId, OperationIdentity, Part, PartMeta};
 use uuid::Uuid;
 
 use crate::CompactorError;
 use crate::rewrite;
+
+/// The version of "what merging these parts means" (plan 43). Inside the
+/// operation fingerprint, so bumping it makes the same input group a *different*
+/// operation. Bump it when a change would make the same inputs produce
+/// materially different output — a new placement rule, a changed sort or
+/// materialized-column semantic. Not for an ordinary release: a version that
+/// moves on every deploy orphans every in-flight identity.
+pub const COMPACTION_TRANSFORMATION_VERSION: u32 = 1;
+
+/// The identity of "merge exactly these live parts into one run at
+/// `output_level`". Built before a single Parquet file is opened, and free of
+/// everything that belongs to the *attempt* rather than the intent: the output
+/// paths (fresh UUIDs every time), the lease owner and generation, the sizes and
+/// statistics only a completed merge knows.
+pub fn compaction_identity_for(
+    hypertable: &Hypertable,
+    group: &[Part],
+    output_level: i16,
+) -> Result<OperationIdentity, CompactorError> {
+    let input_parts: Vec<ukiel_core::PartId> = group.iter().map(|p| p.id).collect();
+    Ok(OperationIdentity::compaction(
+        hypertable.id,
+        CompactionIntent {
+            output_level,
+            input_parts: &input_parts,
+            partition_values: &group[0].meta.partition_values,
+            table_schema: &hypertable.table_schema,
+            sort_key: &hypertable.sort_key,
+            placement: hypertable.placement,
+            transformation_version: COMPACTION_TRANSFORMATION_VERSION,
+        },
+    )?)
+}
 
 /// Seconds since the Unix epoch for liveness gauges (metrics P1). The
 /// workflow-script `Date` ban does not apply to crate runtime code.
@@ -548,6 +581,12 @@ impl Compactor {
         group: &[Part],
         output_level: i16,
     ) -> Result<usize, CompactorError> {
+        // Named before any object work, from the live inputs and the output
+        // level alone. If the commit's acknowledgement is lost, this is what the
+        // supervisor asks the catalog about — and a second attempt at the same
+        // merge, with different output files, reconciles to it.
+        let identity = compaction_identity_for(hypertable, group, output_level)?;
+
         let cancel = tokio_util::sync::CancellationToken::new();
         let renewals = tokio::spawn(renew_until_cancelled(
             self.catalog.clone(),
@@ -561,7 +600,7 @@ impl Compactor {
         // never discarded by a renewal that fails in the same instant.
         let merged = tokio::select! {
             biased;
-            result = self.merge_parts(hypertable, lease, group, output_level) => Some(result),
+            result = self.merge_parts(hypertable, lease, &identity, group, output_level) => Some(result),
             () = cancel.cancelled() => None,
         };
         cancel.cancel();
@@ -624,6 +663,7 @@ impl Compactor {
         &self,
         hypertable: &Hypertable,
         lease: &CompactionLease,
+        identity: &OperationIdentity,
         group: &[Part],
         output_level: i16,
     ) -> Result<usize, CompactorError> {
@@ -693,16 +733,16 @@ impl Compactor {
         // CatalogError::Conflict (ingest and deletion take no lease); uploaded
         // objects are then orphans — harmless, cleaned by GC's orphan sweep.
         self.catalog
-            .commit_compaction_replace(hypertable.id, lease, old, new_parts, None)
+            .commit_compaction_replace(hypertable.id, lease, old, new_parts, identity)
             .await
             .inspect_err(|e| {
                 // A transport failure around the REPLACE leaves its outcome
                 // unknown: it may have committed and lost the acknowledgement.
-                // Counted, never replayed. The next pass replans from live
-                // state, which is correct either way — if it landed, the inputs
-                // are gone and there is nothing to redo; if it did not, they are
-                // still there. (Plan 43 makes the outcome *knowable* rather than
-                // merely survivable.)
+                // Still never replayed in place — the next pass replans from
+                // live state, which is correct either way. What plan 43 adds is
+                // that the error now *carries the identity*, so the supervisor
+                // can ask the catalog which of the two happened instead of
+                // merely surviving not knowing.
                 if e.is_recoverable_transport() {
                     metrics::counter!("compactor_ambiguous_commit_total").increment(1);
                 }

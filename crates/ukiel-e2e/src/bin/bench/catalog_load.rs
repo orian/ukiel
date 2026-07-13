@@ -734,6 +734,10 @@ pub async fn conflict(
     let pools = Arc::new(build_pools(cfg.pools, cfg.connections_per_pool).await?);
     let ht = pools[0].get_hypertable(ht_name).await?;
     let ht_id = ht.id;
+    // Shared, not cloned per operation: the identity builder reads the table's
+    // schema/sort/placement, and copying them a million times would price the
+    // benchmark's own bookkeeping instead of the catalog's.
+    let ht = Arc::new(ht);
 
     // Each contender stands in for one compactor process, so each gets its own
     // owner identity. Sharing an owner across contenders would defeat the lease
@@ -771,7 +775,7 @@ pub async fn conflict(
             acquired.clone(),
         );
         run_load("conflict", &cfg, pools.clone(), move |pools, seq| {
-            let (attempts, conflicts, useful, noops, shape, skipped, acquired) = (
+            let (attempts, conflicts, useful, noops, shape, skipped, acquired, ht) = (
                 attempts.clone(),
                 conflicts.clone(),
                 useful.clone(),
@@ -779,6 +783,7 @@ pub async fn conflict(
                 shape.clone(),
                 skipped.clone(),
                 acquired.clone(),
+                ht.clone(),
             );
             async move {
                 let cat = &pools[(seq as usize) % pools.len()];
@@ -837,6 +842,22 @@ pub async fn conflict(
                         break;
                     }
                     let old: Vec<_> = inputs.iter().map(|p| p.id).collect();
+                    // The real path (plan 43): every leased REPLACE is
+                    // identified, so the benchmark prices the fingerprint
+                    // build, the extra column, and the replay lookup.
+                    let identity = ukiel_core::OperationIdentity::compaction(
+                        ht_id,
+                        ukiel_core::CompactionIntent {
+                            output_level: 1,
+                            input_parts: &old,
+                            partition_values: &partition,
+                            table_schema: &ht.table_schema,
+                            sort_key: &ht.sort_key,
+                            placement: ht.placement,
+                            transformation_version:
+                                ukiel_compactor::compactor::COMPACTION_TRANSFORMATION_VERSION,
+                        },
+                    )?;
                     let new = vec![PartMeta {
                         path: format!("ht/{}/L1/{}.parquet", ht_id.0, uuid::Uuid::new_v4()),
                         partition_values: partition.clone(),
@@ -861,11 +882,11 @@ pub async fn conflict(
                     // which is exactly what it is still there to catch.
                     let committed = match &lease {
                         Some(lease) => {
-                            cat.commit_compaction_replace(ht_id, lease, old, new, None)
+                            cat.commit_compaction_replace(ht_id, lease, old, new, &identity)
                                 .await
                         }
                         None => {
-                            cat.commit(ht_id, CommitOp::Replace { old, new }, None)
+                            cat.commit(ht_id, CommitOp::Replace { old, new }, Some(&identity))
                                 .await
                         }
                     };

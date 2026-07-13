@@ -14,6 +14,11 @@ pub enum CompactorError {
     Expr(#[from] ukiel_expr::ExprError),
     #[error(transparent)]
     SortKey(#[from] ukiel_core::SortKeyError),
+    /// A merge or deletion whose inputs cannot name a coherent operation — a
+    /// duplicate input part, an empty group. A caller bug, caught before any
+    /// object work.
+    #[error(transparent)]
+    Operation(#[from] ukiel_core::OperationError),
     #[error("column '{0}' not found in schema")]
     MissingColumn(String),
     #[error("column '{0}' is not Int64")]

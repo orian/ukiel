@@ -104,3 +104,105 @@ async fn deletion_rewrite_drops_the_key_from_the_bitmap() {
     assert_eq!(bitmap_contains(encoded, 3), Some(true));
     assert_eq!(bitmap_contains(encoded, 90), Some(true));
 }
+
+// ---------------------------------------------------------------------------
+// Plan 43: deletion operation identity.
+// ---------------------------------------------------------------------------
+
+use ukiel_catalog::OperationLookup;
+use ukiel_compactor::deletion::DELETION_TRANSFORMATION_VERSION;
+use ukiel_core::{CommitOp, CommitResult, DeleteKeyIntent, OperationIdentity, PartMeta};
+
+/// The deletion identity is "erase this key from exactly these live parts".
+///
+/// Getting this wrong is worse than for a merge: a replayed *deletion* that is
+/// not recognised would tombstone parts a peer has since rebuilt, so the retry
+/// must reconcile rather than re-erase.
+#[tokio::test]
+async fn a_replayed_deletion_reconciles_instead_of_erasing_twice() {
+    let env = compactor_test::setup().await;
+    add_l0(
+        &env,
+        "d1",
+        vec![
+            json!({"tenant_id": 7, "ts": 1, "payload": "seven"}),
+            json!({"tenant_id": 8, "ts": 2, "payload": "eight"}),
+        ],
+    )
+    .await;
+    let ht = env.catalog.get_hypertable("events").await.unwrap();
+    let inputs = env.catalog.live_parts(env.ht, Some(7)).await.unwrap();
+    let input_parts: Vec<_> = inputs.iter().map(|p| p.id).collect();
+
+    let identity = |parts: &[ukiel_core::PartId], key: i64| {
+        OperationIdentity::delete_key(
+            env.ht,
+            DeleteKeyIntent {
+                packing_key: key,
+                input_parts: parts,
+                table_schema: &ht.table_schema,
+                sort_key: &ht.sort_key,
+                placement: ht.placement,
+                transformation_version: DELETION_TRANSFORMATION_VERSION,
+            },
+        )
+        .unwrap()
+    };
+    let erase_seven = identity(&input_parts, 7);
+
+    // A changed target key, or a changed input set, is different intent.
+    assert_ne!(erase_seven.key(), identity(&input_parts, 8).key());
+    let mut wider = input_parts.clone();
+    wider.push(ukiel_core::PartId(999_999));
+    assert_ne!(erase_seven.key(), identity(&wider, 7).key());
+
+    let stats = delete_key(&env.catalog, &env.store, &ht, 7).await.unwrap();
+    assert_eq!(stats.rows_deleted, 1);
+    assert_eq!(
+        env.catalog.lookup_operation(&erase_seven).await.unwrap(),
+        OperationLookup::Committed(
+            match env.catalog.lookup_operation(&erase_seven).await.unwrap() {
+                OperationLookup::Committed(id) => id,
+                other => panic!("the deletion must be recorded under its identity: {other:?}"),
+            }
+        )
+    );
+    let after = live_payloads(&env).await;
+    assert_eq!(after, HashSet::from(["eight".to_string()]));
+
+    // The acknowledgement was lost: the same intent is submitted again, with a
+    // different rewrite path (as any second attempt would have). It reconciles,
+    // and tombstones nothing — the inputs it names are already tombstoned, so
+    // without the identity this would have been a Conflict at best and a
+    // double-erasure of rebuilt parts at worst.
+    let replay = env
+        .catalog
+        .commit(
+            env.ht,
+            CommitOp::Replace {
+                old: input_parts.clone(),
+                new: vec![PartMeta {
+                    path: "second-attempt.parquet".into(),
+                    partition_values: json!({"day": "d1"}),
+                    packing_key_min: 8,
+                    packing_key_max: 8,
+                    row_count: 1,
+                    size_bytes: 1,
+                    level: 0,
+                    column_stats: None,
+                }],
+            },
+            Some(&erase_seven),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(replay, CommitResult::AlreadyApplied(_)),
+        "{replay:?}"
+    );
+    assert_eq!(
+        live_payloads(&env).await,
+        after,
+        "the replay changed nothing"
+    );
+}

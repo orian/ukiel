@@ -74,18 +74,23 @@ impl PostgresCatalog {
     /// deletion, and operator actions take no lease, so the optimistic conflict
     /// check underneath stays the final protection and can still return
     /// `Conflict` after the fence passes.
+    ///
+    /// The identity is **required**, and it is what the replay path keys on: a
+    /// merge whose acknowledgement was lost is reconciled here *before* the
+    /// lease is judged, so a worker whose lease expired while it was away is
+    /// told its work is durable rather than told it lost.
     pub async fn commit_compaction_replace(
         &self,
         hypertable_id: HypertableId,
         lease: &CompactionLease,
         old: Vec<PartId>,
         new: Vec<PartMeta>,
-        identity: Option<&OperationIdentity>,
+        identity: &OperationIdentity,
     ) -> Result<CommitResult, CatalogError> {
         self.commit_inner(
             hypertable_id,
             CommitOp::Replace { old, new },
-            identity,
+            Some(identity),
             &[],
             Some(lease),
         )

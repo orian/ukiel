@@ -1843,3 +1843,148 @@ async fn the_sweep_wraps_at_the_tail_within_one_tick() {
     // meet the L1 run above it — that is the ladder, not this sweep's business).
     assert_eq!(live_l0_parts(&env, "d1").await, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Plan 43: compaction operation identity.
+// ---------------------------------------------------------------------------
+
+use ukiel_catalog::OperationLookup;
+use ukiel_compactor::compactor::{COMPACTION_TRANSFORMATION_VERSION, compaction_identity_for};
+use ukiel_core::{CommitResult, Hypertable, Part};
+
+fn merge_identity(ht: &Hypertable, group: &[Part], level: i16) -> ukiel_core::OperationIdentity {
+    compaction_identity_for(ht, group, level).unwrap()
+}
+
+#[tokio::test]
+async fn the_compaction_identity_is_the_merge_intent_not_the_attempt() {
+    let env = setup().await;
+    for i in 0..2 {
+        add_l0(
+            &env,
+            "d1",
+            vec![json!({"tenant_id": 1, "ts": i, "payload": format!("v{i}")})],
+        )
+        .await;
+    }
+    let ht = env.catalog.get_hypertable("events").await.unwrap();
+    let parts = env
+        .catalog
+        .live_partition_parts(env.ht, &json!({"day": "d1"}))
+        .await
+        .unwrap();
+
+    // Enumeration order is not intent: two workers that read the same live group
+    // in different orders are doing the same merge.
+    let mut shuffled = parts.clone();
+    shuffled.reverse();
+    assert_eq!(
+        merge_identity(&ht, &parts, 1).key(),
+        merge_identity(&ht, &shuffled, 1).key()
+    );
+
+    // Level and input set are.
+    assert_ne!(
+        merge_identity(&ht, &parts, 1).key(),
+        merge_identity(&ht, &parts, 2).key()
+    );
+    assert_ne!(
+        merge_identity(&ht, &parts, 1).key(),
+        merge_identity(&ht, &parts[..1], 1).key()
+    );
+    assert_eq!(COMPACTION_TRANSFORMATION_VERSION, 1);
+}
+
+/// The lost-acknowledgement case for compaction: the merge is durable, the
+/// worker never heard, and its lease is gone by the time it asks. Replaying the
+/// same intent must reconcile — *without* a second Parquet read or upload, which
+/// is the whole economic point of the lease in plan 41.
+#[tokio::test]
+async fn a_replayed_merge_reconciles_without_touching_object_storage_again() {
+    let env = setup().await;
+    for i in 0..2 {
+        add_l0(
+            &env,
+            "d1",
+            vec![json!({"tenant_id": 1, "ts": i, "payload": format!("v{i}")})],
+        )
+        .await;
+    }
+    let before = live_payloads(&env).await;
+    let ht = env.catalog.get_hypertable("events").await.unwrap();
+    let partition = json!({"day": "d1"});
+    let inputs = env
+        .catalog
+        .live_partition_parts(env.ht, &partition)
+        .await
+        .unwrap();
+    let identity = merge_identity(&ht, &inputs, 1);
+
+    // The worker's merge landed.
+    let (store, probe) = probe_store(env.store.clone(), None);
+    let c = Compactor::new(env.catalog.clone(), store, worker_config("c1"));
+    let stats = c.run_once().await.unwrap();
+    assert_eq!(stats.merged_groups, 1);
+    let reads_and_uploads = (probe.reads(), probe.uploads());
+    assert!(reads_and_uploads.0 > 0 && reads_and_uploads.1 > 0);
+
+    let OperationLookup::Committed(id) = env.catalog.lookup_operation(&identity).await.unwrap()
+    else {
+        panic!("the merge that just ran must be recorded under its identity")
+    };
+
+    // The acknowledgement was lost. The worker comes back, reacquires the
+    // partition (a *new* generation — issue 0013), and replays the same intent
+    // against the parts it remembers. It is told the truth.
+    let lease = env
+        .catalog
+        .try_acquire_compaction_lease(
+            env.ht,
+            &partition,
+            uuid::Uuid::new_v4(),
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap()
+        .expect("free");
+    let replay = env
+        .catalog
+        .commit_compaction_replace(
+            env.ht,
+            &lease,
+            inputs.iter().map(|p| p.id).collect(),
+            vec![PartMeta {
+                path: "redo.parquet".into(),
+                partition_values: partition.clone(),
+                packing_key_min: 1,
+                packing_key_max: 1,
+                row_count: 2,
+                size_bytes: 2,
+                level: 1,
+                column_stats: None,
+            }],
+            &identity,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        replay,
+        CommitResult::AlreadyApplied(id),
+        "durable work is reported, not redone"
+    );
+
+    // Nothing was read or uploaded for the replay, and the data is unchanged.
+    assert_eq!(
+        (probe.reads(), probe.uploads()),
+        reads_and_uploads,
+        "reconciliation must never turn a committed merge into more object work"
+    );
+    assert_eq!(live_payloads(&env).await, before);
+    let live = env.catalog.live_parts(env.ht, None).await.unwrap();
+    assert_eq!(
+        live.len(),
+        1,
+        "the replay's part was not inserted: {live:?}"
+    );
+    assert_ne!(live[0].meta.path, "redo.parquet");
+}

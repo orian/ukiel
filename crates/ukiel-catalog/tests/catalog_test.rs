@@ -1806,7 +1806,13 @@ async fn leased_replace_commits_only_for_the_current_generation() {
     // The current owner commits.
     let old = live_ids(&catalog, ht, &day1).await;
     catalog
-        .commit_compaction_replace(ht, &lease, old, vec![l1_meta("l1-a.parquet", &day1)], None)
+        .commit_compaction_replace(
+            ht,
+            &lease,
+            old,
+            vec![l1_meta("l1-a.parquet", &day1)],
+            &op(ht, 101, 0, 0),
+        )
         .await
         .unwrap();
     let live = catalog.live_partition_parts(ht, &day1).await.unwrap();
@@ -1831,7 +1837,7 @@ async fn leased_replace_commits_only_for_the_current_generation() {
             &lease,
             old.clone(),
             vec![l1_meta("zombie.parquet", &day1)],
-            None,
+            &op(ht, 102, 0, 0),
         )
         .await
         .unwrap_err();
@@ -1852,7 +1858,13 @@ async fn leased_replace_commits_only_for_the_current_generation() {
 
     // The current owner still commits fine.
     catalog
-        .commit_compaction_replace(ht, &b, old, vec![l1_meta("l1-b.parquet", &day1)], None)
+        .commit_compaction_replace(
+            ht,
+            &b,
+            old,
+            vec![l1_meta("l1-b.parquet", &day1)],
+            &op(ht, 103, 0, 0),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1887,7 +1899,7 @@ async fn leased_replace_rejects_wrong_owner_expired_and_missing_leases() {
             &impostor,
             old.clone(),
             vec![l1_meta("x.parquet", &day1)],
-            None,
+            &op(ht, 104, 0, 0),
         )
         .await
         .unwrap_err();
@@ -1902,7 +1914,7 @@ async fn leased_replace_rejects_wrong_owner_expired_and_missing_leases() {
             &lease,
             old.clone(),
             vec![l1_meta("x.parquet", &day1)],
-            None,
+            &op(ht, 105, 0, 0),
         )
         .await
         .unwrap_err();
@@ -1916,7 +1928,7 @@ async fn leased_replace_rejects_wrong_owner_expired_and_missing_leases() {
             &lease,
             old.clone(),
             vec![l1_meta("x.parquet", &day1)],
-            None,
+            &op(ht, 106, 0, 0),
         )
         .await
         .unwrap_err();
@@ -1949,7 +1961,7 @@ async fn a_lease_on_one_partition_cannot_rewrite_another() {
             &lease,
             live_ids(&catalog, ht, &day2).await,
             vec![l1_meta("cross.parquet", &day1)],
-            None,
+            &op(ht, 107, 0, 0),
         )
         .await
         .unwrap_err();
@@ -1965,7 +1977,7 @@ async fn a_lease_on_one_partition_cannot_rewrite_another() {
             &lease,
             live_ids(&catalog, ht, &day1).await,
             vec![l1_meta("cross.parquet", &day2)],
-            None,
+            &op(ht, 108, 0, 0),
         )
         .await
         .unwrap_err();
@@ -2011,7 +2023,13 @@ async fn stale_and_current_leased_commits_serialize_on_the_lease_row() {
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
             catalog
-                .commit_compaction_replace(ht, &lease, old, vec![l1_meta(path, &partition)], None)
+                .commit_compaction_replace(
+                    ht,
+                    &lease,
+                    old,
+                    vec![l1_meta(path, &partition)],
+                    &op(ht, 109, 0, 0),
+                )
                 .await
         }));
     }
@@ -2059,7 +2077,7 @@ async fn ingest_and_deletion_still_race_the_lease_holder_safely() {
             &lease,
             planned.clone(),
             vec![l1_meta("l1.parquet", &day1)],
-            None,
+            &op(ht, 110, 0, 0),
         )
         .await
         .unwrap();
@@ -2087,7 +2105,7 @@ async fn ingest_and_deletion_still_race_the_lease_holder_safely() {
             &lease,
             planned,
             vec![l1_meta("l2.parquet", &day1)],
-            None,
+            &op(ht, 111, 0, 0),
         )
         .await
         .unwrap_err();
@@ -2114,7 +2132,7 @@ async fn an_idempotent_replay_is_reconciled_before_the_lease_is_judged() {
             &lease,
             old.clone(),
             vec![l1_meta("l1.parquet", &day1)],
-            Some(&op(ht, 1, 0, 0)),
+            &op(ht, 1, 0, 0),
         )
         .await
         .unwrap()
@@ -2139,7 +2157,7 @@ async fn an_idempotent_replay_is_reconciled_before_the_lease_is_judged() {
             &lease,
             old,
             vec![l1_meta("l1.parquet", &day1)],
-            Some(&op(ht, 1, 0, 0)),
+            &op(ht, 1, 0, 0),
         )
         .await
         .unwrap();
@@ -2184,7 +2202,7 @@ async fn the_same_owner_is_fenced_by_generation_alone() {
             &first,
             old.clone(),
             vec![l1_meta("stale.parquet", &day1)],
-            None,
+            &op(ht, 112, 0, 0),
         )
         .await
         .unwrap_err();
@@ -2196,7 +2214,7 @@ async fn the_same_owner_is_fenced_by_generation_alone() {
             &second,
             old,
             vec![l1_meta("fresh.parquet", &day1)],
-            None,
+            &op(ht, 113, 0, 0),
         )
         .await
         .unwrap();
@@ -2493,7 +2511,13 @@ async fn a_released_lease_generation_is_never_reissued() {
     );
     let old = live_ids(&catalog, ht, &day1).await;
     let err = catalog
-        .commit_compaction_replace(ht, &stale, old, vec![l1_meta("aba.parquet", &day1)], None)
+        .commit_compaction_replace(
+            ht,
+            &stale,
+            old,
+            vec![l1_meta("aba.parquet", &day1)],
+            &op(ht, 114, 0, 0),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, CatalogError::LeaseLost { .. }), "{err:?}");
@@ -2806,7 +2830,7 @@ async fn a_committed_leased_replace_is_reconciled_before_the_lease_is_judged() {
             &lease,
             old.clone(),
             vec![l1_meta("l1.parquet", &day1)],
-            Some(&identity),
+            &identity,
         )
         .await
         .unwrap()
@@ -2834,7 +2858,7 @@ async fn a_committed_leased_replace_is_reconciled_before_the_lease_is_judged() {
             &lease,
             old,
             vec![l1_meta("redo.parquet", &day1)],
-            Some(&identity),
+            &identity,
         )
         .await
         .unwrap();
@@ -2878,7 +2902,7 @@ async fn a_new_operation_under_a_stale_lease_is_still_fenced_out() {
             &stale,
             old,
             vec![l1_meta("zombie.parquet", &day1)],
-            Some(&op(ht, 9, 0, 0)),
+            &op(ht, 9, 0, 0),
         )
         .await
         .unwrap_err();
@@ -2930,13 +2954,7 @@ async fn a_collision_is_reported_before_lease_state() {
         .unwrap();
 
     let err = catalog
-        .commit_compaction_replace(
-            ht,
-            &stale,
-            old,
-            vec![l1_meta("x.parquet", &day1)],
-            Some(&forged),
-        )
+        .commit_compaction_replace(ht, &stale, old, vec![l1_meta("x.parquet", &day1)], &forged)
         .await
         .unwrap_err();
     assert!(
