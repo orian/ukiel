@@ -1649,3 +1649,394 @@ async fn lease_migration_applies_to_a_populated_pre_0008_catalog() {
     // The pre-existing data is untouched by the upgrade.
     assert_eq!(catalog.live_parts(ht, None).await.unwrap().len(), 1);
 }
+
+/// Live part ids of one partition.
+async fn live_ids(
+    catalog: &ukiel_catalog::PostgresCatalog,
+    ht: HypertableId,
+    partition: &serde_json::Value,
+) -> Vec<ukiel_core::PartId> {
+    catalog
+        .live_partition_parts(ht, partition)
+        .await
+        .unwrap()
+        .iter()
+        .map(|p| p.id)
+        .collect()
+}
+
+fn l1_meta(path: &str, partition: &serde_json::Value) -> PartMeta {
+    PartMeta {
+        path: path.to_string(),
+        partition_values: partition.clone(),
+        packing_key_min: 1,
+        packing_key_max: 1,
+        row_count: 2,
+        size_bytes: 2,
+        level: 1,
+        column_stats: None,
+    }
+}
+
+#[tokio::test]
+async fn leased_replace_commits_only_for_the_current_generation() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let day1 = json!({ "day": "2026-07-01" });
+    add_l0_part(&catalog, ht, &day1).await;
+    add_l0_part(&catalog, ht, &day1).await;
+
+    let owner = Uuid::new_v4();
+    let lease = catalog
+        .try_acquire_compaction_lease(ht, &day1, owner, TTL)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // The current owner commits.
+    let old = live_ids(&catalog, ht, &day1).await;
+    catalog
+        .commit_compaction_replace(ht, &lease, old, vec![l1_meta("l1-a.parquet", &day1)], None)
+        .await
+        .unwrap();
+    let live = catalog.live_partition_parts(ht, &day1).await.unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].meta.level, 1);
+
+    // A stale generation cannot: B took the partition over after A expired, so
+    // A's REPLACE is refused and nothing is tombstoned.
+    add_l0_part(&catalog, ht, &day1).await;
+    expire_lease(&catalog, ht, &day1).await;
+    let b = catalog
+        .try_acquire_compaction_lease(ht, &day1, Uuid::new_v4(), TTL)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(b.generation, lease.generation + 1);
+
+    let old = live_ids(&catalog, ht, &day1).await;
+    let err = catalog
+        .commit_compaction_replace(
+            ht,
+            &lease,
+            old.clone(),
+            vec![l1_meta("zombie.parquet", &day1)],
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CatalogError::LeaseLost { .. }), "{err:?}");
+    assert_eq!(
+        catalog.live_partition_parts(ht, &day1).await.unwrap().len(),
+        2,
+        "the fenced-out commit tombstoned nothing"
+    );
+    assert!(
+        !catalog
+            .all_part_paths(ht)
+            .await
+            .unwrap()
+            .contains(&"zombie.parquet".to_string()),
+        "and inserted nothing"
+    );
+
+    // The current owner still commits fine.
+    catalog
+        .commit_compaction_replace(ht, &b, old, vec![l1_meta("l1-b.parquet", &day1)], None)
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog.live_partition_parts(ht, &day1).await.unwrap().len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn leased_replace_rejects_wrong_owner_expired_and_missing_leases() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let day1 = json!({ "day": "2026-07-01" });
+    add_l0_part(&catalog, ht, &day1).await;
+    add_l0_part(&catalog, ht, &day1).await;
+    let old = live_ids(&catalog, ht, &day1).await;
+
+    let lease = catalog
+        .try_acquire_compaction_lease(ht, &day1, Uuid::new_v4(), TTL)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Same generation, forged owner.
+    let impostor = ukiel_catalog::CompactionLease {
+        owner_id: Uuid::new_v4(),
+        ..lease.clone()
+    };
+    let err = catalog
+        .commit_compaction_replace(
+            ht,
+            &impostor,
+            old.clone(),
+            vec![l1_meta("x.parquet", &day1)],
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CatalogError::LeaseLost { .. }), "{err:?}");
+
+    // Right owner and generation, but the tenancy has expired: PostgreSQL's
+    // clock decides, not the worker's belief that it is still inside its TTL.
+    expire_lease(&catalog, ht, &day1).await;
+    let err = catalog
+        .commit_compaction_replace(
+            ht,
+            &lease,
+            old.clone(),
+            vec![l1_meta("x.parquet", &day1)],
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CatalogError::LeaseLost { .. }), "{err:?}");
+
+    // Released outright: no row at all is also no ownership.
+    catalog.release_compaction_lease(&lease).await.unwrap();
+    let err = catalog
+        .commit_compaction_replace(
+            ht,
+            &lease,
+            old.clone(),
+            vec![l1_meta("x.parquet", &day1)],
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CatalogError::LeaseLost { .. }), "{err:?}");
+    assert_eq!(
+        catalog.live_partition_parts(ht, &day1).await.unwrap().len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn a_lease_on_one_partition_cannot_rewrite_another() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let day1 = json!({ "day": "2026-07-01" });
+    let day2 = json!({ "day": "2026-07-02" });
+    add_l0_part(&catalog, ht, &day1).await;
+    add_l0_part(&catalog, ht, &day2).await;
+
+    let lease = catalog
+        .try_acquire_compaction_lease(ht, &day1, Uuid::new_v4(), TTL)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Inputs from the unleased partition.
+    let err = catalog
+        .commit_compaction_replace(
+            ht,
+            &lease,
+            live_ids(&catalog, ht, &day2).await,
+            vec![l1_meta("cross.parquet", &day1)],
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CatalogError::LeasePartitionMismatch { .. }),
+        "{err:?}"
+    );
+
+    // Outputs aimed at the unleased partition.
+    let err = catalog
+        .commit_compaction_replace(
+            ht,
+            &lease,
+            live_ids(&catalog, ht, &day1).await,
+            vec![l1_meta("cross.parquet", &day2)],
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CatalogError::LeasePartitionMismatch { .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        catalog.live_partition_parts(ht, &day2).await.unwrap().len(),
+        1,
+        "day2 is untouched"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_and_current_leased_commits_serialize_on_the_lease_row() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let day1 = json!({ "day": "2026-07-01" });
+    add_l0_part(&catalog, ht, &day1).await;
+    add_l0_part(&catalog, ht, &day1).await;
+    let old = live_ids(&catalog, ht, &day1).await;
+
+    let stale = catalog
+        .try_acquire_compaction_lease(ht, &day1, Uuid::new_v4(), TTL)
+        .await
+        .unwrap()
+        .unwrap();
+    expire_lease(&catalog, ht, &day1).await;
+    let current = catalog
+        .try_acquire_compaction_lease(ht, &day1, Uuid::new_v4(), TTL)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Both fire at once at the same live inputs; the FOR UPDATE lock inside the
+    // commit orders them and only the current generation survives.
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let mut handles = Vec::new();
+    for (lease, path) in [(stale, "stale.parquet"), (current, "current.parquet")] {
+        let (catalog, barrier, old, partition) =
+            (catalog.clone(), barrier.clone(), old.clone(), day1.clone());
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            catalog
+                .commit_compaction_replace(ht, &lease, old, vec![l1_meta(path, &partition)], None)
+                .await
+        }));
+    }
+    let mut committed = 0;
+    let mut fenced = 0;
+    for h in handles {
+        match h.await.unwrap() {
+            Ok(_) => committed += 1,
+            Err(CatalogError::LeaseLost { .. }) => fenced += 1,
+            Err(e) => panic!("unexpected {e:?}"),
+        }
+    }
+    assert_eq!((committed, fenced), (1, 1));
+
+    let live = catalog.live_partition_parts(ht, &day1).await.unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(
+        live[0].meta.path, "current.parquet",
+        "the zombie's output never became live"
+    );
+}
+
+#[tokio::test]
+async fn ingest_and_deletion_still_race_the_lease_holder_safely() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let day1 = json!({ "day": "2026-07-01" });
+    add_l0_part(&catalog, ht, &day1).await;
+    add_l0_part(&catalog, ht, &day1).await;
+
+    let lease = catalog
+        .try_acquire_compaction_lease(ht, &day1, Uuid::new_v4(), TTL)
+        .await
+        .unwrap()
+        .unwrap();
+    let planned = live_ids(&catalog, ht, &day1).await;
+
+    // Ingest takes no lease and needs none: an ADD lands while the compactor
+    // holds the partition, and the leased REPLACE of the older inputs still
+    // commits. The new L0 simply stays live.
+    add_l0_part(&catalog, ht, &day1).await;
+    catalog
+        .commit_compaction_replace(
+            ht,
+            &lease,
+            planned.clone(),
+            vec![l1_meta("l1.parquet", &day1)],
+            None,
+        )
+        .await
+        .unwrap();
+    let live = catalog.live_partition_parts(ht, &day1).await.unwrap();
+    assert_eq!(live.len(), 2, "merged L1 + the L0 that arrived mid-merge");
+
+    // Deletion takes no lease either, and it still wins the optimistic race:
+    // the lease fence passes, then the conflict check refuses a REPLACE whose
+    // input was tombstoned under it. Scheduling ownership is not data
+    // integrity — REPLACE remains the backstop.
+    let planned = live_ids(&catalog, ht, &day1).await;
+    catalog
+        .commit(
+            ht,
+            CommitOp::Delete {
+                parts: vec![planned[0]],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let err = catalog
+        .commit_compaction_replace(
+            ht,
+            &lease,
+            planned,
+            vec![l1_meta("l2.parquet", &day1)],
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CatalogError::Conflict { .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn an_idempotent_replay_is_reconciled_before_the_lease_is_judged() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let day1 = json!({ "day": "2026-07-01" });
+    add_l0_part(&catalog, ht, &day1).await;
+    add_l0_part(&catalog, ht, &day1).await;
+    let old = live_ids(&catalog, ht, &day1).await;
+
+    let lease = catalog
+        .try_acquire_compaction_lease(ht, &day1, Uuid::new_v4(), TTL)
+        .await
+        .unwrap()
+        .unwrap();
+    let CommitResult::Committed(id) = catalog
+        .commit_compaction_replace(
+            ht,
+            &lease,
+            old.clone(),
+            vec![l1_meta("l1.parquet", &day1)],
+            Some("op-1"),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected a commit")
+    };
+
+    // The acknowledgement was lost and the worker's lease has since been taken
+    // over. Replaying the *same operation* must report the durable truth ("it
+    // already landed"), not LeaseLost — a worker that is told it lost would redo
+    // work that is already committed. This ordering is what HA phase 2's
+    // canonical compactor operation identities splice into.
+    expire_lease(&catalog, ht, &day1).await;
+    catalog
+        .try_acquire_compaction_lease(ht, &day1, Uuid::new_v4(), TTL)
+        .await
+        .unwrap()
+        .unwrap();
+    let replay = catalog
+        .commit_compaction_replace(
+            ht,
+            &lease,
+            old,
+            vec![l1_meta("l1.parquet", &day1)],
+            Some("op-1"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay, CommitResult::AlreadyApplied(id));
+    assert_eq!(
+        catalog.live_partition_parts(ht, &day1).await.unwrap().len(),
+        1,
+        "the replay changed nothing"
+    );
+}

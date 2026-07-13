@@ -1,6 +1,7 @@
 use sqlx::{Postgres, Transaction};
 use ukiel_core::{CommitId, CommitOp, CommitResult, HypertableId, PartId, PartMeta};
 
+use crate::CompactionLease;
 use crate::offsets::OffsetRange;
 use crate::{CatalogError, PostgresCatalog};
 
@@ -14,7 +15,7 @@ impl PostgresCatalog {
         op: CommitOp,
         idempotency_key: Option<&str>,
     ) -> Result<CommitResult, CatalogError> {
-        self.commit_inner(hypertable_id, op, idempotency_key, &[])
+        self.commit_inner(hypertable_id, op, idempotency_key, &[], None)
             .await
     }
 
@@ -28,7 +29,42 @@ impl PostgresCatalog {
         op: CommitOp,
         offsets: &[OffsetRange],
     ) -> Result<CommitResult, CatalogError> {
-        self.commit_inner(hypertable_id, op, None, offsets).await
+        self.commit_inner(hypertable_id, op, None, offsets, None)
+            .await
+    }
+
+    /// A compaction REPLACE fenced by the partition lease the worker has held
+    /// since before it opened a Parquet file (plan 41).
+    ///
+    /// The lease row is locked and validated — owner, generation, and unexpired
+    /// by PostgreSQL's clock — inside the same transaction that tombstones the
+    /// inputs, so a zombie that stalled past its TTL cannot commit over the
+    /// successor that took its partition. The lock is held for this short
+    /// catalog transaction only, never across object work: it serializes
+    /// takeover against commit, so a tenancy still valid at this instant is
+    /// allowed to finish and a takeover simply waits and gets the next
+    /// generation.
+    ///
+    /// The fence is *scheduling* ownership, not data integrity. Ingest,
+    /// deletion, and operator actions take no lease, so the optimistic conflict
+    /// check underneath stays the final protection and can still return
+    /// `Conflict` after the fence passes.
+    pub async fn commit_compaction_replace(
+        &self,
+        hypertable_id: HypertableId,
+        lease: &CompactionLease,
+        old: Vec<PartId>,
+        new: Vec<PartMeta>,
+        idempotency_key: Option<&str>,
+    ) -> Result<CommitResult, CatalogError> {
+        self.commit_inner(
+            hypertable_id,
+            CommitOp::Replace { old, new },
+            idempotency_key,
+            &[],
+            Some(lease),
+        )
+        .await
     }
 
     async fn commit_inner(
@@ -37,13 +73,14 @@ impl PostgresCatalog {
         op: CommitOp,
         idempotency_key: Option<&str>,
         offsets: &[OffsetRange],
+        lease: Option<&CompactionLease>,
     ) -> Result<CommitResult, CatalogError> {
         // Time the whole transaction — success, conflict, or offset-race all
         // cost latency (metrics P1). `kind` captured before `op` is moved.
         let kind = op.kind();
         let started = std::time::Instant::now();
         let result = self
-            .commit_txn(hypertable_id, op, idempotency_key, offsets)
+            .commit_txn(hypertable_id, op, idempotency_key, offsets, lease)
             .await;
         metrics::histogram!("catalog_commit_duration_seconds", "kind" => kind)
             .record(started.elapsed().as_secs_f64());
@@ -56,8 +93,25 @@ impl PostgresCatalog {
         op: CommitOp,
         idempotency_key: Option<&str>,
         offsets: &[OffsetRange],
+        lease: Option<&CompactionLease>,
     ) -> Result<CommitResult, CatalogError> {
         let mut tx = self.pool.begin().await?;
+
+        if let Some(lease) = lease {
+            // Ordering, deliberately: a replay of an operation that already
+            // landed is *reconciled* before a lost lease is called a failure.
+            // A worker whose commit acknowledgement was lost must learn that
+            // its work is durable, not be told it lost the race and redo it.
+            // Today only an explicit idempotency key reaches this; HA phase 2's
+            // canonical compactor operation identities splice in here, and this
+            // is the ordering they inherit.
+            if let Some(key) = idempotency_key
+                && let Some(existing) = existing_commit(&mut tx, hypertable_id, key).await?
+            {
+                return Ok(CommitResult::AlreadyApplied(existing));
+            }
+            fence_lease(&mut tx, hypertable_id, lease, &op).await?;
+        }
 
         let inserted: Option<i64> = sqlx::query_scalar(
             "INSERT INTO commits (hypertable_id, kind, idempotency_key)
@@ -132,6 +186,92 @@ impl PostgresCatalog {
         tx.commit().await?;
         Ok(CommitResult::Committed(commit_id))
     }
+}
+
+/// The commit already recorded under this idempotency key, if any.
+async fn existing_commit(
+    tx: &mut Transaction<'_, Postgres>,
+    hypertable_id: HypertableId,
+    key: &str,
+) -> Result<Option<CommitId>, CatalogError> {
+    let id: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM commits WHERE hypertable_id = $1 AND idempotency_key = $2",
+    )
+    .bind(hypertable_id.0)
+    .bind(key)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(id.map(CommitId))
+}
+
+/// Locks the lease row and proves this worker still owns the partition it is
+/// about to rewrite, then proves the rewrite stays inside that partition.
+/// Everything the caller passed is checked against the database, not trusted:
+/// the `CompactionLease` value is a token, not an authority.
+async fn fence_lease(
+    tx: &mut Transaction<'_, Postgres>,
+    hypertable_id: HypertableId,
+    lease: &CompactionLease,
+    op: &CommitOp,
+) -> Result<(), CatalogError> {
+    let partition = &lease.partition_values;
+    if hypertable_id != lease.hypertable_id {
+        return Err(CatalogError::LeasePartitionMismatch {
+            partition: partition.to_string(),
+        });
+    }
+
+    // FOR UPDATE: a concurrent takeover blocks here until this transaction
+    // ends, then reads the post-commit truth. No object work happens under it.
+    let held: Option<(uuid::Uuid, i64, bool)> = sqlx::query_as(
+        "SELECT owner_id, generation, expires_at > clock_timestamp()
+         FROM compaction_leases
+         WHERE hypertable_id = $1 AND partition_values = $2
+         FOR UPDATE",
+    )
+    .bind(hypertable_id.0)
+    .bind(partition)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    let ours = held.is_some_and(|(owner, generation, unexpired)| {
+        owner == lease.owner_id && generation == lease.generation && unexpired
+    });
+    if !ours {
+        return Err(CatalogError::LeaseLost {
+            partition: partition.to_string(),
+        });
+    }
+
+    // A lease on partition A must not license a rewrite of partition B: without
+    // this, one caller bug would turn the fence into a rubber stamp for parts
+    // nobody claimed.
+    let CommitOp::Replace { old, new } = op else {
+        return Err(CatalogError::LeasePartitionMismatch {
+            partition: partition.to_string(),
+        });
+    };
+    if new.iter().any(|p| &p.partition_values != partition) {
+        return Err(CatalogError::LeasePartitionMismatch {
+            partition: partition.to_string(),
+        });
+    }
+    let ids: Vec<i64> = old.iter().map(|p| p.0).collect();
+    let inside: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM parts
+         WHERE id = ANY($1) AND hypertable_id = $2 AND partition_values = $3",
+    )
+    .bind(&ids)
+    .bind(hypertable_id.0)
+    .bind(partition)
+    .fetch_one(&mut **tx)
+    .await?;
+    if inside != ids.len() as i64 {
+        return Err(CatalogError::LeasePartitionMismatch {
+            partition: partition.to_string(),
+        });
+    }
+    Ok(())
 }
 
 async fn insert_parts(
