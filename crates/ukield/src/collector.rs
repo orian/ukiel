@@ -307,6 +307,53 @@ mod tests {
         assert_eq!(dir_bytes(&dir).unwrap(), 0);
     }
 
+    /// Plan 42: a catalog the collector cannot reach must not take anything down.
+    /// Monitoring is not the data plane — a metrics outage that degraded roles or
+    /// killed the process would turn a scrape problem into a customer problem.
+    #[tokio::test]
+    async fn an_unreachable_catalog_never_stops_the_collector() {
+        let catalog = ukiel_catalog::PostgresCatalog::connect_lazy_with_config(
+            "postgres://u:p@127.0.0.1:1/db",
+            &ukiel_catalog::CatalogPoolConfig {
+                acquire_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let collector = Collector {
+            catalog,
+            interval: Duration::from_millis(10),
+            cache_walk_every: 0,
+            l0_fanout: 4,
+            fanout: 10,
+            finalize_after_secs: 3600.0,
+            cache_dir: String::new(),
+            routes: vec![],
+            kafka: None,
+        };
+
+        // Several failed ticks in a row: each one logs and counts, none of them
+        // propagates. The loop is still alive at the end, which is the assertion.
+        for n in 0..3 {
+            collector.tick(n).await;
+        }
+
+        // And it keeps ticking until it is cancelled — not until the database
+        // comes back.
+        let token = CancellationToken::new();
+        let handle = tokio::spawn({
+            let token = token.clone();
+            async move { collector.run(token).await }
+        });
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            !handle.is_finished(),
+            "a failing family must not end the collector"
+        );
+        token.cancel();
+        assert_eq!(handle.await.unwrap().unwrap(), "collector");
+    }
+
     #[tokio::test]
     async fn family_errors_are_isolated() {
         let ran = Arc::new(AtomicUsize::new(0));

@@ -89,49 +89,76 @@ impl Gc {
     }
 
     /// Deletes objects of safely-reapable tombstoned parts, then stamps them
-    /// purged. Delete-then-stamp order: a crash in between re-deletes on the
-    /// next pass, and a missing object counts as already deleted.
+    /// purged — **one authorized candidate at a time** (plan 42).
+    ///
+    /// Each iteration re-asks the catalog for the next candidate, so a catalog
+    /// that dies mid-pass stops the pass. It cannot authorize the deletion of a
+    /// second object from a list nothing can still vouch for: after a failover
+    /// the new primary may not even hold the commit that tombstoned these parts,
+    /// and then "safe to delete" would describe objects that are still live.
+    /// Delayed reclamation is cheap; deleting referenced data is not (HA7).
+    ///
+    /// Delete-then-stamp order is unchanged: a crash in between re-deletes next
+    /// pass, and a missing object counts as already deleted.
     async fn reap(&self, hypertable: &Hypertable, stats: &mut GcStats) -> Result<(), GcError> {
-        let parts = self
-            .catalog
-            .reapable_parts(hypertable.id, self.config.tombstone_grace_secs)
-            .await?;
-        if parts.is_empty() {
-            return Ok(());
-        }
-        for part in &parts {
+        loop {
+            let next = self
+                .catalog
+                .next_reapable_part(hypertable.id, self.config.tombstone_grace_secs)
+                .await
+                .inspect_err(|_| {
+                    metrics::counter!("gc_destructive_pass_aborted_total", "phase" => "reap")
+                        .increment(1);
+                })?;
+            let Some(part) = next else { return Ok(()) };
+
             match self.store.delete(&Path::from(part.meta.path.clone())).await {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
                 Err(e) => return Err(e.into()),
             }
+            // If this stamp fails, the object is already gone and the row is not
+            // marked — the next recovered pass sees the same candidate, gets
+            // `NotFound` from the store (idempotent), and stamps it then.
+            self.catalog
+                .mark_purged(&[part.id])
+                .await
+                .inspect_err(|_| {
+                    metrics::counter!("gc_destructive_pass_aborted_total", "phase" => "reap")
+                        .increment(1);
+                })?;
+            stats.reaped_parts += 1;
         }
-        self.catalog
-            .mark_purged(&parts.iter().map(|p| p.id).collect::<Vec<_>>())
-            .await?;
-        stats.reaped_parts += parts.len();
-        Ok(())
     }
 
     /// Deletes objects for orphaned upload-intents past the grace, then clears
-    /// their intent rows. No object-store listing — orphans are a catalog query
+    /// their intent rows — one authorized candidate at a time, for the same
+    /// reason as `reap`. No object-store listing: orphans are a catalog query
     /// (see `reconcile` for the listing-based backstop).
     async fn sweep(&self, hypertable: &Hypertable, stats: &mut GcStats) -> Result<(), GcError> {
-        let orphans = self
-            .catalog
-            .orphaned_pending_objects(hypertable.id, self.config.orphan_grace_secs as f64)
-            .await?;
-        if orphans.is_empty() {
-            return Ok(());
-        }
-        for path in &orphans {
+        loop {
+            let next = self
+                .catalog
+                .next_orphaned_pending_object(hypertable.id, self.config.orphan_grace_secs as f64)
+                .await
+                .inspect_err(|_| {
+                    metrics::counter!("gc_destructive_pass_aborted_total", "phase" => "sweep")
+                        .increment(1);
+                })?;
+            let Some(path) = next else { return Ok(()) };
+
             match self.store.delete(&Path::from(path.clone())).await {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
                 Err(e) => return Err(e.into()),
             }
+            self.catalog
+                .clear_pending_objects(std::slice::from_ref(&path))
+                .await
+                .inspect_err(|_| {
+                    metrics::counter!("gc_destructive_pass_aborted_total", "phase" => "sweep")
+                        .increment(1);
+                })?;
+            stats.swept_orphans += 1;
         }
-        self.catalog.clear_pending_objects(&orphans).await?;
-        stats.swept_orphans += orphans.len();
-        Ok(())
     }
 
     /// Defense-in-depth: lists objects under each hypertable's prefix and
@@ -153,17 +180,33 @@ impl Gc {
             let prefix = Path::from(format!("ht/{}", hypertable.id));
             let objects: Vec<_> = self.store.list(Some(&prefix)).try_collect().await?;
             let now = chrono::Utc::now();
+            let mut deleted_any = false;
             for meta in objects {
                 if known.contains(meta.location.as_ref()) {
                     continue;
                 }
-                if (now - meta.last_modified).num_seconds() >= self.config.orphan_grace_secs {
-                    match self.store.delete(&meta.location).await {
-                        Ok(()) | Err(object_store::Error::NotFound { .. }) => {
-                            stats.reconciled_orphans += 1;
-                        }
-                        Err(e) => return Err(e.into()),
+                if (now - meta.last_modified).num_seconds() < self.config.orphan_grace_secs {
+                    continue;
+                }
+                // The known-set was derived from the catalog before this listing.
+                // Before every *subsequent* deletion, re-confirm the catalog is
+                // still there: if it is not, that set may no longer describe the
+                // truth, and this loop would keep deleting objects on its word.
+                // Aborting costs a delayed sweep; continuing could cost data.
+                if deleted_any {
+                    self.catalog.ping().await.inspect_err(|_| {
+                        metrics::counter!(
+                            "gc_destructive_pass_aborted_total", "phase" => "reconcile"
+                        )
+                        .increment(1);
+                    })?;
+                }
+                match self.store.delete(&meta.location).await {
+                    Ok(()) | Err(object_store::Error::NotFound { .. }) => {
+                        stats.reconciled_orphans += 1;
+                        deleted_any = true;
                     }
+                    Err(e) => return Err(e.into()),
                 }
             }
         }

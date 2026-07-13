@@ -4934,6 +4934,8 @@ dependencies = [
 name = "ukiel-gc"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
+ "async-trait",
  "chrono",
  "futures",
  "metrics",

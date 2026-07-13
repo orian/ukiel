@@ -16,5 +16,8 @@ tracing = { workspace = true }
 metrics = { workspace = true }
 
 [dev-dependencies]
+async-stream = "0.3"
+futures = { workspace = true }
+async-trait = { workspace = true }
 serde_json = { workspace = true }
 testcontainers-modules = { workspace = true }
