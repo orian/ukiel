@@ -20,6 +20,7 @@
 use std::process::ExitCode;
 
 mod bluesky;
+mod catalog;
 mod clickbench;
 mod clickhouse;
 mod hits;
@@ -46,6 +47,8 @@ USAGE:
     bench bluesky produce --files N [--topic T] [--wave-files W]
     bench bluesky run --files N [--wave-files W] [--flush-ms MS] [--label LABEL]
     bench bluesky jsonbench [--iters N] [--label LABEL]     official JSONBench 5 queries
+    bench catalog demand [--scenario steady|dashboard-surge|backfill]
+    bench catalog seed --label L [--tables N] [--parts N] [--state S] [--packing-keys N]
     bench clickhouse load --table official|cb [--files N]   ClickHouse reference fixtures
     bench clickhouse run --table official|cb|parquet [--iters N] [--label LABEL]
 
@@ -134,6 +137,26 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
         }
         (Some("hits"), Some("fanout")) => hits::fanout().await,
         (Some("hits"), sub) => anyhow::bail!("unknown `hits` subcommand {sub:?}\n\n{USAGE}"),
+        (Some("catalog"), Some("demand")) => {
+            catalog::demand(opt_str(args, "--scenario").unwrap_or("steady")).await
+        }
+        (Some("catalog"), Some("seed")) => {
+            catalog::seed(
+                opt_str(args, "--label").unwrap_or("default"),
+                opt_usize(args, "--tables")?.unwrap_or(8) as u32,
+                opt_usize(args, "--parts")?.unwrap_or(1_000_000) as i64,
+                catalog::State::parse(opt_str(args, "--state").unwrap_or("mature"))?,
+                opt_usize(args, "--packing-keys")?.unwrap_or(1_000_000) as u64,
+                opt_str(args, "--dedicated-frac")
+                    .unwrap_or("0.2")
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--dedicated-frac must be a float"))?,
+            )
+            .await
+        }
+        (Some("catalog"), sub) => {
+            anyhow::bail!("unknown `catalog` subcommand {sub:?}\n\n{USAGE}")
+        }
         (Some("bluesky"), Some("produce")) => {
             let files = opt_usize(args, "--files")?
                 .ok_or_else(|| anyhow::anyhow!("bluesky produce needs --files N"))?;

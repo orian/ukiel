@@ -34,6 +34,11 @@ serde = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 anyhow = { workspace = true }
+# Plan 40: the catalog bench seeds real plan-16 column_stats (roaring bitmaps,
+# base64) so JSONB/TOAST width is honest rather than understated.
+roaring = { workspace = true }
+base64 = { workspace = true }
+sqlx = { workspace = true }
 flate2 = "1"
 
 [[bin]]

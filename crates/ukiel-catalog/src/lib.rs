@@ -23,9 +23,27 @@ pub struct PostgresCatalog {
 }
 
 impl PostgresCatalog {
+    /// The per-process pool size. **Per process, not per fleet** — a deployment
+    /// with N ukield processes opens N × this many connections to the one
+    /// primary, which is the number `max_connections` actually has to survive.
+    /// A single big pool is not equivalent to many small ones, and conflating
+    /// them is how a pool knob makes a system worse (roadmap row 40).
+    pub const DEFAULT_POOL_SIZE: u32 = 16;
+
     pub async fn connect(url: &str) -> Result<Self, CatalogError> {
+        Self::connect_with_pool_size(url, Self::DEFAULT_POOL_SIZE).await
+    }
+
+    /// `connect` with an explicit pool size. Exists so the catalog bench can
+    /// model **process-equivalent topologies** (several `PostgresCatalog`
+    /// instances, each its own pool) instead of pretending one large pool is a
+    /// fleet.
+    pub async fn connect_with_pool_size(
+        url: &str,
+        max_connections: u32,
+    ) -> Result<Self, CatalogError> {
         let pool = PgPoolOptions::new()
-            .max_connections(16)
+            .max_connections(max_connections)
             .connect(url)
             .await?;
         Ok(Self { pool })
