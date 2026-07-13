@@ -2094,3 +2094,58 @@ async fn the_same_owner_is_fenced_by_generation_alone() {
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].meta.path, "fresh.parquet");
 }
+
+#[tokio::test]
+async fn a_lazy_pool_starts_without_a_database_and_fails_classifiably() {
+    // Plan 42: ukield must be able to start, bind its listeners and answer
+    // liveness while the writer is still being promoted. So building the pool
+    // must not touch the database...
+    let cfg = ukiel_catalog::CatalogPoolConfig {
+        acquire_timeout: Duration::from_millis(250),
+        ..Default::default()
+    };
+    // Port 1 is reserved and nothing listens there.
+    let catalog = ukiel_catalog::PostgresCatalog::connect_lazy_with_config(
+        "postgres://u:p@127.0.0.1:1/db",
+        &cfg,
+    )
+    .expect("a lazy pool is built, not connected");
+
+    // ...and the failure must arrive at the call site, classified as transport,
+    // so the recovery supervisor can tell "come back later" from "you are wrong".
+    let err = catalog.ping().await.unwrap_err();
+    assert!(
+        err.is_recoverable_transport(),
+        "an unreachable database must be recoverable transport, got {:?}",
+        err.class()
+    );
+}
+
+#[tokio::test]
+async fn a_lazy_pool_reaches_a_database_that_appears_later() {
+    // The point of lazy: the pool outlives the outage. It is built before the
+    // database is usable and still reaches it afterwards — no new process, no
+    // reconstructed pool.
+    let (_pg, _seeded, url) = common::setup_with_url().await;
+    let catalog = ukiel_catalog::PostgresCatalog::connect_lazy_with_config(
+        &url,
+        &ukiel_catalog::CatalogPoolConfig::default(),
+    )
+    .unwrap();
+    catalog.ping().await.expect("first use connects");
+}
+
+#[tokio::test]
+async fn an_invalid_url_is_a_permanent_error_at_build_time() {
+    let built = ukiel_catalog::PostgresCatalog::connect_lazy_with_config(
+        "not-a-postgres-url",
+        &ukiel_catalog::CatalogPoolConfig::default(),
+    );
+    match built {
+        Ok(_) => panic!("a malformed URL must not build a pool"),
+        Err(e) => assert!(
+            !e.is_recoverable_transport(),
+            "a malformed URL will not fix itself: {e:?}"
+        ),
+    }
+}

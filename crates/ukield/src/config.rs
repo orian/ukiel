@@ -2,6 +2,8 @@
 //! reference. Secrets can be overridden by env vars (UKIELD_CATALOG_URL,
 //! UKIELD_S3_ACCESS_KEY_ID, UKIELD_S3_SECRET_ACCESS_KEY).
 
+use std::time::Duration;
+
 use serde::Deserialize;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -44,9 +46,76 @@ fn default_roles() -> Vec<Role> {
     vec![Role::Ingest, Role::Query, Role::Compactor, Role::Gc]
 }
 
+/// Catalog connection, pool lifecycle, and recovery policy (plan 42).
+///
+/// The pool defaults preserve today's capacity. What is new is the *recovery*
+/// half: a managed writer failover must degrade this process, not crash-loop the
+/// fleet, so the pool is built lazily, acquire failures time out promptly enough
+/// to be classified, and retries are bounded and jittered.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
 pub struct CatalogConfig {
     pub url: String,
+    /// Per **process**, not per fleet: N processes open N × this many
+    /// connections to the one primary, and `max_connections` has to survive the
+    /// product (roadmap row 40's first wall). No single process can validate
+    /// that budget; it is a deployment invariant.
+    pub max_connections: u32,
+    pub min_connections: u32,
+    /// How long a caller waits for a connection before the pool gives up. Short
+    /// on purpose: it is what turns "the database is gone" into a prompt,
+    /// classifiable failure instead of a request hanging until its own deadline.
+    pub acquire_timeout_ms: u64,
+    pub idle_timeout_secs: u64,
+    pub max_lifetime_secs: u64,
+    /// Check a connection before handing it out. After a failover the pool holds
+    /// connections to a primary that no longer exists; without this they are
+    /// dealt to callers and fail one request each.
+    pub test_before_acquire: bool,
+    /// Recovery backoff: first delay, ceiling, and the ± fraction of jitter.
+    /// Jitter is not decoration — a fleet that retries in lockstep is a
+    /// thundering herd against a writer that has just come back.
+    pub retry_base_ms: u64,
+    pub retry_max_ms: u64,
+    pub retry_jitter_ratio: f64,
+    pub recovery_probe_timeout_ms: u64,
+    /// How long a query may spend trying to obtain an authoritative plan before
+    /// it is refused. Exceeded → 503 + `Retry-After`, never a stale plan.
+    pub query_admission_timeout_ms: u64,
+    pub retry_after_secs: u64,
+}
+
+impl Default for CatalogConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            max_connections: ukiel_catalog::PostgresCatalog::DEFAULT_POOL_SIZE,
+            min_connections: 0,
+            acquire_timeout_ms: 2_000,
+            idle_timeout_secs: 600,
+            max_lifetime_secs: 1_800,
+            test_before_acquire: true,
+            retry_base_ms: 100,
+            retry_max_ms: 5_000,
+            retry_jitter_ratio: 0.20,
+            recovery_probe_timeout_ms: 2_000,
+            query_admission_timeout_ms: 1_000,
+            retry_after_secs: 1,
+        }
+    }
+}
+
+impl CatalogConfig {
+    pub fn pool_config(&self) -> ukiel_catalog::CatalogPoolConfig {
+        ukiel_catalog::CatalogPoolConfig {
+            max_connections: self.max_connections,
+            min_connections: self.min_connections,
+            acquire_timeout: Duration::from_millis(self.acquire_timeout_ms),
+            idle_timeout: Some(Duration::from_secs(self.idle_timeout_secs)),
+            max_lifetime: Some(Duration::from_secs(self.max_lifetime_secs)),
+            test_before_acquire: self.test_before_acquire,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -150,6 +219,51 @@ pub fn validate(cfg: &UkieldConfig) -> anyhow::Result<()> {
         anyhow::bail!(
             "compactor.candidate_limit ({}) must be > 0",
             cfg.compactor.candidate_limit
+        );
+    }
+    validate_catalog(&cfg.catalog)?;
+    Ok(())
+}
+
+fn validate_catalog(cat: &CatalogConfig) -> anyhow::Result<()> {
+    if cat.url.is_empty() {
+        anyhow::bail!("catalog.url is required (or set UKIELD_CATALOG_URL)");
+    }
+    if cat.max_connections == 0 {
+        anyhow::bail!("catalog.max_connections must be > 0");
+    }
+    if cat.min_connections > cat.max_connections {
+        anyhow::bail!(
+            "catalog.min_connections ({}) must be <= max_connections ({})",
+            cat.min_connections,
+            cat.max_connections
+        );
+    }
+    for (name, value) in [
+        ("acquire_timeout_ms", cat.acquire_timeout_ms),
+        ("retry_base_ms", cat.retry_base_ms),
+        ("retry_max_ms", cat.retry_max_ms),
+        ("recovery_probe_timeout_ms", cat.recovery_probe_timeout_ms),
+        ("query_admission_timeout_ms", cat.query_admission_timeout_ms),
+    ] {
+        if value == 0 {
+            anyhow::bail!("catalog.{name} must be > 0");
+        }
+    }
+    if cat.retry_base_ms > cat.retry_max_ms {
+        anyhow::bail!(
+            "catalog.retry_base_ms ({}) must be <= retry_max_ms ({})",
+            cat.retry_base_ms,
+            cat.retry_max_ms
+        );
+    }
+    // Jitter above 1.0 could produce a negative delay; below 0 is meaningless.
+    // Zero is allowed but discouraged: a fleet retrying in lockstep is a
+    // thundering herd against a writer that has only just come back.
+    if !(0.0..=1.0).contains(&cat.retry_jitter_ratio) {
+        anyhow::bail!(
+            "catalog.retry_jitter_ratio ({}) must be within [0, 1]",
+            cat.retry_jitter_ratio
         );
     }
     Ok(())
@@ -521,6 +635,64 @@ mod tests {
             let cfg: UkieldConfig = toml::from_str(&raw).unwrap();
             assert!(validate(&cfg).is_err(), "{section} must be rejected");
         }
+    }
+
+    #[test]
+    fn catalog_pool_and_recovery_defaults() {
+        let cfg: UkieldConfig = toml::from_str(EXAMPLE).unwrap();
+        let c = &cfg.catalog;
+        assert_eq!(c.max_connections, 16);
+        assert_eq!(c.min_connections, 0);
+        assert_eq!(c.acquire_timeout_ms, 2_000);
+        assert!(
+            c.test_before_acquire,
+            "a failover leaves dead connections in the pool"
+        );
+        assert_eq!(c.retry_base_ms, 100);
+        assert_eq!(c.retry_max_ms, 5_000);
+        assert_eq!(c.retry_jitter_ratio, 0.20);
+        assert_eq!(c.query_admission_timeout_ms, 1_000);
+        assert_eq!(c.retry_after_secs, 1);
+        validate(&cfg).unwrap();
+
+        let pool = c.pool_config();
+        assert_eq!(pool.max_connections, 16);
+        assert_eq!(pool.acquire_timeout, Duration::from_millis(2_000));
+        assert_eq!(pool.max_lifetime, Some(Duration::from_secs(1_800)));
+    }
+
+    #[test]
+    fn invalid_catalog_settings_are_refused() {
+        let bad = [
+            ("min_connections = 32", "min > max"),
+            ("max_connections = 0", "zero pool"),
+            ("acquire_timeout_ms = 0", "zero acquire timeout"),
+            ("retry_base_ms = 9000", "base > max"),
+            ("retry_jitter_ratio = 1.5", "jitter out of range"),
+            ("retry_jitter_ratio = -0.1", "negative jitter"),
+            ("query_admission_timeout_ms = 0", "zero admission budget"),
+        ];
+        for (line, why) in bad {
+            let raw = EXAMPLE.replace(
+                "[catalog]\n        url =",
+                &format!("[catalog]\n        {line}\n        url ="),
+            );
+            let cfg: UkieldConfig = toml::from_str(&raw).unwrap();
+            assert!(validate(&cfg).is_err(), "{why} must be refused");
+        }
+    }
+
+    #[test]
+    fn a_missing_catalog_url_is_refused_rather_than_defaulted() {
+        // The URL has no sane default: silently connecting to localhost is how a
+        // staging process quietly writes to the wrong catalog.
+        let raw = EXAMPLE.replace(
+            r#"url = "postgres://postgres:postgres@127.0.0.1:5432/postgres""#,
+            "",
+        );
+        let cfg: UkieldConfig = toml::from_str(&raw).unwrap();
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("catalog.url"), "{err}");
     }
 
     #[test]

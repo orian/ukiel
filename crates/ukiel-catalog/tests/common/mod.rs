@@ -6,6 +6,13 @@ use ukiel_catalog::PostgresCatalog;
 /// Starts a throwaway Postgres and returns a migrated catalog.
 /// Keep the returned container binding alive for the whole test.
 pub async fn setup() -> (ContainerAsync<Postgres>, PostgresCatalog) {
+    let (pg, catalog, _url) = setup_with_url().await;
+    (pg, catalog)
+}
+
+/// `setup`, also handing back the connection URL — for tests that build a
+/// second, independently configured pool against the same database.
+pub async fn setup_with_url() -> (ContainerAsync<Postgres>, PostgresCatalog, String) {
     let container = Postgres::default()
         .start()
         .await
@@ -17,5 +24,5 @@ pub async fn setup() -> (ContainerAsync<Postgres>, PostgresCatalog) {
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let catalog = PostgresCatalog::connect(&url).await.expect("connect");
     catalog.migrate().await.expect("migrate");
-    (container, catalog)
+    (container, catalog, url)
 }

@@ -84,6 +84,23 @@ impl PostgresCatalog {
             .await;
         metrics::histogram!("catalog_commit_duration_seconds", "kind" => kind)
             .record(started.elapsed().as_secs_f64());
+
+        // Plan 42: outcomes carry their *class*, so an operator can tell a
+        // partition being handed off (ownership) from a primary going away
+        // (transport) without reading log text. A transport failure here is the
+        // one that matters most: the commit's outcome is unknown, not "no".
+        let error_class = match &result {
+            Ok(_) => "none",
+            Err(e) => e.class().as_label(),
+        };
+        let outcome = if result.is_ok() { "ok" } else { "error" };
+        metrics::counter!(
+            "catalog_operation_total",
+            "operation" => kind,
+            "outcome" => outcome,
+            "error_class" => error_class,
+        )
+        .increment(1);
         result
     }
 

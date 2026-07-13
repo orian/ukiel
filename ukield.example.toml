@@ -8,6 +8,31 @@ roles = ["ingest", "query", "compactor", "gc"]
 [catalog]
 url = "postgres://postgres:postgres@127.0.0.1:5432/postgres"
 
+# Pool lifecycle. max_connections is PER PROCESS: a fleet of N processes needs
+# N x this many backends on the one primary, and that product — not this number —
+# is what `max_connections` on the server has to survive (roadmap row 40 found it
+# is the first wall the system hits, long before any throughput limit).
+max_connections = 16
+min_connections = 0
+acquire_timeout_ms = 2000  # short: turns "the database is gone" into a prompt,
+                           # classifiable failure instead of a hung request
+idle_timeout_secs = 600
+max_lifetime_secs = 1800   # so the pool eventually stops holding connections to
+                           # a primary that has been replaced
+test_before_acquire = true # after a failover the pool holds dead connections;
+                           # without this they are dealt out and fail one request each
+
+# Recovery (plan 42): a transient catalog outage degrades this process, it does
+# not crash-loop the fleet. Retries are bounded, capped and jittered — a fleet
+# retrying in lockstep is a thundering herd against a writer that just came back.
+retry_base_ms = 100
+retry_max_ms = 5000
+retry_jitter_ratio = 0.20      # +/- fraction applied to each delay
+recovery_probe_timeout_ms = 2000
+query_admission_timeout_ms = 1000  # budget to obtain an AUTHORITATIVE plan;
+                                   # exceeded -> 503 + Retry-After, never a stale plan
+retry_after_secs = 1
+
 [object_store]
 kind = "s3" # or "memory" for a throwaway in-process store (no MinIO needed)
 endpoint = "http://127.0.0.1:19000"
