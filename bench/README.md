@@ -1237,6 +1237,52 @@ spread. The median/light scenarios move ±10–18%, but those run in **2–10 ms
 where the **measured same-config spread is up to 22%** — so that movement is
 noise, not signal, and it is reported as noise rather than dressed up either way.
 
+### PRODUCTION POSTURE — cached MinIO with plans 37 + 39, 2026-07-13
+
+SHA `5bf3fd5`. **Object storage (MinIO over HTTP) + the plan-15 local cache tier**
+(`UKIEL_E2E_CACHE_DIR=/dev/shm/ukiel-cache`, tmpfs — the upper bound of the tier,
+7.5 GB resident). `hits_cb`, 100 files, 99,997,497 rows, 1,102 parts. This is the
+shape a real deployment runs in, so it is the number that actually matters.
+
+| 41 in-scope queries (q01/q07 are row 35's) | total | vs raw | median per-query |
+|---|---|---|---|
+| raw DataFusion, **local files**, no ukiel | 27.7 s | 1.00× | 1.00× |
+| ukiel, local store (plan 39) | 27.4 s | 0.99× | 0.98× |
+| **ukiel, MinIO + cache tier** | **28.4 s** | **1.03×** | **1.03×** |
+| ukiel, MinIO, **no** cache | 38.5 s | 1.39× | 1.47× |
+| *— before plans 37/39 —* | | | |
+| ukiel, MinIO + cache tier | 39.4 s | 1.42× | 1.11× |
+| ukiel, MinIO, no cache (plan 32 headline) | 53.2 s | 1.92× | 2.00× |
+
+All 43 queries including q01/q07: **28.6 s vs raw's 27.7 s = 1.03×**. Every answer
+identical to raw. Reproduced across two runs (28.4 / 28.6 s).
+
+**The production posture is now within 3% of bare DataFusion reading local
+parquet** — with an object store, a Postgres catalog, per-part planning, tenant
+isolation machinery and two cache layers in the path.
+
+Three separate things got it there, and they are worth keeping distinct:
+
+- **Plans 37 + 39 alone: 39.4 s → 28.4 s (−28%)** on this exact posture. Those
+  were the two *systematic* stack overheads — a doubly-evaluated scan predicate,
+  and a string representation that opted out of the engine's default.
+- **The cache tier: 38.5 s → 28.4 s (−26%)** post-37/39. It recovers essentially
+  all of the object-store transport; what it leaves behind is 1.04× of the pure
+  local-store number — the cache's own cost, and it is small.
+- **The catalog earns its keep where the product lives.** Key-filtered queries are
+  *far* cheaper than the bare engine: q43 **0.17×**, q42 0.21×, q41 0.22×, q38
+  0.24×. Ukiel beats raw-on-local-files outright on **11 of the 41** even while
+  paying for object storage.
+
+What still costs: q24 1.62× (`SELECT *` TopK), q02 1.34×, q25 1.19×. Those are the
+honest remainder — no longer a systematic tax, just per-query shape.
+
+> **Caveat, stated plainly.** The cache is on **tmpfs**, so this is the tier's
+> *upper bound*, not an NVMe number — memory-backed, no device latency. It is the
+> right measurement for pricing what the transport layer costs the stack, and the
+> wrong one to quote as a disk-cache benchmark. A cold cache pays full MinIO
+> price: that is the 38.5 s row.
+
 ### 100M / 1B tiers — optional / stretch
 
 100M Bluesky is a documented long run; 1B needs `--wave-files` and hours.
