@@ -144,6 +144,52 @@ pub fn validate_table_schema(v: &serde_json::Value) -> Result<(), ExprError> {
 
 #[cfg(test)]
 mod tests {
+    /// Plan 39: the query path reads strings as `Utf8View`, so an alias
+    /// expression is compiled against a view-typed schema. It must evaluate to
+    /// the right values *and* to the declared target representation — a
+    /// projection that produced `Utf8` where the query schema says `Utf8View`
+    /// is a schema mismatch, not a slow path.
+    #[test]
+    fn alias_over_view_typed_strings_matches_the_declared_representation() {
+        use arrow::array::StringViewArray;
+        use arrow::datatypes::Field;
+
+        let schema = Schema::new(vec![
+            Field::new("url", DataType::Utf8View, true),
+            Field::new("n", DataType::Int64, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(StringViewArray::from(vec![
+                    Some("https://example.com/a"),
+                    None,
+                ])),
+                Arc::new(arrow::array::Int64Array::from(vec![Some(1), Some(2)])),
+            ],
+        )
+        .unwrap();
+
+        // A string-returning alias, declared (as the view-typed query schema
+        // declares it) as Utf8View.
+        let compiled = compile("upper(url)", &schema, &DataType::Utf8View).unwrap();
+        let out = evaluate(&compiled, &batch).unwrap();
+        assert_eq!(
+            out.data_type(),
+            &DataType::Utf8View,
+            "the alias must produce the representation the query schema declares"
+        );
+        let views = out.as_any().downcast_ref::<StringViewArray>().unwrap();
+        assert_eq!(views.value(0), "HTTPS://EXAMPLE.COM/A");
+        assert!(arrow::array::Array::is_null(views, 1));
+
+        // The same expression declared as owned Utf8 still works — the cast is on
+        // the alias output only, which is a single narrow column.
+        let compiled = compile("upper(url)", &schema, &DataType::Utf8).unwrap();
+        let out = evaluate(&compiled, &batch).unwrap();
+        assert_eq!(out.data_type(), &DataType::Utf8);
+    }
+
     use super::*;
     use arrow::array::{Float64Array, Int64Array};
     use serde_json::json;

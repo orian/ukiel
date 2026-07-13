@@ -421,7 +421,15 @@ impl TableProvider for UkielTableProvider {
                 let spec = &self.columns.specs[i];
                 let expr: Arc<dyn PhysicalExpr> = match &spec.kind {
                     ukiel_core::ColumnKind::Alias(sql) => {
-                        let compiled = ukiel_expr::compile(sql, &scanned_schema, &spec.data_type)
+                        // Compile against the **query schema's** declared type,
+                        // not `ColumnKind`'s. They agree on everything except
+                        // string representation: the query path reads `Utf8View`
+                        // (plan 39) while `TableColumns` is the write-side `Utf8`.
+                        // An alias projecting `Utf8` into a `Utf8View`-declared
+                        // field is a schema mismatch, so the target must be the
+                        // field's. `compile` casts to it — one narrow output
+                        // column, never the scan.
+                        let compiled = ukiel_expr::compile(sql, &scanned_schema, field.data_type())
                             .map_err(|e| DataFusionError::External(Box::new(e)))?;
                         compiled.into_physical()
                     }
