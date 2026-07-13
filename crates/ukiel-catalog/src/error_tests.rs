@@ -122,3 +122,22 @@ fn unknown_sqlstates_default_to_permanent() {
         );
     }
 }
+
+#[test]
+fn an_unreachable_database_is_transport_even_when_it_arrives_as_a_migration_error() {
+    // The failure that made this necessary: `run` classified every migration
+    // error as permanent, so a process starting during a writer failover died
+    // instead of waiting — and the restart hit the primary while it was still
+    // being promoted.
+    let err = CatalogError::Migrate(sqlx::migrate::MigrateError::Execute(sqlx::Error::Io(
+        std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused"),
+    )));
+    assert_eq!(err.class(), CatalogErrorClass::Transport);
+    assert!(err.is_recoverable_transport());
+
+    // But a migration that is actually wrong stays permanent: a checksum
+    // mismatch is not fixed by waiting, and retrying it forever hides it.
+    let err = CatalogError::Migrate(sqlx::migrate::MigrateError::VersionMismatch(3));
+    assert_eq!(err.class(), CatalogErrorClass::PermanentDatabase);
+    assert!(!err.is_recoverable_transport());
+}

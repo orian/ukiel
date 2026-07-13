@@ -19,6 +19,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 url = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -32,3 +33,4 @@ libc = "0.2"
 testcontainers-modules = { workspace = true, features = ["kafka"] }
 rdkafka = { workspace = true }
 reqwest = { workspace = true }
+sqlx = { workspace = true }

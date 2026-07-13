@@ -74,7 +74,19 @@ impl CatalogError {
             | CatalogError::LeasePartitionMismatch { .. }
             | CatalogError::InvalidLeaseTtl(_) => CatalogErrorClass::PermanentInput,
             CatalogError::NotFound(_) => CatalogErrorClass::AbsentResource,
-            CatalogError::Migrate(_) => CatalogErrorClass::PermanentDatabase,
+            // A migration that failed because the database was unreachable is a
+            // *transport* failure wearing a migration's coat. Calling it
+            // permanent is how a writer failover during a rolling deploy kills
+            // every starting process — the exact crash loop plan 42 exists to
+            // stop. A genuinely bad migration (checksum, version, bad SQL) stays
+            // permanent, because waiting will not fix it.
+            CatalogError::Migrate(e) => match e {
+                sqlx::migrate::MigrateError::Execute(inner)
+                | sqlx::migrate::MigrateError::ExecuteMigration(inner, _) => {
+                    class_for_db_error(inner)
+                }
+                _ => CatalogErrorClass::PermanentDatabase,
+            },
             CatalogError::Db(e) => class_for_db_error(e),
         }
     }

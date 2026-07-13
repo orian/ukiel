@@ -8,3 +8,4 @@ pub mod health;
 pub mod metrics;
 pub mod recovery;
 pub mod run;
+pub mod supervisor;
