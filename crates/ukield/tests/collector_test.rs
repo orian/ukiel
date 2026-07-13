@@ -84,20 +84,8 @@ async fn collector_gauges_render_on_metrics() {
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
 
-    // Poll /metrics until the collector has ticked and rendered live_parts.
-    let mut body = String::new();
-    for _ in 0..100 {
-        let resp = client.get(format!("{base}/metrics")).send().await.unwrap();
-        assert_eq!(resp.status(), 200);
-        body = resp.text().await.unwrap();
-        if body.contains("catalog_live_parts") {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
     // Families guaranteed by the seeded state + set-every-tick gauges.
-    for family in [
+    const FAMILIES: [&str; 8] = [
         "catalog_live_parts",
         "compactor_backlog_groups",
         "compactor_unfinalized_partitions",
@@ -108,7 +96,23 @@ async fn collector_gauges_render_on_metrics() {
         // (an expired lease nobody is reclaiming).
         "catalog_compaction_leases_active",
         "catalog_compaction_lease_oldest_expired_age_seconds",
-    ] {
+    ];
+
+    // Poll until EVERY family has rendered. Waiting for only the first one races
+    // the collector: the families of a tick are recorded in sequence, so a scrape
+    // can land after `catalog_live_parts` and before `catalog_pending_objects`.
+    let mut body = String::new();
+    for _ in 0..100 {
+        let resp = client.get(format!("{base}/metrics")).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        body = resp.text().await.unwrap();
+        if FAMILIES.iter().all(|f| body.contains(f)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    for family in FAMILIES {
         assert!(
             body.contains(family),
             "missing collector family {family}:\n{body}"

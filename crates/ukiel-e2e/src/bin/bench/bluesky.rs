@@ -373,6 +373,7 @@ pub async fn run(
             hypertable: "bsky".to_string(),
             ts_column: "ts".to_string(),
         }],
+        ready: None,
     };
     let ingest_worker = IngestWorker::new(stack.catalog.clone(), stack.store.clone(), ingest_cfg);
     let ingest_token = CancellationToken::new();

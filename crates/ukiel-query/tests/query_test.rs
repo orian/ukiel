@@ -25,6 +25,8 @@ pub struct Harness {
     pub catalog: PostgresCatalog,
     pub store: Arc<dyn ObjectStore>,
     pub ht: HypertableId,
+    /// So a test can open a second, independently killable pool.
+    pub url: String,
 }
 
 fn events_schema() -> serde_json::Value {
@@ -41,11 +43,8 @@ fn events_schema() -> serde_json::Value {
 pub async fn setup() -> Harness {
     let pg = Postgres::default().start().await.expect("postgres");
     let port = pg.get_host_port_ipv4(5432).await.unwrap();
-    let catalog = PostgresCatalog::connect(&format!(
-        "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
-    ))
-    .await
-    .unwrap();
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+    let catalog = PostgresCatalog::connect(&url).await.unwrap();
     catalog.migrate().await.unwrap();
 
     let ht = catalog
@@ -120,6 +119,7 @@ pub async fn setup() -> Harness {
         catalog,
         store,
         ht,
+        url,
     }
 }
 

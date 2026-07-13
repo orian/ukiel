@@ -25,6 +25,7 @@ chrono = { workspace = true }
 metrics = { workspace = true }
 
 [dev-dependencies]
+tokio-util = { workspace = true }
 ukiel-ingest = { workspace = true }
 # Plan 16: the span test writes its fixture with the real key-aligned writer, so
 # the file and the catalog spans cannot drift apart in the test.

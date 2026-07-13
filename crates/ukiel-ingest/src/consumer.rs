@@ -14,7 +14,9 @@ use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::time::MissedTickBehavior;
+
 use tokio_util::sync::CancellationToken;
 use ukiel_catalog::{OffsetRange, PostgresCatalog};
 use ukiel_core::Hypertable;
@@ -51,12 +53,22 @@ impl IngestWorker {
     /// would keep consuming Kafka and committing after the worker is gone.
     pub async fn run(&self, shutdown: CancellationToken) -> Result<(), IngestError> {
         let mut set = tokio::task::JoinSet::new();
+        // Ingest is ready when EVERY route has positioned itself from the
+        // catalog — not when the first one has. While any route is still
+        // seeking, this worker has not reconciled (plan 42).
+        let gate = self.config.ready.clone().map(|signal| {
+            Arc::new(ReadyGate {
+                remaining: AtomicUsize::new(self.config.tables.len()),
+                signal,
+            })
+        });
         for route in &self.config.tables {
             let task = RouteIngest {
                 catalog: self.catalog.clone(),
                 flusher: Flusher::new(self.catalog.clone(), self.store.clone()),
                 config: self.config.clone(),
                 route: route.clone(),
+                gate: gate.clone(),
             };
             let token = shutdown.clone();
             set.spawn(async move { task.run(token).await });
@@ -68,10 +80,26 @@ impl IngestWorker {
     }
 }
 
+/// Counts routes down to zero, then fires once. A route that dies before
+/// arriving simply never arrives — the role stays unready, which is the truth.
+struct ReadyGate {
+    remaining: AtomicUsize,
+    signal: ukiel_core::ReadySignal,
+}
+
+impl ReadyGate {
+    fn arrive(&self) {
+        if self.remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.signal.fire();
+        }
+    }
+}
+
 struct RouteIngest {
     catalog: PostgresCatalog,
     flusher: Flusher,
     config: IngestConfig,
+    gate: Option<Arc<ReadyGate>>,
     route: TableRoute,
 }
 
@@ -146,7 +174,12 @@ impl RouteIngest {
             &hypertable.packing_key,
             Some(&self.route.ts_column),
         )?;
+        // Offsets reloaded from the catalog and Kafka seeked to them: this route
+        // is now reading from authority, which is what "ready" means.
         let consumer = self.connect(&hypertable).await?;
+        if let Some(gate) = &self.gate {
+            gate.arrive();
+        }
 
         let mut buffers = Buffers::default();
         let mut ticker =
@@ -396,6 +429,7 @@ mod tests {
             max_event_age_days: 3650,
             max_event_future_secs: 3600,
             tables: vec![],
+            ready: None,
         }
     }
 

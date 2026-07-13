@@ -35,6 +35,10 @@ pub struct GcConfig {
     /// Run the listing-based `reconcile` backstop every Nth `run` tick
     /// (0 = never). Reconcile catches objects uploaded without an intent row.
     pub reconcile_every_n_passes: u64,
+    /// Fired after the first pass that successfully read authoritative
+    /// candidates and fences (plan 42). GC is ready when it has re-derived what
+    /// is safe to delete — never on a ping, because a ping authorizes nothing.
+    pub ready: Option<ukiel_core::ReadySignal>,
 }
 
 impl Default for GcConfig {
@@ -44,6 +48,7 @@ impl Default for GcConfig {
             orphan_grace_secs: 3600,
             poll_interval_ms: 60_000,
             reconcile_every_n_passes: 60,
+            ready: None,
         }
     }
 }
@@ -180,6 +185,9 @@ impl Gc {
                 _ = shutdown.cancelled() => return Ok(()),
                 _ = ticker.tick() => {
                     let mut stats = self.run_once().await?;
+                    // A completed pass means candidates and fences were read
+                    // from authority: GC's definition of reconciled (plan 42).
+                    ukiel_core::signal_ready(&self.config.ready);
                     pass += 1;
                     if self.config.reconcile_every_n_passes > 0
                         && pass.is_multiple_of(self.config.reconcile_every_n_passes)

@@ -103,6 +103,7 @@ async fn consumes_flushes_and_resumes_exactly_once() {
             hypertable: "events".into(),
             ts_column: "ts".into(),
         }],
+        ready: None,
     };
 
     let worker = IngestWorker::new(catalog.clone(), store.clone(), config.clone());
@@ -229,6 +230,7 @@ async fn backpressure_defers_flushes_until_pressure_clears() {
             hypertable: "events".into(),
             ts_column: "ts".into(),
         }],
+        ready: None,
     };
 
     let worker = IngestWorker::new(catalog.clone(), store.clone(), config);

@@ -3,6 +3,7 @@
 pub mod commit;
 pub mod ids;
 pub mod part;
+pub mod ready;
 pub mod schema;
 pub mod sorting;
 pub mod stats;
@@ -11,6 +12,7 @@ pub mod table;
 pub use commit::{ChangeEvent, CommitOp, CommitResult};
 pub use ids::{CommitId, HypertableId, LogicalTableId, NamespaceId, PartId};
 pub use part::{ColumnRange, Part, PartMeta};
+pub use ready::{ReadySignal, signal_ready};
 pub use schema::{
     ColumnKind, ColumnSpec, SchemaError, TableColumns, UKIEL_TYPE_META, arrow_schema_from_json,
     ukiel_type_of,

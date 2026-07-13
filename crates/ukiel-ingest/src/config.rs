@@ -28,6 +28,13 @@ pub struct IngestConfig {
     #[serde(default = "default_max_event_future_secs")]
     pub max_event_future_secs: u64,
     pub tables: Vec<TableRoute>,
+    /// Fired once EVERY route has validated its hypertable, reloaded catalog
+    /// offsets and seeked Kafka (plan 42). All of them, not the first: while any
+    /// route is still positioning, the ingest role has not reconciled, and a
+    /// process that claimed otherwise would be advertising a consumer that is
+    /// not yet reading from the right place.
+    #[serde(skip)]
+    pub ready: Option<ukiel_core::ReadySignal>,
 }
 
 /// Guardrail defaults (issue 0009: one source of truth — ukield's

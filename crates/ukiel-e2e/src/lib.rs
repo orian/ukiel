@@ -121,13 +121,13 @@ impl Stack {
             .expect("build producer");
 
         // In-process query server on an ephemeral port.
-        let state = AppState {
-            catalog: catalog.clone(),
-            store: store.clone(),
-            store_url: store_url.clone(),
-            statement_timeout: std::time::Duration::from_secs(300),
-            metadata_cache: Arc::new(ukiel_query::metadata_cache::ParquetMetadataCache::default()),
-        };
+        let state = AppState::with_defaults(
+            catalog.clone(),
+            store.clone(),
+            store_url.clone(),
+            std::time::Duration::from_secs(300),
+            Arc::new(ukiel_query::metadata_cache::ParquetMetadataCache::default()),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -281,6 +281,7 @@ impl Stack {
                 hypertable: table.hypertable_name.clone(),
                 ts_column: table.ts_column.clone(),
             }],
+            ready: None,
         };
         let worker = IngestWorker::new(self.catalog.clone(), self.store.clone(), config);
         let shutdown = CancellationToken::new();
@@ -469,6 +470,7 @@ impl Stack {
             self.catalog.clone(),
             self.store.clone(),
             ukiel_gc::GcConfig {
+                ready: None,
                 tombstone_grace_secs: 0.0,
                 orphan_grace_secs: 0,
                 poll_interval_ms: 1000,

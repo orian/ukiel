@@ -8,6 +8,7 @@ use anyhow::Context;
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use object_store::memory::InMemory;
+use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use ukiel_catalog::PostgresCatalog;
 use ukiel_compactor::compactor::{Compactor, CompactorConfig};
@@ -67,6 +68,14 @@ fn spawn_supervised<E, Build>(
         let _up = WorkerUp::new(label);
         supervisor::supervise_role(role, build, catalog, health, handle, policy, shutdown).await
     });
+}
+
+/// The handshake a worker fires once it has reloaded from catalog authority.
+/// Only then is the role Healthy — never because its future was spawned, and
+/// never because a `SELECT 1` answered (plan 42).
+fn ready_signal(health: &HealthRegistry, role: Role) -> ukiel_core::ReadySignal {
+    let handle = health.role(role);
+    ukiel_core::ReadySignal::new(move || handle.healthy())
 }
 
 pub fn build_store(cfg: &ObjectStoreConfig) -> anyhow::Result<(Arc<dyn ObjectStore>, url::Url)> {
@@ -161,6 +170,19 @@ pub async fn run_with_bound_addr(
             store_url: store_url.clone(),
             statement_timeout: std::time::Duration::from_secs(cfg.query.statement_timeout_secs),
             metadata_cache: metadata_cache.clone(),
+            admission_timeout: std::time::Duration::from_millis(
+                cfg.catalog.query_admission_timeout_ms,
+            ),
+            retry_after_secs: cfg.catalog.retry_after_secs,
+            // Readiness reports what the *roles* say, not merely whether a
+            // `SELECT 1` answered: a role still reconciling has not reloaded its
+            // authoritative state and must not be sent traffic.
+            health: Some({
+                let health = health.clone();
+                Arc::new(move || {
+                    serde_json::to_value(health.snapshot()).unwrap_or_else(|_| json!({}))
+                })
+            }),
         };
         let listener = tokio::net::TcpListener::bind(&cfg.query.listen)
             .await
@@ -268,6 +290,7 @@ pub async fn run_with_bound_addr(
                 max_event_age_days: cfg.ingest.max_event_age_days,
                 max_event_future_secs: cfg.ingest.max_event_future_secs,
                 tables: routes,
+                ready: Some(ready_signal(&health, Role::Ingest)),
             };
             // Rebuilt from scratch on every attempt — a fresh consumer, empty
             // buffers, and offsets reloaded from the catalog. Nothing a dropped
@@ -306,6 +329,7 @@ pub async fn run_with_bound_addr(
             lease_ttl_ms: cfg.compactor.lease_ttl_secs * 1_000,
             lease_renew_interval_ms: cfg.compactor.lease_renew_interval_secs * 1_000,
             owner_id: Some(instance_id),
+            ready: Some(ready_signal(&health, Role::Compactor)),
             ..CompactorConfig::default()
         };
         let (catalog, store, token) = (catalog.clone(), store.clone(), shutdown.clone());
@@ -330,6 +354,7 @@ pub async fn run_with_bound_addr(
             poll_interval_ms: cfg.gc.poll_interval_ms,
             tombstone_grace_secs: cfg.gc.tombstone_grace_secs,
             orphan_grace_secs: cfg.gc.orphan_grace_secs,
+            ready: Some(ready_signal(&health, Role::Gc)),
             ..GcConfig::default()
         };
         let (catalog, store, token) = (catalog.clone(), store.clone(), shutdown.clone());

@@ -69,6 +69,10 @@ pub struct CompactorConfig {
     /// Process-instance identity for leases. `None` = generate one per
     /// `Compactor` (production); tests inject a stable id.
     pub owner_id: Option<uuid::Uuid>,
+    /// Fired after the first pass that successfully read current live state
+    /// (plan 42). *Discovery*, not a ping: this worker is ready when it has
+    /// replanned from authority, not when the database merely answered.
+    pub ready: Option<ukiel_core::ReadySignal>,
 }
 
 impl Default for CompactorConfig {
@@ -86,6 +90,7 @@ impl Default for CompactorConfig {
             lease_ttl_ms: 60_000,
             lease_renew_interval_ms: 20_000,
             owner_id: None,
+            ready: None,
         }
     }
 }
@@ -182,6 +187,9 @@ impl Compactor {
         metrics::counter!("compactor_conflicts_total").increment(stats.conflicts as u64);
         if result.is_ok() {
             metrics::gauge!("compactor_last_success_timestamp").set(unix_secs());
+            // A clean pass means candidates were discovered from current live
+            // state — the compactor's definition of "reconciled" (plan 42).
+            ukiel_core::signal_ready(&self.config.ready);
         }
 
         result.map(|()| stats)
