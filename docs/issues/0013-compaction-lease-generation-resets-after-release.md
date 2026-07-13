@@ -1,7 +1,7 @@
 # 0013 — Compaction lease generations reset after a clean release
 
 - **Severity:** Medium (fencing-invariant hardening; difficult to trigger in the current sequential compactor)
-- **Status:** Open
+- **Status:** Resolved (plan 43, task 1) — migration `0010_compaction_lease_generation_seq.sql` draws every new tenancy's generation from a catalog-wide sequence, so a released token is never reissued
 - **Components:** `crates/ukiel-catalog`, `crates/ukiel-compactor`
 - **Found by:** post-implementation review of plan 41, 2026-07-13
 
@@ -75,6 +75,28 @@ token needs uniqueness and ordering, not density.
 - Expiry takeover and concurrent acquisition retain the one-winner property.
 - Clean release still makes the partition immediately claimable and does not
   create false abandoned-lease age.
+
+## Fix
+
+Migration `0010` creates `compaction_lease_generation_seq`. Every new tenancy —
+a fresh row, or the takeover of an expired or released one — draws `nextval`; an
+idempotent reacquisition by the same *unexpired* owner keeps its generation, so
+an in-flight merge's fence survives its own retry. Clean release still deletes
+the row, so the lease table and the abandoned-lease gauge stay bounded to
+active/abandoned work. The sequence is initialized strictly above every
+generation already present, so an upgrade cannot reissue a live tenancy.
+
+Gaps are expected and harmless: a losing `INSERT ... ON CONFLICT` contender still
+evaluates the VALUES list and burns a value it never uses. The token needs
+uniqueness and ordering, not density — and the tests that asserted the *distance*
+between generations now assert their *order*.
+
+The regression test reproduces the ABA on the old counter (`1 -> 1` after a
+release by the same owner) and pins that a pre-release token can neither renew,
+release, nor pass the REPLACE fence against its successor. Plan 43's
+reconciliation lifecycle — which carries an operation across a worker rebuild —
+is exactly the caller that would have made this reachable, which is why it landed
+first.
 
 ## Notes
 

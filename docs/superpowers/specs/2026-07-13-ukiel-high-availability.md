@@ -1,6 +1,7 @@
 # Ukiel High Availability Design
 
-Status: Proposed (Phase 1 delivered — plan 42; Phase 2 is the active-active gate)
+Status: Proposed (Phases 1 and 2 delivered — plans 42 and 43; the active-active
+compaction gate is closed. Phases 3 and 4 remain open.)
 Date: 2026-07-13
 Scope: ukield and its worker crates when the catalog runs on a managed,
 single-writer PostgreSQL service such as Amazon Aurora PostgreSQL.
@@ -615,24 +616,66 @@ permanent, it failed the compactor role and took the process down on ~1 run in 4
 — exactly the crash loop this phase exists to prevent. It is transport, and there
 is a regression test.
 
-### Phase 2: ambiguous mutation safety
+### Phase 2: ambiguous mutation safety — **DELIVERED (plan 43, 2026-07-13)**
 
-- commit_with_offsets operation keys.
-- Canonical operation fingerprints.
-- Compactor/deletion/MV operation identities.
-- Lookup/reconciliation API.
+A catalog mutation whose commit acknowledgement is lost is now **decidable**.
+
+- **Canonical operation identity** (`ukiel-core`): domain-separated, versioned,
+  type-tagged and length-delimited canonical bytes, hashed with BLAKE3. It names
+  *logical intent*, never a physical attempt — generated object paths, upload
+  UUIDs, lease owner/generation, attempt counters and wall-clock time are all
+  absent by construction, because fingerprinting an attempt would make every
+  retry a new operation and the mechanism a no-op. Domains: ingest (sorted Kafka
+  offset ranges), compaction (output level, sorted input parts, partition,
+  schema, sort key, placement), delete-key. `mv` is reserved for plan 8.
+- **Stored fingerprint** (migration 0011): `commits.idempotency_key` becomes the
+  operation key and gains a 32-byte digest beside it. Same key + same fingerprint
+  is `AlreadyApplied`; same key + *different or unknowable* fingerprint is
+  `OperationKeyCollision` — permanent, loud, mutating nothing. That answer must
+  never be "already applied", which would tell a worker that someone else's
+  commit was its own. History is **not** backfilled: a pre-plan-43 keyed row's
+  intent is unrecoverable, and a made-up digest would turn unknown history into
+  false certainty.
+- **Authoritative lookup** (`lookup_operation` → `Committed(id) | Absent`). The
+  only authority: object-store state cannot be used to infer it (uploads precede
+  the transaction, orphans are ordinary), and neither can a worker's memory.
+- **A single ambiguous boundary.** Only a transport failure returned by `COMMIT`
+  itself becomes `AmbiguousMutation` (carrying the identity). Everything before
+  it failed *definitely* — conflict, offset race, lost lease, bad statement, all
+  rolled back — and a retryable-database error is PostgreSQL explicitly saying the
+  transaction did not happen. An unidentified mutation at the same boundary is
+  `UnidentifiedAmbiguousMutation`: equally unknown, but undecidable, so permanent
+  and never quietly retried.
+- **Reconciliation in the supervisor**: the role stays `Reconciling` until lookup
+  answers. Neither answer resumes anything — `Absent` is not permission to replay
+  a stale payload, and the rebuilt worker reloads offsets, re-seeks Kafka and
+  replans from live parts either way. What the answer buys is that a lost
+  acknowledgement is a fact in the log and a counter
+  (`catalog_mutation_reconciliation_total{role,outcome}`) instead of a silence.
+- **Replay before lease judgement**: a merge whose acknowledgement was lost has
+  very likely lost its lease by the time it can ask. Judging the lease first would
+  answer `LeaseLost` for work that is already durable and send a second worker to
+  redo it. Reconciliation is not a lease bypass: a *new* operation under a stale
+  lease is still fenced out.
+- **Non-reused fencing tokens** (issue 0013, migration 0010): lease generations
+  come from a catalog-wide sequence, so a clean release can no longer hand the
+  same `(partition, owner, generation)` back to a later tenancy — the ABA that
+  reconciliation's longer-lived tokens would have made reachable.
 - ~~Monotonic cursor update.~~ **Delivered (plan 41)**: `set_cursor` never
   retreats, and a stale or equal write does not refresh `updated_at` — so a
   delayed replica can neither prolong the GC fence nor impersonate progress.
-- Integration tests for lost commit acknowledgments.
 
-**This phase is the gate on active-active compaction in production.** Plan 41
-made the fleet efficient and failover-safe, not ambiguity-safe: a compactor whose
-commit acknowledgement is lost still cannot tell whether its REPLACE landed. The
-leased commit path already reconciles an idempotency-key replay *before* it
-judges the lease (a worker whose work is durable is told so, rather than being
-told it lost the race and redoing it), so phase 2's canonical operation
-identities splice into a path whose ordering is already fixed and tested.
+**Proven by S11** (`make e2e-ha`), 8 consecutive runs: a feature-gated seam inside
+the commit path — absent from production builds, instance-scoped, one-shot — fires
+on either side of `COMMIT` and hands the caller the identical transport error.
+Ingest and compaction converge **exactly once** under both answers; a durable
+merge is reconciled before its expired lease is judged, and its replay does no
+second Parquet read or upload; a key reused under a different fingerprint fails
+permanently and mutates neither parts nor offsets.
+
+**The active-active compaction gate is closed.** Phases 3 and 4 are not: this
+plan added no horizontal ingest ownership, no GC singleton lease, and no managed
+Aurora RTO measurement.
 
 ### Phase 3: replicated workers
 
