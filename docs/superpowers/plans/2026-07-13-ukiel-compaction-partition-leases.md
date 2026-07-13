@@ -2,6 +2,12 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Status: Executed 2026-07-13.** All six tasks landed (commits `5f73ed8` ..
+> `8803406`). Measured outcome, exit criteria, and the A/B matrix are recorded in
+> `docs/notes/2026-07-13-catalog-scalability.md` ("Partition leases: the
+> scheduling rule, enforced") and roadmap row 41. Production active-active
+> enablement remains gated on HA phase 2 (roadmap row 42 → its successor).
+
 **Goal:** Make active-active compaction efficient and failover-safe. Plan 40 measured that 32 contenders on one partition complete the same **58** useful replacements as 2 contenders while discarding **55.7%** of attempts; on a Zipf-hot partition useful throughput falls from 971 swaps at 8 contenders to 678 at 32. The catalog-only benchmark understates the product cost: `Compactor::merge_parts` reads Parquet, performs the streaming merge, and uploads every output before REPLACE discovers the loser. This plan assigns one renewable, database-time lease per `(hypertable_id, partition_values)` before object work, fences that lease generation in the REPLACE transaction, and makes worker cursors monotonic without allowing a shared cursor to hide abandoned compaction.
 
 **Architecture — lease the stable scheduling unit, keep REPLACE as correctness.** A compaction lease covers a whole partition, not individual parts and not one level. Part sets and levels change while compaction runs; individual-part leases would require multi-row acquisition, permit overlapping level/finalization work, and fragment as soon as a REPLACE lands. The partition is the unit already used by merge planning and finalization, and serializing work inside it loses no measured throughput: plan 40 shows same-partition concurrency adds no useful work, while partition-disjoint work scales.
@@ -69,11 +75,11 @@ pub async fn compaction_candidates(
 - `compaction_candidates` groups the partial live set by `(partition_values, level)`, counts distinct `created_by_commit`, applies `l0_fanout` to level 0 and `fanout` above it, then returns distinct partition values in deterministic order with a bounded limit. Migration 0007's `(hypertable_id, partition_values, level)` live-part path is the starting index; record `EXPLAIN (ANALYZE, BUFFERS)` before adding another index.
 - Refactor the compactor so each tick asks current state for candidate partitions. After claiming is added in Task 4 it will fetch `live_partition_parts` only for a claimed candidate and recompute the eligible level from that snapshot. In this task, preserve behavior without leases. Remove `events.is_empty() => return` as a correctness gate; feed polling/cursor advancement may remain as cheap wake telemetry.
 
-- [ ] **Step 1: Failing cursor tests.** Advance 7 -> 9 -> 8 and assert 9; race concurrent writers of 7/11/9 behind a barrier and assert 11; assert a stale/equal write leaves `updated_at` unchanged. Verify GC's minimum-cursor behavior cannot regress.
-- [ ] **Step 2: Failing candidate tests.** Mixed partitions and levels: only threshold-satisfying partitions return, distinct once even if two levels qualify, limit is honored, tombstoned/sealed-in-future rows do not count (today only tombstoned is representable).
-- [ ] **Step 3: Implement the SQL and refactor planning.** Add a compactor regression test that first advances its cursor to feed head, leaves a mergeable live-state backlog, and proves `run_once` still compacts it without a new feed event.
-- [ ] **Step 4: Verify:** `cargo test -p ukiel-catalog -- --test-threads=2 && cargo test -p ukiel-compactor -- --test-threads=2`.
-- [ ] **Step 5: Commit:**
+- [x] **Step 1: Failing cursor tests.** Advance 7 -> 9 -> 8 and assert 9; race concurrent writers of 7/11/9 behind a barrier and assert 11; assert a stale/equal write leaves `updated_at` unchanged. Verify GC's minimum-cursor behavior cannot regress.
+- [x] **Step 2: Failing candidate tests.** Mixed partitions and levels: only threshold-satisfying partitions return, distinct once even if two levels qualify, limit is honored, tombstoned/sealed-in-future rows do not count (today only tombstoned is representable).
+- [x] **Step 3: Implement the SQL and refactor planning.** Add a compactor regression test that first advances its cursor to feed head, leaves a mergeable live-state backlog, and proves `run_once` still compacts it without a new feed event.
+- [x] **Step 4: Verify:** `cargo test -p ukiel-catalog -- --test-threads=2 && cargo test -p ukiel-compactor -- --test-threads=2`.
+- [x] **Step 5: Commit:**
 
 ```bash
 git commit -m "fix: monotonic worker cursors and live-state compaction discovery"
@@ -135,10 +141,10 @@ pub async fn release_compaction_lease(
 - All expiry expressions use `clock_timestamp() + make_interval(...)`. Validate TTL in Rust (`> 0`, fits PostgreSQL interval); bind integer milliseconds to avoid floating-point interval ambiguity.
 - Do not use advisory locks or `SELECT ... FOR UPDATE SKIP LOCKED` across the merge. No connection remains checked out during object I/O.
 
-- [ ] **Step 1: Write failing catalog integration tests:** one winner under 32 simultaneous acquirers; loser sees `None`; same owner idempotently reacquires without generation churn; forced expiry permits takeover and increments generation; stale renew/release cannot touch the new owner; renewal extends expiry without changing generation; different partitions acquire independently.
-- [ ] **Step 2: Implement migration, types, and APIs.** Add `CatalogError::LeaseLost` only for fenced mutations in Task 3; acquisition contention itself remains an ordinary `None`.
-- [ ] **Step 3: Verify migration from a pre-0008 catalog and fresh bootstrap:** `cargo test -p ukiel-catalog -- --test-threads=2`.
-- [ ] **Step 4: Commit:**
+- [x] **Step 1: Write failing catalog integration tests:** one winner under 32 simultaneous acquirers; loser sees `None`; same owner idempotently reacquires without generation churn; forced expiry permits takeover and increments generation; stale renew/release cannot touch the new owner; renewal extends expiry without changing generation; different partitions acquire independently.
+- [x] **Step 2: Implement migration, types, and APIs.** Add `CatalogError::LeaseLost` only for fenced mutations in Task 3; acquisition contention itself remains an ordinary `None`.
+- [x] **Step 3: Verify migration from a pre-0008 catalog and fresh bootstrap:** `cargo test -p ukiel-catalog -- --test-threads=2`.
+- [x] **Step 4: Commit:**
 
 ```bash
 git commit -m "feat: renewable catalog leases for compaction partitions"
@@ -172,10 +178,10 @@ pub async fn commit_compaction_replace(
 - On missing, expired, wrong-owner, or wrong-generation ownership, return `CatalogError::LeaseLost` and insert no commit/parts. Preserve the ordinary `CatalogError::Conflict` path for ingest/deletion races after lease validation.
 - Route through the existing commit machinery rather than duplicate part insertion, idempotency, intent clearing, and feed emission. The generic `commit` API remains unchanged for ingest/deletion/tests.
 
-- [ ] **Step 1: Failing tests:** current generation commits; expired/stale generation cannot commit; owner mismatch cannot commit; partition mismatch cannot commit; two stale/current commits serialize with only the current owner accepted; an ingest ADD racing a leased replacement remains correct; deletion can still make the replacement conflict.
-- [ ] **Step 2: Implement the transactional fence and named error.** Ensure an idempotency-key replay is reconciled before treating an expired lease as failure once HA phase 2 supplies canonical compactor operation identities; document/test the intended ordering now so the later splice is unambiguous.
-- [ ] **Step 3: Verify:** `cargo test -p ukiel-catalog -- --test-threads=2`.
-- [ ] **Step 4: Commit:**
+- [x] **Step 1: Failing tests:** current generation commits; expired/stale generation cannot commit; owner mismatch cannot commit; partition mismatch cannot commit; two stale/current commits serialize with only the current owner accepted; an ingest ADD racing a leased replacement remains correct; deletion can still make the replacement conflict.
+- [x] **Step 2: Implement the transactional fence and named error.** Ensure an idempotency-key replay is reconciled before treating an expired lease as failure once HA phase 2 supplies canonical compactor operation identities; document/test the intended ordering now so the later splice is unambiguous.
+- [x] **Step 3: Verify:** `cargo test -p ukiel-catalog -- --test-threads=2`.
+- [x] **Step 4: Commit:**
 
 ```bash
 git commit -m "feat: fence compaction replace commits by partition lease generation"
@@ -203,12 +209,12 @@ git commit -m "feat: fence compaction replace commits by partition lease generat
 
 Treat `LeaseLost` as expected scheduling churn, not a fatal worker exit. A genuine catalog error still stops/degrades the role according to the HA state machine. Uploaded output from a loss near commit remains registered pending/orphan data and is handled by existing GC. Never clear upload intents merely because the lease was lost.
 
-- [ ] **Step 1: Replace the competing-compactors test's weak assertion with an efficiency assertion.** Two workers synchronized on the same candidate: exactly one enters Parquet reads/upload, one useful merge lands, zero catalog conflicts, all rows remain. Separate partitions still let both workers perform useful work.
-- [ ] **Step 2: Add adversarial handoff tests.** Force owner A's lease to expire while paused before commit, let B acquire generation N+1, then resume A: A receives `LeaseLost`, B commits, data is intact. Kill A without release; after forced expiry B takes over and the backlog converges without a new feed event.
-- [ ] **Step 3: Add renewal coverage.** A deliberately slow merge survives beyond one initial TTL because renewals succeed. Forced renewal loss cancels before REPLACE; no live inputs are tombstoned and completed uploads remain intent-covered.
-- [ ] **Step 4: Integrate both ladder and finalizer paths.** Preserve one-merge-per-partition-per-pass, placement, streaming memory bounds, and current conflict replanning for non-compactor races.
-- [ ] **Step 5: Verify:** `cargo test -p ukiel-compactor -- --test-threads=2 && make e2e` (S6 equivalence, S8 object hygiene).
-- [ ] **Step 6: Commit:**
+- [x] **Step 1: Replace the competing-compactors test's weak assertion with an efficiency assertion.** Two workers synchronized on the same candidate: exactly one enters Parquet reads/upload, one useful merge lands, zero catalog conflicts, all rows remain. Separate partitions still let both workers perform useful work.
+- [x] **Step 2: Add adversarial handoff tests.** Force owner A's lease to expire while paused before commit, let B acquire generation N+1, then resume A: A receives `LeaseLost`, B commits, data is intact. Kill A without release; after forced expiry B takes over and the backlog converges without a new feed event.
+- [x] **Step 3: Add renewal coverage.** A deliberately slow merge survives beyond one initial TTL because renewals succeed. Forced renewal loss cancels before REPLACE; no live inputs are tombstoned and completed uploads remain intent-covered.
+- [x] **Step 4: Integrate both ladder and finalizer paths.** Preserve one-merge-per-partition-per-pass, placement, streaming memory bounds, and current conflict replanning for non-compactor races.
+- [x] **Step 5: Verify:** `cargo test -p ukiel-compactor -- --test-threads=2 && make e2e` (S6 equivalence, S8 object hygiene).
+- [x] **Step 6: Commit:**
 
 ```bash
 git commit -m "feat: lease partition compaction before parquet work"
@@ -246,10 +252,10 @@ candidate_limit = 64
   - catalog gauge for active/unexpired compaction leases and oldest expired lease age.
 - Existing `compactor_conflicts_total` stays: it should collapse for compactor/compactor races but still reveal ingest/deletion races.
 
-- [ ] **Step 1: Failing config tests** for defaults and invalid TTL/renewal combinations.
-- [ ] **Step 2: Wire owner/config and metrics.** Collector SQL must use database time and remain bounded by the small lease table/index.
-- [ ] **Step 3: Verify:** `cargo test -p ukield -- --test-threads=2 && cargo test -p ukiel-compactor -- --test-threads=2`.
-- [ ] **Step 4: Commit:**
+- [x] **Step 1: Failing config tests** for defaults and invalid TTL/renewal combinations.
+- [x] **Step 2: Wire owner/config and metrics.** Collector SQL must use database time and remain bounded by the small lease table/index.
+- [x] **Step 3: Verify:** `cargo test -p ukield -- --test-threads=2 && cargo test -p ukiel-compactor -- --test-threads=2`.
+- [x] **Step 4: Commit:**
 
 ```bash
 git commit -m "feat: configure and observe active-active compaction leases"
@@ -274,10 +280,10 @@ git commit -m "feat: configure and observe active-active compaction leases"
 - HA acceptance: kill lease owner during merge, wait no longer than `ttl + poll interval`, prove a peer claims and converges; fail catalog during renewal, prove no new merge begins and no unfenced REPLACE commits; restore catalog, replan from live state, and converge without a new feed event.
 - Connection acceptance: repeat the process-equivalent pool surge with the intended ukield replica count. The lease feature must not evade plan 40's first wall; document the fleet pool budget/RDS Proxy posture.
 
-- [ ] **Step 1: Full verification:** `cargo fmt --check && cargo clippy --all-targets -- -D warnings && make test && make e2e`.
-- [ ] **Step 2: Run and record the A/B matrix and HA fault cases.** At least twice per benchmark point; reports append under the existing catalog-results convention.
-- [ ] **Step 3: Update docs.** Mark HA Phase 3 compactor scheduling leases delivered, keep REPLACE named as correctness, record the failover bound and ambiguous-operation rollout gate. Mark roadmap row 41 Executed with measured numbers.
-- [ ] **Step 4: Commit:**
+- [x] **Step 1: Full verification:** `cargo fmt --check && cargo clippy --all-targets -- -D warnings && make test && make e2e`.
+- [x] **Step 2: Run and record the A/B matrix and HA fault cases.** At least twice per benchmark point; reports append under the existing catalog-results convention.
+- [x] **Step 3: Update docs.** Mark HA Phase 3 compactor scheduling leases delivered, keep REPLACE named as correctness, record the failover bound and ambiguous-operation rollout gate. Mark roadmap row 41 Executed with measured numbers.
+- [x] **Step 4: Commit:**
 
 ```bash
 git commit -m "docs: compaction partition leases measured - duplicate merge work eliminated"
