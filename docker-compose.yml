@@ -3,6 +3,12 @@
 services:
   postgres:
     image: postgres:17
+    # `max_connections` is the first wall the catalog bench found (plan 40): a
+    # 7-process fleet at 16 conns/process exceeds the default 100. It is a knob
+    # here so the fleet-budget question can be measured rather than argued —
+    # raising it is not free (each backend reserves memory), which is exactly
+    # what UKIEL_PG_MAX_CONNECTIONS lets a run price.
+    command: postgres -c max_connections=${UKIEL_PG_MAX_CONNECTIONS:-100}
     environment:
       POSTGRES_PASSWORD: postgres
     ports:

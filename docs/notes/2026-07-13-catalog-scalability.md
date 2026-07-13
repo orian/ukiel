@@ -301,6 +301,53 @@ so the point is valid — but the ratio is a real number for capacity planning:
 **a ukield process needs roughly one core per 3.5k catalog reads/s**, and that
 cost is client-side, not database-side. It is not fixed by any option below.
 
+
+## `max_connections` 100 vs 200 — measured, not argued
+
+Same fixture, same binary, only `max_connections` changed
+(`UKIEL_PG_MAX_CONNECTIONS`, compose knob).
+
+**Admission — the wall moves exactly where the arithmetic says:**
+
+| fleet (× 16 conns) | wanted | admitted @100 | admitted @200 |
+|---|---|---|---|
+| 4 processes | 64 | 64 | 64 |
+| 6 | 96 | 96 | 96 |
+| **8** | **128** | **100** (28 refused) | **128** (0 refused) |
+| 12 | 192 | 100 (92 refused) | **192** (0 refused) |
+| 16 | 256 | 100 (156 refused) | 200 (56 refused) |
+
+The fleet ceiling goes from **6 processes to 12**.
+
+**Cost of raising it — none measurable:**
+
+| topology | @100 | @200 |
+|---|---|---|
+| 1×16 (16 conns) | 22,122 op/s | 22,029 op/s |
+| 4×16 (64) | 24,782 op/s | 24,726 op/s |
+| 8×16 (128) | 22,729 op/s | 23,529 op/s |
+| postgres RSS | 94.3 MiB | 81.7 MiB |
+
+Throughput is flat within noise and memory does not grow — Postgres allocates a
+backend on connect, it does not reserve one per configured slot. At this scale the
+"raising `max_connections` is expensive" folklore simply does not bite.
+
+**And the finding that matters most — the wall does not announce itself in p99:**
+
+| max_connections | fleet | achieved | **p99** | **max** | **timed out** |
+|---|---|---|---|---|---|
+| **100** | 8×16 = 128 conns | 22,729 op/s | **2.1 ms** | **2,001.6 ms** | **46** |
+| **200** | 8×16 = 128 conns | 23,529 op/s | 2.6 ms | 21.0 ms | **0** |
+
+A fleet that overshoots `max_connections` does not merely get connections refused.
+Its **queries miss deadlines** — 46 of them hit the 2 s timeout — while **p99 still
+reads 2.1 ms** and throughput looks healthy. Only `max` and the timeout counter
+show it. A dashboard watching p99 would have seen nothing wrong.
+
+**Verdict #1 sharpens: set `max_connections` to at least `2 × fleet_size ×
+pool_size`, and treat it as a fleet-wide budget.** It is free at this scale, and
+the failure it prevents is invisible to the metric most people watch.
+
 ---
 
 # OPTION VERDICTS
@@ -309,9 +356,9 @@ Each with the deciding number. **No product change ships from plan 40.**
 
 | # | option | verdict | the deciding number |
 |---|---|---|---|
-| 1 | **Fleet-wide connection budget** | **PURSUE** | A 7-process fleet (112 conns) exceeds `max_connections = 100`. This is the first wall the system actually hits, and it arrives long before any throughput limit. |
+| 1 | **Fleet-wide connection budget** | **PURSUE** | A 7-process fleet (112 conns) exceeds `max_connections = 100` — the first wall the system actually hits, long before any throughput limit. **Measured 100 vs 200: raising it costs nothing** (throughput flat within noise, RSS unchanged) and doubles the fleet ceiling to 12 processes. **And it is not merely an admission problem: at 100 with a 128-conn fleet, 46 queries missed their 2 s deadline while p99 still read 2.1 ms.** The wall is invisible to the metric most people watch. Set it to ≥ 2 × fleet × pool_size. |
 | 2 | Per-process pool knob | **DECLINE** (alone) | 1×16 → 16×4 at constant connections moves throughput +13%. The pool is never the wall. A bigger pool without a fleet budget makes #1 arrive *sooner*. |
-| 3 | **PgBouncer** | **NOT YET** — trigger named | Needed only once the fleet exceeds `max_connections / pool_size` (~6 processes at defaults). Below that it adds a hop for nothing. Revisit when the fleet plan crosses that line, or raise `max_connections` first (cheaper). |
+| 3 | **PgBouncer** | **NOT YET** — trigger named | Needed once the fleet exceeds `max_connections / pool_size`. But raising `max_connections` is the cheaper first move and was **measured free** (100 → 200: no throughput or memory cost, ceiling 6 → 12 processes). PgBouncer earns its hop only when the fleet outgrows what a single primary will accept in backends — a much larger fleet than anything on the roadmap. |
 | 4 | Batched part inserts | **DECLINE** | 4 parts/commit already gives 8,026 commits/s = 32k parts/s against a 25.6 TPS demand (157× headroom). Per-commit cost dominates the per-part INSERT. Optimizing the loop optimizes a non-constraint. |
 | 5 | DDL / metadata cache | **NOT MEASURABLE HERE** | Session build was out of this plan's catalog-only scope. It remains a *latency* question (per-query), not a capacity one. File separately if per-query latency is ever the complaint. |
 | 6 | Live-parts snapshot cache | **DECLINE** | Reads sustain 20k QPS against a 167 QPS demand (120×) and 1,667 QPS surge (12×). It would add a cache-coherency and stale-read problem to solve a problem that does not exist. |
