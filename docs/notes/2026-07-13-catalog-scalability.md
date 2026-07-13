@@ -156,3 +156,189 @@ write lanes; row 8, which adds feed consumers; and row 23, which bounds catalog
 history. The final answer is not merely QPS at N cores. It is: at what tenant
 activity, ingest rate, catalog age, and fleet size does one primary miss the
 SLO, and which least-complex option restores the required headroom?
+
+---
+
+# MEASURED (plan 40, 2026-07-13)
+
+**Catalog only.** No Parquet was written, no object store touched, no DataFusion
+query run. Rows in Postgres, and the catalog API over them — the question is where
+the single primary stops meeting the SLO, not how fast the scan layer is.
+
+Fixture: 25k parts / 4 hypertables / 30 day-partitions / 1M packing keys, with
+real plan-16 `column_stats` (roaring bitmaps + row-group spans, so JSONB and TOAST
+width are honest). Machine: 12 physical cores (24 threads), Postgres 17 in compose,
+`max_connections = 100`. Driver and Postgres are co-located.
+SLO: query-admission p99 ≤ 50 ms, commit p99 ≤ 100 ms, zero timeouts,
+2× headroom (steady) / 1.25× (surge).
+
+## The headline
+
+**One primary is nowhere near the wall at the million-tenant envelope, and the
+first thing to break is not throughput — it is `max_connections`.**
+
+| demand scenario | derived load | measured (mixed, all workloads together) | headroom |
+|---|---|---|---|
+| steady | 167 read QPS + 25.6 write TPS | 6,739 ops/s | **17×** |
+| dashboard-surge | 1,667 read QPS | 17,748 ops/s | **8.4×** |
+| backfill | 205 write TPS | 6,997 ops/s | **9.3×** |
+
+All three **PASS** the capacity gate. Reads alone sustain 20,000 QPS open-loop at
+6 cores with p99 6.2 ms and zero timeouts; commits sustain ~8,000/s against a
+demand of 25.6.
+
+## Reads: liveness costs, history is nearly free
+
+The single most useful result, and it is counter-intuitive:
+
+| state | live / tombstoned (of 25k) | read QPS (closed, 32 workers) |
+|---|---|---|
+| fresh (90% live) | 22,500 / 2,500 | **2,674** (uniform) / 3,498 (zipf) |
+| **mature (10% live)** | 2,500 / 22,500 | **17,469** / **21,298** |
+| backlogged (35% live) | 8,750 / 16,250 | 4,015 / 5,201 |
+
+**A catalog with 22,500 tombstoned rows is 6.5× FASTER than one with 22,500 live
+rows.** The partial live index does its job: history is close to free, and what
+costs is the number of rows that are still *live*. So the compacted steady state
+is the fast state, and a backlog — not age — is what hurts. Zipf keys are ~20%
+faster than uniform (a hot key's parts stay in cache).
+
+This directly re-prices roadmap row 23 (feed horizon): **not needed for read
+latency.** Its motivation is disk and vacuum, not query admission, and it should
+be argued on those terms.
+
+## Cores: ~3.5k read QPS per core, linear
+
+| Postgres cores | closed-loop knee | open-loop sustained (p99 ≤ SLO, 0 timeouts) |
+|---|---|---|
+| 2 | 7,570 op/s (p99 48.8 ms — at the SLO edge) | **5,000/s** |
+| 4 | 15,806 op/s | **10,000/s** |
+| 6 | 21,820 op/s | **20,000/s** (p99 6.2 ms) |
+
+Saturation at 2 cores classifies as **PostgresCpu** (1.94 of 2.0 cores, 97%).
+Above that, nothing dominates — the primary is simply not being pushed.
+
+Even **2 cores clears every scenario**: 15× headroom on steady, 2× on the surge.
+
+## The first wall: `max_connections`, and it is not a throughput problem
+
+Topology, at a fixed 64 total connections:
+
+| topology | read QPS |
+|---|---|
+| 1 pool × 16 | 22,561 |
+| 4 × 16 (64 conns) | 25,435 |
+| 8 × 8 (64 conns) | 25,649 |
+| 16 × 4 (64 conns) | 25,147 |
+
+Four times the connections buys **+13%**. The pool is never the wall.
+
+But the connection *surge* — P process-equivalent pools all demanding their
+connections at once, as a deploy does — finds a hard global limit:
+
+| fleet | connections wanted | admitted | refused |
+|---|---|---|---|
+| 4 processes × 16 | 64 | 64 | 0 |
+| 6 × 16 | 96 | 96 | 0 |
+| **7 × 16** | **112** | **100** | **12** |
+| 8 × 16 | 128 | 100 | 28 |
+| 12 × 16 | 192 | 100 | 92 |
+
+**A 7-process fleet exhausts the default `max_connections`.** No per-process pool
+setting moves this; a bigger pool just walks a smaller fleet into the same wall
+sooner. (This is also why sqlx's laziness nearly hid it: constructing 8 pools
+opens almost no sockets, and the test cheerfully reported "128 connections, 0
+failures" until every pool was forced to hold its connections simultaneously.)
+
+## Writes: the per-part INSERT loop is not the problem
+
+| parts per commit | commits/s | parts/s |
+|---|---|---|
+| 1 | 4,920 | 4,920 |
+| **4** | **8,026** | **32,104** |
+| 16 | 4,537 | 72,592 |
+
+Per-**commit** cost (transaction + offset CAS) dominates; the per-part INSERT is
+cheap up to ~4. Against a demand of 25.6 TPS steady / 205 backfill, that is
+**157× / 20× headroom**. Batched part inserts would optimize something that is not
+the constraint.
+
+## Conflicts: optimistic REPLACE does not scale with contenders on one partition
+
+Backlogged fixture, one hypertable. *Useful* swaps — the commit that actually
+landed — not attempts:
+
+| shape | contenders | useful swaps | conflicts | rollback tax |
+|---|---|---|---|---|
+| same-partition | 2 | 58 | 54 | 10.6% |
+| same-partition | 8 | **58** | 293 | 21.6% |
+| same-partition | 32 | **58** | 1,134 | **55.7%** |
+| zipf (hot partition) | 2 | 393 | 18 | 3.5% |
+| zipf | 8 | **971** | 259 | 14.7% |
+| zipf | 32 | **678** | 1,468 | **61.9%** |
+| spread (own partition each) | 2 | 540 | 5 | 0.9% |
+| spread | 32 | 1,740 | 794 | 1.4% |
+
+**Piling contenders onto one partition adds no useful work and only waste**: 32
+contenders do exactly the same 58 swaps as 2, while throwing away 56% of their
+attempts. On a hot partition, throughput *declines* past 8 contenders (971 → 678).
+
+Product consequence: the compactor should not run many workers against the same
+partition. Partition-disjoint work scales; contended work does not. This is a
+scheduling rule, not a database limit.
+
+> Honesty note: the same-partition and spread points at high contender counts
+> merged their partitions *out* mid-run (no-ops dominated), so those rows are
+> bounded by the fixture as well as by contention. The bench says so on the run
+> rather than reporting the no-ops as swaps — which an earlier version of it did,
+> claiming 62,000 useful merges/s from a partition that only ever held 25 parts.
+
+## The driver is expensive, and that is a fleet-sizing fact
+
+At 21k read QPS the **bench driver burns ~6 cores** deserializing ~500k part rows/s
+(JSONB → serde) while Postgres burns ~5.7. Neither is the wall on a 24-thread box,
+so the point is valid — but the ratio is a real number for capacity planning:
+**a ukield process needs roughly one core per 3.5k catalog reads/s**, and that
+cost is client-side, not database-side. It is not fixed by any option below.
+
+---
+
+# OPTION VERDICTS
+
+Each with the deciding number. **No product change ships from plan 40.**
+
+| # | option | verdict | the deciding number |
+|---|---|---|---|
+| 1 | **Fleet-wide connection budget** | **PURSUE** | A 7-process fleet (112 conns) exceeds `max_connections = 100`. This is the first wall the system actually hits, and it arrives long before any throughput limit. |
+| 2 | Per-process pool knob | **DECLINE** (alone) | 1×16 → 16×4 at constant connections moves throughput +13%. The pool is never the wall. A bigger pool without a fleet budget makes #1 arrive *sooner*. |
+| 3 | **PgBouncer** | **NOT YET** — trigger named | Needed only once the fleet exceeds `max_connections / pool_size` (~6 processes at defaults). Below that it adds a hop for nothing. Revisit when the fleet plan crosses that line, or raise `max_connections` first (cheaper). |
+| 4 | Batched part inserts | **DECLINE** | 4 parts/commit already gives 8,026 commits/s = 32k parts/s against a 25.6 TPS demand (157× headroom). Per-commit cost dominates the per-part INSERT. Optimizing the loop optimizes a non-constraint. |
+| 5 | DDL / metadata cache | **NOT MEASURABLE HERE** | Session build was out of this plan's catalog-only scope. It remains a *latency* question (per-query), not a capacity one. File separately if per-query latency is ever the complaint. |
+| 6 | Live-parts snapshot cache | **DECLINE** | Reads sustain 20k QPS against a 167 QPS demand (120×) and 1,667 QPS surge (12×). It would add a cache-coherency and stale-read problem to solve a problem that does not exist. |
+| 7 | Read replicas | **DECLINE** | Same as #6: primary read CPU is not the wall. And a replica inherits the two invariants below, for no measured gain. |
+| 8 | Typed stats columns / index changes | **DECLINE** | Buffer hit ratio 1.000; zero I/O waits; no lock waits. JSONB decode cost is **client-side** (the driver's 6 cores), which no Postgres schema change touches. |
+| 9 | Feed horizon / physical partitioning (row 23) | **RE-PRICED** | History is nearly free for reads — a 90%-tombstoned catalog is **6.5× faster** than a 90%-live one. Row 23's motivation is **disk and vacuum, not query latency**, and it should be argued on those terms. |
+| 10 | Hypertable sharding | **DECLINE** | Useful commit TPS is 8,026 against a 205 TPS backfill demand. Sharding is a last resort for a constraint that is 20–150× away. |
+
+## The two invariants any future cache or replica must satisfy
+
+Recorded because they were nearly forgotten, and because tombstone grace is the
+attractive wrong answer:
+
+1. **Deletion safety:** `lag + query lifetime < tombstone grace`. A stale read may
+   reference an object GC has already reaped.
+2. **Freshness:** `lag ≤ the declared query-freshness SLO`. A stale read *omits*
+   recently added parts and silently returns incomplete data.
+
+**Tombstone grace does not solve freshness.** They are independent, and only #2 can
+authorize a lag. Any cache or replica follow-up must specify both, plus a race-free
+snapshot/feed-high-watermark bootstrap, read-your-writes, memory bounds, failover,
+and what happens when lag exceeds the limit.
+
+## What would change these verdicts
+
+- A fleet larger than ~6 processes → #1 and #3 become live immediately.
+- Read demand above ~10k QPS sustained (60× today's steady) → #6/#7 return.
+- A backlogged catalog as the *steady* state (not a transient) → reads drop to
+  ~4k QPS, and the compactor's ability to keep up becomes the question, not the
+  primary's throughput.

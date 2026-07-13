@@ -5,6 +5,23 @@
 > verdict. No performance fix ships from this plan; a confirmed fix earns its
 > own roadmap row.
 
+> **EXECUTED 2026-07-13** (commits `d26994e`…). Catalog only — rows in Postgres; no Parquet, no object store, no DataFusion query. 25k-part fixtures on a 12-physical-core box.
+>
+> **Result: one primary is nowhere near the wall. All three demand scenarios PASS with 8–17× headroom, and the first thing to break is `max_connections` — a 7-process fleet at 16 conns/process exceeds the default 100.** That is a budget problem, not a sharding problem.
+>
+> - Reads sustain **20,000 QPS** open-loop at 6 cores (p99 6.2 ms, zero timeouts) against a **167 QPS** steady demand. Commits sustain **8,026/s** against **25.6 TPS**.
+> - **Liveness costs; history is nearly free.** A 90%-tombstoned catalog reads **6.5× faster** than a 90%-live one — so **row 23 (feed horizon) is re-priced: its motivation is disk and vacuum, not query latency.**
+> - **Optimistic REPLACE does not scale with contenders on one partition**: 32 contenders do the same **58** useful swaps as 2, while throwing away **56%** of attempts. A compactor scheduling rule, not a database limit.
+> - Ten options carry numbered verdicts. **No product change ships from this plan** — one row (fleet-wide connection budget) is PURSUE, one (row 23) is re-priced, the rest DECLINE or NOT-YET with the trigger named.
+>
+> Four counting bugs were found and fixed *in the bench itself*, each of which produced a plausible wrong number — they are the reason the results are trustworthy, and they are documented rather than quietly patched:
+> - **Throughput** divided warmup completions by post-warmup duration (reported 1,250 op/s for a 1,000/s offered rate).
+> - **Conflict** counted no-ops as useful swaps (claimed 62,000 merges/s from a partition holding 25 parts).
+> - **The CPU limit could not be restored** — `docker update --cpus 0` silently does nothing, so sections after the cores sweep ran at 8 cores while labelled unlimited. The *reports* were honest throughout (each records its own `pg_cpu_limit`), which is how it was caught.
+> - **The connection surge measured nothing**: sqlx pools connect lazily, so 8×16 opened almost no sockets and cheerfully reported "128 connections, 0 failures" against `max_connections = 100`. Forcing every pool to hold its connections simultaneously is what exposed the real global wall.
+>
+> One deviation: the driver-invalidation rule became a **share**, not the plan's flat ">2 cores". The intent is right; the flat test is wrong on a big box, where the driver legitimately burns ~6 cores deserializing part rows next to a Postgres burning ~5.7, with 24 threads spare. Driver CPU is reported on every run regardless — "a ukield process needs ~1 core per 3.5k catalog reads/s" is a fleet-sizing fact, not a bench artifact.
+
 ## Goal
 
 Measure when the single PostgreSQL primary stops meeting Ukiel's query-admission

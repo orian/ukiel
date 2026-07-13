@@ -137,8 +137,44 @@ bench bluesky jsonbench [--iters N] [--label LABEL]     # JSONBench's 5 queries
 bench clickhouse load --table official|cb|parquet [--files N]
 bench clickhouse run  --table official|cb|parquet [--iters N] [--label LABEL]
 
+# Catalog scalability (plan 40) — CATALOG ONLY: rows in Postgres, no Parquet,
+# no object store, no DataFusion query.
+bench catalog demand [--scenario steady|dashboard-surge|backfill]
+bench catalog seed --label L [--tables N] [--parts N] [--state fresh|mature|backlogged|pathological]
+bench catalog read|write|conflict|mixed --label L [--mode closed|open] [--workers N] [--rate R]
+    [--duration S] [--warmup S] [--timeout-ms N] [--pools N] [--connections-per-pool N]
+    [--key-dist uniform|zipf] [--scenario S] [--parts-per-commit N] [--shape S]
+bench catalog connections [--pools N] [--connections-per-pool N]
+
 bench --help
 ```
+
+### Catalog scalability (plan 40)
+
+**Catalog only.** These write rows to Postgres and call the catalog API. They never
+create a Parquet file, never touch the object store, and never run a DataFusion
+query — the question is where the single primary stops meeting the SLO.
+
+The whole matrix: `bash bench/catalog-matrix.sh` (env: `PARTS`, `TABLES`, `DUR`,
+`WARM`). Results in `docs/notes/2026-07-13-catalog-scalability.md`.
+
+Four things the runbook gets right, each of which produced a wrong number first:
+
+- **The CPU limit must be restored by recreating the container.** `docker update
+  --cpus 0` returns success and changes *nothing*; `--cpu-quota -1` is refused once
+  NanoCPUs is set. A run whose recorded `pg_cpu_limit` differs from its label is
+  invalid — every report records its own, which is how a mislabelled sweep was
+  caught rather than published.
+- **Reseed between points.** The write and conflict workloads *mutate* the catalog
+  they measure (one unrecorded write run inflated the hot hypertable from 600 to
+  113,380 live parts, and every read after it looked 25× slower for no reason).
+  They print their start/end cardinality.
+- **Open loop measures from the scheduled arrival**, and the deadline runs from
+  arrival too. Driver-shed arrivals invalidate the point rather than silently
+  capping the offered rate.
+- **Throughput is completions inside the measured window.** Dividing all
+  completions (warmup included) by the post-warmup duration inflates every rate by
+  (warmup+duration)/duration — it reported 1,250 op/s for a 1,000/s offered rate.
 
 **The ClickHouse reference** answers the question plan 32 could not: *2.1x of
 what?* Three fixtures, each in its own ClickHouse database so they cannot
