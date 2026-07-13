@@ -685,6 +685,336 @@ pub async fn write(cfg: LoadConfig, ht_name: &str, parts_per_commit: usize) -> a
     Ok(())
 }
 
+/// `bench catalog conflict …` — the optimistic-REPLACE storm.
+///
+/// This is the compactor's real shape: read the live parts of a partition,
+/// commit `REPLACE(old → new)`, and lose the race if another worker tombstoned
+/// any input first. The losing side re-reads and replans — so throughput here is
+/// not "commits/s" but **useful swaps/s**, and the difference between them is
+/// rollback tax.
+///
+/// A conflict benchmark that reports attempts as throughput is measuring how fast
+/// it can fail.
+pub async fn conflict(cfg: LoadConfig, ht_name: &str, shape: &str) -> anyhow::Result<()> {
+    use ukiel_core::{CommitOp, PartMeta};
+
+    let pools = Arc::new(build_pools(cfg.pools, cfg.connections_per_pool).await?);
+    let ht = pools[0].get_hypertable(ht_name).await?;
+    let ht_id = ht.id;
+
+    // Contention shape. `same-partition` is the worst case (every contender
+    // targets one partition); `spread` gives each its own; `zipf` makes one
+    // partition hot while others are quiet — the realistic middle.
+    let shape = shape.to_string();
+    let attempts = Arc::new(AtomicU64::new(0));
+    let conflicts = Arc::new(AtomicU64::new(0));
+
+    let report = {
+        let (attempts, conflicts, shape) = (attempts.clone(), conflicts.clone(), shape.clone());
+        run_load("conflict", &cfg, pools.clone(), move |pools, seq| {
+            let (attempts, conflicts, shape) = (attempts.clone(), conflicts.clone(), shape.clone());
+            async move {
+                let cat = &pools[(seq as usize) % pools.len()];
+                let day = match shape.as_str() {
+                    "same-partition" => 0,
+                    "zipf" => {
+                        let n = (seq >> 11) as f64 / (u64::MAX >> 11) as f64;
+                        (n.powf(3.0) * 30.0) as u64
+                    }
+                    _ => seq % 30,
+                };
+                let partition = serde_json::json!({
+                    "day": format!("2026-01-{:02}", day + 1)
+                });
+
+                // The compactor's loop: read fresh state, plan, swap, and on a
+                // conflict re-read and try again. Bounded, because an unbounded
+                // retry loop would report a latency that is really a livelock.
+                for _ in 0..5 {
+                    attempts.fetch_add(1, Ordering::Relaxed);
+                    let live = cat.live_parts(ht_id, None).await?;
+                    let inputs: Vec<_> = live
+                        .iter()
+                        .filter(|p| p.meta.partition_values == partition)
+                        .take(4)
+                        .collect();
+                    if inputs.len() < 2 {
+                        return Ok((0, 0)); // nothing to merge here
+                    }
+                    let old: Vec<_> = inputs.iter().map(|p| p.id).collect();
+                    let new = vec![PartMeta {
+                        path: format!("ht/{}/L1/{}.parquet", ht_id.0, uuid::Uuid::new_v4()),
+                        partition_values: partition.clone(),
+                        packing_key_min: inputs
+                            .iter()
+                            .map(|p| p.meta.packing_key_min)
+                            .min()
+                            .unwrap(),
+                        packing_key_max: inputs
+                            .iter()
+                            .map(|p| p.meta.packing_key_max)
+                            .max()
+                            .unwrap(),
+                        row_count: inputs.iter().map(|p| p.meta.row_count).sum(),
+                        size_bytes: inputs.iter().map(|p| p.meta.size_bytes).sum(),
+                        level: 1,
+                        column_stats: None,
+                    }];
+                    match cat
+                        .commit(ht_id, CommitOp::Replace { old, new }, None)
+                        .await
+                    {
+                        Ok(_) => return Ok((inputs.len() as u64, 0)),
+                        Err(ukiel_catalog::CatalogError::Conflict { .. }) => {
+                            // Lost the race. Every byte of work in this attempt is
+                            // thrown away — that is the rollback tax, and it is
+                            // what a "commits attempted" number would hide.
+                            conflicts.fetch_add(1, Ordering::Relaxed);
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                Ok((0, 0))
+            }
+        })
+        .await?
+    };
+
+    let a = attempts.load(Ordering::Relaxed);
+    let c = conflicts.load(Ordering::Relaxed);
+    print_report(&report);
+    println!(
+        "  conflict shape '{shape}': {a} attempts -> {} USEFUL swaps, {c} conflicts \
+         ({:.0}% of attempts wasted)\n\
+         \x20 useful swaps/s {:.1} — the number that matters; 'commits attempted' would be {:.1}",
+        report.completed,
+        if a > 0 {
+            100.0 * c as f64 / a as f64
+        } else {
+            0.0
+        },
+        report.achieved_qps,
+        a as f64 / report.duration_s.max(1.0),
+    );
+    let mut v = serde_json::to_value(&report)?;
+    v["conflict_shape"] = shape.into();
+    v["attempts"] = a.into();
+    v["conflicts"] = c.into();
+    crate::report::write_json(&format!("catalog-conflict-{}.json", cfg.label), &v)?;
+    Ok(())
+}
+
+/// `bench catalog mixed …` — the demand envelope with the background workers on.
+///
+/// Reads and writes at the scenario's derived rates, **plus** everything the
+/// fleet does whether or not a customer is looking: feed polls, finalization
+/// candidates, the L0 backpressure probe, GC's pending-object sweep, and the
+/// collector's aggregates. A capacity number measured with the background off is
+/// a number for a system nobody runs.
+pub async fn mixed(cfg: LoadConfig, ht_name: &str) -> anyhow::Result<()> {
+    use ukiel_core::{CommitOp, PartMeta};
+
+    let pools = Arc::new(build_pools(cfg.pools, cfg.connections_per_pool).await?);
+    let ht = pools[0].get_hypertable(ht_name).await?;
+    let ht_id = ht.id;
+    let demand = Demand::named(&cfg.scenario)?;
+    let load = demand.derive();
+
+    // The op mix mirrors the derived demand: reads dominate, writes are steady,
+    // background is a small constant. Sampled per operation from the sequence, so
+    // the ratio holds without a scheduler per stream.
+    let total = load.read_qps + load.write_tps + load.background_qps;
+    let read_share = load.read_qps / total;
+    let write_share = (load.read_qps + load.write_tps) / total;
+    let topic = format!("bench-mixed-{}", cfg.label);
+    let (keys, dist) = (cfg.packing_keys, cfg.key_dist);
+    let seq_no = Arc::new(AtomicU64::new(0));
+
+    let report = run_load("mixed", &cfg, pools.clone(), move |pools, seq| {
+        let topic = topic.clone();
+        let seq_no = seq_no.clone();
+        async move {
+            let cat = &pools[(seq as usize) % pools.len()];
+            let n = (seq >> 11) as f64 / (u64::MAX >> 11) as f64;
+
+            if n < read_share {
+                // Query admission.
+                let key = dist.pick(n / read_share, keys);
+                let parts = cat.live_parts_pruned(ht_id, Some(key), &[]).await?;
+                Ok((parts.len() as u64, 0))
+            } else if n < write_share {
+                // Ingest flush: the real commit path plus the guardrail probe the
+                // flusher actually runs before every flush.
+                let _ = cat.max_live_l0_parts(ht_id, &[]).await?;
+                let i = seq_no.fetch_add(1, Ordering::Relaxed) as i64;
+                let parts = vec![PartMeta {
+                    path: format!("ht/{}/L0/mix-{i}.parquet", ht_id.0),
+                    partition_values: serde_json::json!({"day": "2026-01-01"}),
+                    packing_key_min: i % 1_000_000,
+                    packing_key_max: (i % 1_000_000) + 50,
+                    row_count: 100_000,
+                    size_bytes: 50_000_000,
+                    level: 0,
+                    column_stats: None,
+                }];
+                let ranges = [ukiel_catalog::OffsetRange {
+                    topic: topic.clone(),
+                    partition: (i % 64) as i32,
+                    first: i,
+                    last: i,
+                }];
+                cat.commit_with_offsets(ht_id, CommitOp::Add { parts }, &ranges)
+                    .await?;
+                Ok((1, 0))
+            } else {
+                // Background: what the fleet does regardless of customers.
+                match (seq >> 3) % 3 {
+                    0 => {
+                        let ev = cat
+                            .changes_since(ht_id, ukiel_core::CommitId(0), 100)
+                            .await?;
+                        Ok((ev.len() as u64, 0))
+                    }
+                    1 => {
+                        let c = cat.finalize_candidates(ht_id).await?;
+                        Ok((c.len() as u64, 0))
+                    }
+                    _ => {
+                        let n = cat.max_live_l0_parts(ht_id, &[]).await?;
+                        Ok((n as u64, 0))
+                    }
+                }
+            }
+        }
+    })
+    .await?;
+
+    print_report(&report);
+    println!(
+        "  mix: {:.0}% read / {:.0}% write / {:.0}% background (from the '{}' demand envelope)",
+        read_share * 100.0,
+        (write_share - read_share) * 100.0,
+        (1.0 - write_share) * 100.0,
+        cfg.scenario
+    );
+    crate::report::write_json(&format!("catalog-mixed-{}.json", cfg.label), &report)?;
+    Ok(())
+}
+
+/// `bench catalog connections …` — the fleet arriving at once.
+///
+/// Not "can one pool open 16 connections", but: **P process-equivalent pools all
+/// starting together**, as a deploy or a restart does. The wall this finds is
+/// global (`max_connections`), and no amount of per-process pool tuning moves it —
+/// which is exactly why a pool knob without a fleet-wide connection budget can
+/// make things worse.
+pub async fn connections(pools_n: usize, per_pool: u32, ht_name: &str) -> anyhow::Result<()> {
+    let max_conn: String = {
+        let probe = PostgresCatalog::connect_with_pool_size(&pg_url(), 1).await?;
+        sqlx::query_scalar("SELECT current_setting('max_connections')")
+            .fetch_one(probe.pool_for_tests())
+            .await?
+    };
+    println!(
+        "connection surge: {pools_n} process-equivalent pools x {per_pool} conns = {} total, \
+         against max_connections = {max_conn}",
+        pools_n * per_pool as usize
+    );
+
+    let started = Instant::now();
+    let mut handles = Vec::new();
+    for _ in 0..pools_n {
+        handles.push(tokio::spawn(async move {
+            let t = Instant::now();
+            let r = PostgresCatalog::connect_with_pool_size(&pg_url(), per_pool).await;
+            (t.elapsed().as_secs_f64() * 1000.0, r)
+        }));
+    }
+
+    let mut establish_ms = Vec::new();
+    let mut failed = 0usize;
+    let mut cats = Vec::new();
+    for h in handles {
+        match h.await {
+            Ok((ms, Ok(c))) => {
+                establish_ms.push(ms);
+                cats.push(c);
+            }
+            Ok((_, Err(e))) => {
+                failed += 1;
+                if failed == 1 {
+                    println!("  first failure: {e}");
+                }
+            }
+            Err(_) => failed += 1,
+        }
+    }
+    establish_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let surge_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+    // **sqlx pools connect lazily.** Constructing P pools of N proves nothing — it
+    // opens almost no sockets, and a surge test reporting "128 connections, 0
+    // failures" against `max_connections = 100` is reporting a fiction.
+    //
+    // Force every pool to hold ALL of its connections at once, behind a barrier so
+    // the peak is simultaneous rather than smeared across a ramp. That is what a
+    // fleet under load does, and it is the moment the global wall exists.
+    let ht = cats[0].get_hypertable(ht_name).await?;
+    let ht_id = ht.id;
+    let wanted = cats.len() * per_pool as usize;
+    let gate = Arc::new(tokio::sync::Barrier::new(wanted));
+    let mut probes = Vec::new();
+    for c in &cats {
+        for _ in 0..per_pool {
+            let (c, gate) = (c.clone(), gate.clone());
+            probes.push(tokio::spawn(async move {
+                gate.wait().await;
+                c.live_parts_pruned(ht_id, Some(1), &[]).await.is_ok()
+            }));
+        }
+    }
+    let mut admitted = 0usize;
+    let mut refused = 0usize;
+    for p in probes {
+        match p.await {
+            Ok(true) => admitted += 1,
+            _ => refused += 1,
+        }
+    }
+
+    println!(
+        "  established {} / {pools_n} pools in {surge_ms:.0} ms (p50 {:.0} / p99 {:.0} ms), {failed} failed to construct\n  \
+         under SIMULTANEOUS load: {admitted} / {wanted} concurrent connections admitted, {refused} refused",
+        cats.len(),
+        percentile(&establish_ms, 50.0),
+        percentile(&establish_ms, 99.0),
+    );
+    let limit: i64 = max_conn.parse().unwrap_or(0);
+    if refused > 0 || wanted as i64 > limit {
+        println!(
+            "  ! the wall here is GLOBAL: max_connections = {max_conn}, this fleet wants {wanted}.\n  \
+             No per-process pool setting moves it — a pool knob without a fleet-wide connection\n  \
+             budget just walks a bigger fleet into the same wall, faster."
+        );
+    }
+    crate::report::write_json(
+        &format!("catalog-connections-{pools_n}x{per_pool}.json"),
+        &serde_json::json!({
+            "pools": pools_n, "connections_per_pool": per_pool,
+            "total_connections": pools_n * per_pool as usize,
+            "max_connections": max_conn,
+            "established": cats.len(), "failed_to_construct": failed,
+            "concurrent_admitted": admitted, "concurrent_refused": refused,
+            "concurrent_wanted": cats.len() * per_pool as usize,
+            "surge_ms": surge_ms,
+            "establish_p50_ms": percentile(&establish_ms, 50.0),
+            "establish_p99_ms": percentile(&establish_ms, 99.0),
+        }),
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

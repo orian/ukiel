@@ -51,9 +51,10 @@ USAGE:
     bench bluesky jsonbench [--iters N] [--label LABEL]     official JSONBench 5 queries
     bench catalog demand [--scenario steady|dashboard-surge|backfill]
     bench catalog seed --label L [--tables N] [--parts N] [--state S] [--packing-keys N]
-    bench catalog read|write --label L [--mode closed|open] [--workers N] [--rate R]
+    bench catalog read|write|conflict|mixed --label L [--mode closed|open] [--workers N] [--rate R]
         [--duration S] [--warmup S] [--timeout-ms N] [--pools N] [--connections-per-pool N]
-        [--key-dist uniform|zipf] [--scenario S] [--parts-per-commit N]
+        [--key-dist uniform|zipf] [--scenario S] [--parts-per-commit N] [--shape S]
+    bench catalog connections [--pools N] [--connections-per-pool N]
     bench clickhouse load --table official|cb [--files N]   ClickHouse reference fixtures
     bench clickhouse run --table official|cb|parquet [--iters N] [--label LABEL]
 
@@ -159,7 +160,15 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
             )
             .await
         }
-        (Some("catalog"), Some(w @ ("read" | "write"))) => {
+        (Some("catalog"), Some("connections")) => {
+            catalog_load::connections(
+                opt_usize(args, "--pools")?.unwrap_or(8),
+                opt_usize(args, "--connections-per-pool")?.unwrap_or(16) as u32,
+                opt_str(args, "--table").unwrap_or("bench_cat_0"),
+            )
+            .await
+        }
+        (Some("catalog"), Some(w @ ("read" | "write" | "conflict" | "mixed"))) => {
             let cfg = catalog_load::LoadConfig {
                 label: opt_str(args, "--label").unwrap_or("default").to_string(),
                 mode: catalog_load::Mode::parse(opt_str(args, "--mode").unwrap_or("closed"))?,
@@ -190,6 +199,11 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
             let table = opt_str(args, "--table").unwrap_or("bench_cat_0");
             match w {
                 "read" => catalog_load::read(cfg, table).await,
+                "conflict" => {
+                    let shape = opt_str(args, "--shape").unwrap_or("same-partition");
+                    catalog_load::conflict(cfg, table, shape).await
+                }
+                "mixed" => catalog_load::mixed(cfg, table).await,
                 _ => {
                     let ppc = opt_usize(args, "--parts-per-commit")?.unwrap_or(4);
                     catalog_load::write(cfg, table, ppc).await
