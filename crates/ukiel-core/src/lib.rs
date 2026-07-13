@@ -2,6 +2,7 @@
 
 pub mod commit;
 pub mod ids;
+pub mod operation;
 pub mod part;
 pub mod ready;
 pub mod schema;
@@ -11,6 +12,10 @@ pub mod table;
 
 pub use commit::{ChangeEvent, CommitOp, CommitResult};
 pub use ids::{CommitId, HypertableId, LogicalTableId, NamespaceId, PartId};
+pub use operation::{
+    CompactionIntent, DeleteKeyIntent, IngestRange, MAX_OPERATION_KEY_LEN, OperationError,
+    OperationIdentity,
+};
 pub use part::{ColumnRange, Part, PartMeta};
 pub use ready::{ReadySignal, signal_ready};
 pub use schema::{

@@ -11,6 +11,7 @@ parquet = { workspace = true }
 thiserror = { workspace = true }
 roaring = { workspace = true }
 base64 = { workspace = true }
+blake3 = { workspace = true }
 
 [dev-dependencies]
 bytes = { workspace = true }

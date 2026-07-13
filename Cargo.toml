@@ -36,6 +36,9 @@ tracing = "0.1"
 toml = "1"
 anyhow = "1"
 metrics = "0.24"
+# Plan 43: operation fingerprints. A hash, never a hashing implementation of
+# our own — the digest is a durable catalog value.
+blake3 = "1"
 metrics-util = "0.19"
 metrics-exporter-prometheus = "0.16"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
