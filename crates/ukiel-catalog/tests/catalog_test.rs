@@ -1,7 +1,9 @@
 mod common;
 
 use serde_json::json;
-use ukiel_core::{CommitOp, CommitResult, HypertableId, NamespaceId, PartMeta};
+use ukiel_core::{
+    CommitOp, CommitResult, HypertableId, IngestRange, NamespaceId, OperationIdentity, PartMeta,
+};
 
 fn part_meta(path: &str, packing_key_min: i64, packing_key_max: i64) -> PartMeta {
     PartMeta {
@@ -17,9 +19,16 @@ fn part_meta(path: &str, packing_key_min: i64, packing_key_max: i64) -> PartMeta
 }
 
 async fn setup_hypertable(catalog: &ukiel_catalog::PostgresCatalog) -> HypertableId {
+    setup_hypertable_named(catalog, "events").await
+}
+
+async fn setup_hypertable_named(
+    catalog: &ukiel_catalog::PostgresCatalog,
+    name: &str,
+) -> HypertableId {
     catalog
         .create_hypertable(
-            "events",
+            name,
             &events_schema(),
             &json!({"columns": ["day"]}),
             &["tenant_id".to_string()],
@@ -310,14 +319,14 @@ async fn idempotency_key_dedups_commit() {
     let (_pg, catalog) = common::setup().await;
     let ht = setup_hypertable(&catalog).await;
 
-    let key = "0:0-99"; // kafka partition 0, offsets 0..=99
+    let key = op(ht, 0, 0, 99); // kafka partition 0, offsets 0..=99
     let first = catalog
         .commit(
             ht,
             CommitOp::Add {
                 parts: vec![part_meta("p1.parquet", 1, 10)],
             },
-            Some(key),
+            Some(&key),
         )
         .await
         .unwrap();
@@ -332,7 +341,7 @@ async fn idempotency_key_dedups_commit() {
             CommitOp::Add {
                 parts: vec![part_meta("p1-retry.parquet", 1, 10)],
             },
-            Some(key),
+            Some(&key),
         )
         .await
         .unwrap();
@@ -350,7 +359,7 @@ async fn idempotency_key_dedups_commit() {
             CommitOp::Add {
                 parts: vec![part_meta("p2.parquet", 1, 10)],
             },
-            Some("0:100-199"),
+            Some(&op(ht, 0, 100, 199)),
         )
         .await
         .unwrap();
@@ -441,6 +450,7 @@ async fn duplicate_offset_commit_is_rejected_and_rolled_back() {
                         parts: vec![part_meta(path, 1, 10)],
                     },
                     &[r],
+                    None,
                 )
                 .await
         };
@@ -513,6 +523,7 @@ async fn commit_with_offsets_is_atomic() {
                     last: 9,
                 },
             ],
+            None,
         )
         .await
         .unwrap();
@@ -536,6 +547,7 @@ async fn commit_with_offsets_is_atomic() {
                 first: 42,
                 last: 99,
             }],
+            None,
         )
         .await
         .unwrap_err();
@@ -561,6 +573,7 @@ async fn commit_with_offsets_is_atomic() {
                 first: 42,
                 last: 99,
             }],
+            None,
         )
         .await
         .unwrap();
@@ -1690,6 +1703,23 @@ async fn lease_migration_applies_to_a_populated_pre_0008_catalog() {
     assert_eq!(catalog.live_parts(ht, None).await.unwrap().len(), 1);
 }
 
+/// A factory-built identity. The catalog boundary only ever sees a (key,
+/// fingerprint) pair, so the domain is immaterial here — what matters is that
+/// the pair is *derived*, never hand-assembled.
+fn op(ht: HypertableId, partition: i32, first: i64, last: i64) -> OperationIdentity {
+    OperationIdentity::ingest(
+        ht,
+        &[IngestRange {
+            topic: "events".into(),
+            partition,
+            first,
+            last,
+        }],
+        1,
+    )
+    .unwrap()
+}
+
 /// Live part ids of one partition.
 async fn live_ids(
     catalog: &ukiel_catalog::PostgresCatalog,
@@ -2044,7 +2074,7 @@ async fn an_idempotent_replay_is_reconciled_before_the_lease_is_judged() {
             &lease,
             old.clone(),
             vec![l1_meta("l1.parquet", &day1)],
-            Some("op-1"),
+            Some(&op(ht, 1, 0, 0)),
         )
         .await
         .unwrap()
@@ -2069,7 +2099,7 @@ async fn an_idempotent_replay_is_reconciled_before_the_lease_is_judged() {
             &lease,
             old,
             vec![l1_meta("l1.parquet", &day1)],
-            Some("op-1"),
+            Some(&op(ht, 1, 0, 0)),
         )
         .await
         .unwrap();
@@ -2518,4 +2548,449 @@ async fn generation_sequence_starts_above_existing_leases() {
         "the sequence must start above every generation the old counter handed out, got {}",
         reclaimed.generation
     );
+}
+
+// ---------------------------------------------------------------------------
+// Plan 43: operation identity, fingerprint storage, authoritative lookup.
+// ---------------------------------------------------------------------------
+
+use ukiel_catalog::{CatalogErrorClass, OperationLookup};
+
+#[tokio::test]
+async fn lookup_answers_absent_then_committed() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let identity = op(ht, 0, 0, 99);
+
+    assert_eq!(
+        catalog.lookup_operation(&identity).await.unwrap(),
+        OperationLookup::Absent,
+        "nothing has been committed under this intent"
+    );
+
+    let CommitResult::Committed(id) = catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![part_meta("p1.parquet", 1, 10)],
+            },
+            Some(&identity),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected a commit")
+    };
+    assert_eq!(
+        catalog.lookup_operation(&identity).await.unwrap(),
+        OperationLookup::Committed(id)
+    );
+
+    // Scoped to its hypertable: the same key under another table is not this
+    // operation. (Two hypertables cannot in practice produce the same key —
+    // the id is inside the fingerprint — but the query must be scoped anyway,
+    // or the uniqueness the catalog enforces and the one the caller assumes
+    // would differ.)
+    let other = setup_hypertable_named(&catalog, "events2").await;
+    assert_eq!(
+        catalog
+            .lookup_operation(
+                &OperationIdentity::from_stored(
+                    other,
+                    identity.key().to_string(),
+                    *identity.fingerprint()
+                )
+                .unwrap()
+            )
+            .await
+            .unwrap(),
+        OperationLookup::Absent
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_operation_applies_nothing_and_returns_the_original_commit() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let identity = op(ht, 0, 0, 99);
+
+    let CommitResult::Committed(first) = catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![part_meta("first.parquet", 1, 10)],
+            },
+            Some(&identity),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected a commit")
+    };
+
+    // The retry uploaded *different objects* — a fresh attempt at the same
+    // intent always does, because paths carry a UUID. It must still reconcile.
+    let replay = catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![part_meta("retry.parquet", 1, 10)],
+            },
+            Some(&identity),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay, CommitResult::AlreadyApplied(first));
+
+    let live = catalog.live_parts(ht, None).await.unwrap();
+    assert_eq!(live.len(), 1, "the replay inserted nothing");
+    assert_eq!(live[0].meta.path, "first.parquet", "the first outputs win");
+}
+
+#[tokio::test]
+async fn a_key_reused_under_different_intent_is_a_loud_collision() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let identity = op(ht, 0, 0, 99);
+    catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![part_meta("p1.parquet", 1, 10)],
+            },
+            Some(&identity),
+        )
+        .await
+        .unwrap();
+
+    // Same key, different fingerprint. Only a bug or direct SQL can produce
+    // this — which is exactly why the fingerprint is stored beside the key
+    // rather than trusted to be derivable from it.
+    let forged =
+        OperationIdentity::from_stored(ht, identity.key().to_string(), [0xAB; 32]).unwrap();
+    for err in [
+        catalog.lookup_operation(&forged).await.unwrap_err(),
+        catalog
+            .commit(
+                ht,
+                CommitOp::Add {
+                    parts: vec![part_meta("forged.parquet", 1, 10)],
+                },
+                Some(&forged),
+            )
+            .await
+            .unwrap_err(),
+    ] {
+        assert!(
+            matches!(err, CatalogError::OperationKeyCollision { .. }),
+            "must never be AlreadyApplied: {err:?}"
+        );
+        assert_eq!(err.class(), CatalogErrorClass::PermanentInput);
+    }
+    assert_eq!(
+        catalog.live_parts(ht, None).await.unwrap().len(),
+        1,
+        "a collision mutates nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_historical_key_without_a_fingerprint_collides_rather_than_guessing() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let identity = op(ht, 0, 0, 99);
+
+    // A pre-plan-43 keyed commit: its intent is not recoverable, and migration
+    // 0011 deliberately does not invent one. "Probably the same thing" is not
+    // an answer a reconciliation protocol may give.
+    sqlx::query(
+        "INSERT INTO commits (hypertable_id, kind, idempotency_key) VALUES ($1, 'add', $2)",
+    )
+    .bind(ht.0)
+    .bind(identity.key())
+    .execute(catalog.pool_for_tests())
+    .await
+    .unwrap();
+
+    let err = catalog.lookup_operation(&identity).await.unwrap_err();
+    assert!(
+        matches!(err, CatalogError::OperationKeyCollision { .. }),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_identity_from_another_hypertable_is_refused_before_any_work() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let other = setup_hypertable_named(&catalog, "events2").await;
+
+    let err = catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![part_meta("p1.parquet", 1, 10)],
+            },
+            Some(&op(other, 0, 0, 99)),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CatalogError::OperationHypertableMismatch { .. }),
+        "{err:?}"
+    );
+    assert!(catalog.live_parts(ht, None).await.unwrap().is_empty());
+}
+
+/// The ordering that makes reconciliation worth having: durable work beats a
+/// lease that expired *after* the commit landed.
+#[tokio::test]
+async fn a_committed_leased_replace_is_reconciled_before_the_lease_is_judged() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let day1 = json!({ "day": "2026-07-01" });
+    add_l0_part(&catalog, ht, &day1).await;
+    add_l0_part(&catalog, ht, &day1).await;
+    let old = live_ids(&catalog, ht, &day1).await;
+    let identity = op(ht, 1, 0, 0);
+
+    let owner = Uuid::new_v4();
+    let lease = catalog
+        .try_acquire_compaction_lease(ht, &day1, owner, TTL)
+        .await
+        .unwrap()
+        .unwrap();
+    let CommitResult::Committed(id) = catalog
+        .commit_compaction_replace(
+            ht,
+            &lease,
+            old.clone(),
+            vec![l1_meta("l1.parquet", &day1)],
+            Some(&identity),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected a commit")
+    };
+
+    // The acknowledgement was lost. By the time the worker asks again, its lease
+    // is long gone — released on the way down, then reissued to a peer at a new
+    // generation (issue 0013: a *new* generation, never the old one back).
+    assert!(catalog.release_compaction_lease(&lease).await.unwrap());
+    let peer = catalog
+        .try_acquire_compaction_lease(ht, &day1, owner, TTL)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(peer.generation > lease.generation);
+
+    // Replaying the same intent under the *stale* lease reports the durable
+    // truth. Judging the lease first would say LeaseLost and send a second
+    // worker to redo a merge that is already committed.
+    let replay = catalog
+        .commit_compaction_replace(
+            ht,
+            &lease,
+            old,
+            vec![l1_meta("redo.parquet", &day1)],
+            Some(&identity),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay, CommitResult::AlreadyApplied(id));
+
+    let live = catalog.live_partition_parts(ht, &day1).await.unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(
+        live[0].meta.path, "l1.parquet",
+        "the replay changed nothing"
+    );
+}
+
+/// ...but reconciliation is not a lease bypass. A *new* operation under a stale
+/// lease is still fenced out — the replay path only forgives work that is
+/// already durable.
+#[tokio::test]
+async fn a_new_operation_under_a_stale_lease_is_still_fenced_out() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let day1 = json!({ "day": "2026-07-01" });
+    add_l0_part(&catalog, ht, &day1).await;
+    add_l0_part(&catalog, ht, &day1).await;
+    let old = live_ids(&catalog, ht, &day1).await;
+
+    let stale = catalog
+        .try_acquire_compaction_lease(ht, &day1, Uuid::new_v4(), TTL)
+        .await
+        .unwrap()
+        .unwrap();
+    expire_lease(&catalog, ht, &day1).await;
+    catalog
+        .try_acquire_compaction_lease(ht, &day1, Uuid::new_v4(), TTL)
+        .await
+        .unwrap()
+        .expect("a peer takes over");
+
+    let err = catalog
+        .commit_compaction_replace(
+            ht,
+            &stale,
+            old,
+            vec![l1_meta("zombie.parquet", &day1)],
+            Some(&op(ht, 9, 0, 0)),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CatalogError::LeaseLost { .. }), "{err:?}");
+    assert_eq!(
+        catalog.live_partition_parts(ht, &day1).await.unwrap().len(),
+        2,
+        "nothing was tombstoned"
+    );
+}
+
+/// A collision is reported before the lease is even read, and mutates nothing.
+#[tokio::test]
+async fn a_collision_is_reported_before_lease_state() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let day1 = json!({ "day": "2026-07-01" });
+    add_l0_part(&catalog, ht, &day1).await;
+    add_l0_part(&catalog, ht, &day1).await;
+    let old = live_ids(&catalog, ht, &day1).await;
+
+    let identity = op(ht, 1, 0, 0);
+    catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![part_meta("unrelated.parquet", 1, 10)],
+            },
+            Some(&identity),
+        )
+        .await
+        .unwrap();
+
+    // Same key, different intent, and a lease that is not ours either. The
+    // collision is the answer: a permanent input error outranks a scheduling
+    // one, and the caller must not be told to retry.
+    let forged =
+        OperationIdentity::from_stored(ht, identity.key().to_string(), [0x11; 32]).unwrap();
+    let stale = catalog
+        .try_acquire_compaction_lease(ht, &day1, Uuid::new_v4(), TTL)
+        .await
+        .unwrap()
+        .unwrap();
+    expire_lease(&catalog, ht, &day1).await;
+    catalog
+        .try_acquire_compaction_lease(ht, &day1, Uuid::new_v4(), TTL)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let err = catalog
+        .commit_compaction_replace(
+            ht,
+            &stale,
+            old,
+            vec![l1_meta("x.parquet", &day1)],
+            Some(&forged),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CatalogError::OperationKeyCollision { .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        catalog.live_partition_parts(ht, &day1).await.unwrap().len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn the_fingerprint_column_rejects_a_wrong_width_digest() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let err = sqlx::query(
+        "INSERT INTO commits (hypertable_id, kind, idempotency_key, operation_fingerprint)
+         VALUES ($1, 'add', 'k', $2)",
+    )
+    .bind(ht.0)
+    .bind(vec![0u8; 31])
+    .execute(catalog.pool_for_tests())
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("commits_operation_fingerprint_check"),
+        "the 32-byte width is a database invariant, not a convention: {err}"
+    );
+}
+
+/// Migration 0011 lands on a populated catalog: unkeyed and historical keyed
+/// commits both survive, and neither acquires an invented fingerprint.
+#[tokio::test]
+async fn fingerprint_migration_applies_to_a_populated_catalog() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![part_meta("unkeyed.parquet", 1, 10)],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let pool = catalog.pool_for_tests();
+    sqlx::query("ALTER TABLE commits DROP COLUMN operation_fingerprint")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 11")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO commits (hypertable_id, kind, idempotency_key) VALUES ($1, 'add', 'legacy-key')")
+        .bind(ht.0)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    catalog.migrate().await.unwrap();
+
+    let fingerprints: Vec<Option<Vec<u8>>> =
+        sqlx::query_scalar("SELECT operation_fingerprint FROM commits ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert!(
+        fingerprints.iter().all(|f| f.is_none()),
+        "history is not backfilled: a made-up digest is false certainty"
+    );
+    assert_eq!(catalog.live_parts(ht, None).await.unwrap().len(), 1);
+
+    // And the catalog still works afterwards.
+    let identity = op(ht, 0, 0, 9);
+    assert!(matches!(
+        catalog
+            .commit(
+                ht,
+                CommitOp::Add {
+                    parts: vec![part_meta("after.parquet", 1, 10)],
+                },
+                Some(&identity),
+            )
+            .await
+            .unwrap(),
+        CommitResult::Committed(_)
+    ));
+    assert!(matches!(
+        catalog.lookup_operation(&identity).await.unwrap(),
+        OperationLookup::Committed(_)
+    ));
 }

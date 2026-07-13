@@ -116,7 +116,7 @@ impl Flusher {
         // whether it landed instead of arranging not to need the answer.
         let result = self
             .catalog
-            .commit_with_offsets(hypertable.id, CommitOp::Add { parts }, &offsets)
+            .commit_with_offsets(hypertable.id, CommitOp::Add { parts }, &offsets, None)
             .await
             .inspect_err(|e| {
                 if e.is_recoverable_transport() {

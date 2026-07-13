@@ -1,21 +1,40 @@
 use sqlx::{Postgres, Transaction};
-use ukiel_core::{CommitId, CommitOp, CommitResult, HypertableId, PartId, PartMeta};
+use ukiel_core::{
+    CommitId, CommitOp, CommitResult, HypertableId, OperationIdentity, PartId, PartMeta,
+};
 
 use crate::CompactionLease;
 use crate::offsets::OffsetRange;
 use crate::{CatalogError, PostgresCatalog};
 
+/// What the catalog knows about one operation. There is no third answer: a
+/// rolled-back attempt left nothing behind, and an object in the store proves
+/// nothing (uploads precede the transaction, and orphans are ordinary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationLookup {
+    /// No commit carries this key. The work did not land — but the *old worker*
+    /// is gone too, so this is permission to replan from authority, never to
+    /// resume a stale payload.
+    Absent,
+    /// This exact intent is durable, under this commit.
+    Committed(CommitId),
+}
+
 impl PostgresCatalog {
     /// Atomically apply `op`. REPLACE/DELETE fail with `CatalogError::Conflict`
     /// if any input part is no longer live (another commit tombstoned it first);
     /// the caller should re-read live parts and retry.
+    ///
+    /// With an `identity`, the commit is *reconcilable*: a replay of the same
+    /// intent returns the original commit instead of applying anything, and a
+    /// lost acknowledgement becomes `AmbiguousMutation` rather than an unknown.
     pub async fn commit(
         &self,
         hypertable_id: HypertableId,
         op: CommitOp,
-        idempotency_key: Option<&str>,
+        identity: Option<&OperationIdentity>,
     ) -> Result<CommitResult, CatalogError> {
-        self.commit_inner(hypertable_id, op, idempotency_key, &[], None)
+        self.commit_inner(hypertable_id, op, identity, &[], None)
             .await
     }
 
@@ -28,8 +47,9 @@ impl PostgresCatalog {
         hypertable_id: HypertableId,
         op: CommitOp,
         offsets: &[OffsetRange],
+        identity: Option<&OperationIdentity>,
     ) -> Result<CommitResult, CatalogError> {
-        self.commit_inner(hypertable_id, op, None, offsets, None)
+        self.commit_inner(hypertable_id, op, identity, offsets, None)
             .await
     }
 
@@ -55,23 +75,49 @@ impl PostgresCatalog {
         lease: &CompactionLease,
         old: Vec<PartId>,
         new: Vec<PartMeta>,
-        idempotency_key: Option<&str>,
+        identity: Option<&OperationIdentity>,
     ) -> Result<CommitResult, CatalogError> {
         self.commit_inner(
             hypertable_id,
             CommitOp::Replace { old, new },
-            idempotency_key,
+            identity,
             &[],
             Some(lease),
         )
         .await
     }
 
+    /// Did this exact operation land? The authoritative answer, and the only
+    /// one: object-store state cannot be used to infer it (uploads precede the
+    /// transaction), and neither can a worker's memory of what it was doing.
+    ///
+    /// A stored key whose fingerprint differs — or is unknowable, as every
+    /// pre-plan-43 keyed row's is — is `OperationKeyCollision`, never
+    /// `Committed`. Answering "yes" for somebody else's commit is the one
+    /// failure this must not have.
+    pub async fn lookup_operation(
+        &self,
+        identity: &OperationIdentity,
+    ) -> Result<OperationLookup, CatalogError> {
+        let row: Option<(i64, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT id, operation_fingerprint FROM commits
+             WHERE hypertable_id = $1 AND idempotency_key = $2",
+        )
+        .bind(identity.hypertable_id().0)
+        .bind(identity.key())
+        .fetch_optional(&self.pool)
+        .await?;
+        match reconcile(identity, row)? {
+            Some(id) => Ok(OperationLookup::Committed(id)),
+            None => Ok(OperationLookup::Absent),
+        }
+    }
+
     async fn commit_inner(
         &self,
         hypertable_id: HypertableId,
         op: CommitOp,
-        idempotency_key: Option<&str>,
+        identity: Option<&OperationIdentity>,
         offsets: &[OffsetRange],
         lease: Option<&CompactionLease>,
     ) -> Result<CommitResult, CatalogError> {
@@ -80,7 +126,7 @@ impl PostgresCatalog {
         let kind = op.kind();
         let started = std::time::Instant::now();
         let result = self
-            .commit_txn(hypertable_id, op, idempotency_key, offsets, lease)
+            .commit_txn(hypertable_id, op, identity, offsets, lease)
             .await;
         metrics::histogram!("catalog_commit_duration_seconds", "kind" => kind)
             .record(started.elapsed().as_secs_f64());
@@ -108,22 +154,35 @@ impl PostgresCatalog {
         &self,
         hypertable_id: HypertableId,
         op: CommitOp,
-        idempotency_key: Option<&str>,
+        identity: Option<&OperationIdentity>,
         offsets: &[OffsetRange],
         lease: Option<&CompactionLease>,
     ) -> Result<CommitResult, CatalogError> {
+        // An identity is scoped to its hypertable. One that travels between
+        // tables is not an identity, and it would make the catalog's uniqueness
+        // scope and the caller's disagree.
+        if let Some(identity) = identity
+            && identity.hypertable_id() != hypertable_id
+        {
+            return Err(CatalogError::OperationHypertableMismatch {
+                identity: identity.hypertable_id().0,
+                mutation: hypertable_id.0,
+            });
+        }
+
         let mut tx = self.pool.begin().await?;
 
         if let Some(lease) = lease {
             // Ordering, deliberately: a replay of an operation that already
             // landed is *reconciled* before a lost lease is called a failure.
-            // A worker whose commit acknowledgement was lost must learn that
-            // its work is durable, not be told it lost the race and redo it.
-            // Today only an explicit idempotency key reaches this; HA phase 2's
-            // canonical compactor operation identities splice in here, and this
-            // is the ordering they inherit.
-            if let Some(key) = idempotency_key
-                && let Some(existing) = existing_commit(&mut tx, hypertable_id, key).await?
+            // A worker whose commit acknowledgement was lost must learn that its
+            // work is durable, not be told it lost the race and redo it. Its
+            // lease has very likely expired by then — that is what a lost
+            // acknowledgement plus a recovery looks like — and judging the lease
+            // first would answer `LeaseLost` for work that is already committed,
+            // sending a second worker to redo a merge that is already durable.
+            if let Some(identity) = identity
+                && let Some(existing) = lookup_in_tx(&mut tx, identity).await?
             {
                 return Ok(CommitResult::AlreadyApplied(existing));
             }
@@ -131,30 +190,34 @@ impl PostgresCatalog {
         }
 
         let inserted: Option<i64> = sqlx::query_scalar(
-            "INSERT INTO commits (hypertable_id, kind, idempotency_key)
-             VALUES ($1, $2, $3)
+            "INSERT INTO commits (hypertable_id, kind, idempotency_key, operation_fingerprint)
+             VALUES ($1, $2, $3, $4)
              ON CONFLICT (hypertable_id, idempotency_key) WHERE idempotency_key IS NOT NULL
              DO NOTHING
              RETURNING id",
         )
         .bind(hypertable_id.0)
         .bind(op.kind())
-        .bind(idempotency_key)
+        .bind(identity.map(|i| i.key()))
+        .bind(identity.map(|i| i.fingerprint().to_vec()))
         .fetch_optional(&mut *tx)
         .await?;
 
         let commit_id = match inserted {
             Some(id) => CommitId(id),
             None => {
-                // Idempotency-key collision: the work was already done.
-                let existing: i64 = sqlx::query_scalar(
-                    "SELECT id FROM commits WHERE hypertable_id = $1 AND idempotency_key = $2",
-                )
-                .bind(hypertable_id.0)
-                .bind(idempotency_key)
-                .fetch_one(&mut *tx)
-                .await?;
-                return Ok(CommitResult::AlreadyApplied(CommitId(existing)));
+                // The key is taken. Same intent → the work is already done and
+                // this attempt applies nothing. Different (or unknowable) intent
+                // → a collision, and the caller hears about it.
+                let identity =
+                    identity.expect("a conflict requires a key, and a key requires an identity");
+                let existing = lookup_in_tx(&mut tx, identity).await?.ok_or_else(|| {
+                    CatalogError::NotFound(format!(
+                        "commit for operation {} vanished between conflict and read",
+                        identity.key()
+                    ))
+                })?;
+                return Ok(CommitResult::AlreadyApplied(existing));
             }
         };
 
@@ -176,6 +239,12 @@ impl PostgresCatalog {
             // stored cursor has not advanced past this range's start. `<=`
             // (not `=`) keeps offset gaps legal (compacted topics). Zero rows
             // affected = another writer got here first: roll everything back.
+            //
+            // Idempotency does not replace this. A *replay* of the same intent
+            // never reaches here (it returned AlreadyApplied above); reaching
+            // here with an advanced cursor means a genuinely different operation
+            // overlaps an already-consumed range, which is a duplicate ingest
+            // worker — an OffsetRace, not a retry.
             let affected = sqlx::query(
                 "INSERT INTO ingest_offsets (hypertable_id, topic, kafka_partition, next_offset)
                  VALUES ($1, $2, $3, $4)
@@ -200,25 +269,81 @@ impl PostgresCatalog {
             }
         }
 
-        tx.commit().await?;
+        // The boundary. Everything before this point failed *definitely*: a
+        // conflict, an offset race, a lost lease, a bad statement — all of them
+        // rolled back, all of them "no". Only here can the transaction be
+        // durable while the answer is lost on the way home.
+        if let Err(e) = tx.commit().await {
+            return Err(ambiguous_or_definite(identity, e));
+        }
         Ok(CommitResult::Committed(commit_id))
     }
 }
 
-/// The commit already recorded under this idempotency key, if any.
-async fn existing_commit(
-    tx: &mut Transaction<'_, Postgres>,
-    hypertable_id: HypertableId,
-    key: &str,
+/// Classifies a failure returned by `COMMIT` itself.
+///
+/// Only a *transport* failure is ambiguous: the server may have committed and
+/// lost the acknowledgement. A retryable-database error (serialization failure,
+/// deadlock) is a definite rollback — PostgreSQL is explicitly telling us the
+/// transaction did not happen — and anything else is a definite failure too. All
+/// of those keep their existing meaning; calling them ambiguous would send the
+/// supervisor looking up an operation that provably is not there.
+fn ambiguous_or_definite(identity: Option<&OperationIdentity>, e: sqlx::Error) -> CatalogError {
+    let definite = CatalogError::Db(e);
+    if definite.class() != crate::CatalogErrorClass::Transport {
+        return definite;
+    }
+    let CatalogError::Db(e) = definite else {
+        unreachable!("just constructed as Db")
+    };
+    match identity {
+        Some(identity) => CatalogError::AmbiguousMutation {
+            key: identity.key().to_string(),
+            identity: Box::new(identity.clone()),
+            source: e,
+        },
+        // Unknown *and* undecidable. Loud, and never quietly retried: inventing
+        // a key now would be fabricating the evidence for the answer.
+        None => CatalogError::UnidentifiedAmbiguousMutation { source: e },
+    }
+}
+
+/// `Some(commit)` when this exact intent is already recorded, `None` when the
+/// key is free. A key under different — or unknowable — intent is a collision,
+/// which is the whole reason the fingerprint is stored beside the key.
+fn reconcile(
+    identity: &OperationIdentity,
+    row: Option<(i64, Option<Vec<u8>>)>,
 ) -> Result<Option<CommitId>, CatalogError> {
-    let id: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM commits WHERE hypertable_id = $1 AND idempotency_key = $2",
+    let Some((id, stored)) = row else {
+        return Ok(None);
+    };
+    let collision = || CatalogError::OperationKeyCollision {
+        key: identity.key().to_string(),
+    };
+    // A historical keyed commit has no fingerprint and its intent cannot be
+    // recovered. "Probably the same thing" is not an answer a reconciliation
+    // protocol is allowed to give.
+    let stored = stored.ok_or_else(collision)?;
+    if stored.as_slice() != identity.fingerprint().as_slice() {
+        return Err(collision());
+    }
+    Ok(Some(CommitId(id)))
+}
+
+async fn lookup_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    identity: &OperationIdentity,
+) -> Result<Option<CommitId>, CatalogError> {
+    let row: Option<(i64, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT id, operation_fingerprint FROM commits
+         WHERE hypertable_id = $1 AND idempotency_key = $2",
     )
-    .bind(hypertable_id.0)
-    .bind(key)
+    .bind(identity.hypertable_id().0)
+    .bind(identity.key())
     .fetch_optional(&mut **tx)
     .await?;
-    Ok(id.map(CommitId))
+    reconcile(identity, row)
 }
 
 /// Locks the lease row and proves this worker still owns the partition it is

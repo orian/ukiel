@@ -72,7 +72,17 @@ impl CatalogError {
             CatalogError::Schema(_)
             | CatalogError::SortKey(_)
             | CatalogError::LeasePartitionMismatch { .. }
-            | CatalogError::InvalidLeaseTtl(_) => CatalogErrorClass::PermanentInput,
+            | CatalogError::InvalidLeaseTtl(_)
+            | CatalogError::OperationKeyCollision { .. }
+            | CatalogError::OperationHypertableMismatch { .. } => CatalogErrorClass::PermanentInput,
+            // The outcome is unknown, and the connection is why: recovery must
+            // run. What separates the two is whether the outcome can be *asked*
+            // — an identified mutation is looked up and answered, an
+            // unidentified one can only be reported.
+            CatalogError::AmbiguousMutation { .. } => CatalogErrorClass::Transport,
+            CatalogError::UnidentifiedAmbiguousMutation { .. } => {
+                CatalogErrorClass::PermanentDatabase
+            }
             CatalogError::NotFound(_) => CatalogErrorClass::AbsentResource,
             // A migration that failed because the database was unreachable is a
             // *transport* failure wearing a migration's coat. Calling it
@@ -165,6 +175,49 @@ pub enum CatalogError {
 
     #[error("not found: {0}")]
     NotFound(String),
+
+    /// An operation key already in the catalog under *different* intent — or
+    /// under intent that cannot be known (a historical row with no fingerprint).
+    ///
+    /// Never `AlreadyApplied`: that answer would tell a worker that somebody
+    /// else's commit was its own, which is the one mistake this whole mechanism
+    /// exists to prevent. Permanent — the caller is wrong and will be wrong
+    /// again.
+    #[error("operation key {key} is already recorded under different intent")]
+    OperationKeyCollision { key: String },
+
+    /// An identity built for one hypertable submitted with a mutation on
+    /// another. A caller bug: the identity is scoped, and a fingerprint that
+    /// travels between tables is not an identity at all.
+    #[error("operation identity is for hypertable {identity}, but the mutation is on {mutation}")]
+    OperationHypertableMismatch { identity: i64, mutation: i64 },
+
+    /// The connection died at the commit boundary of an *identified* mutation.
+    /// The transaction may or may not be durable — that is the whole point of
+    /// the name. Classed as transport so plan 42's recovery runs, but carrying
+    /// the identity, so the supervisor can ask the catalog which it was instead
+    /// of guessing.
+    ///
+    /// It is never permission to replay: `Absent` means rebuild from authority
+    /// and let the fresh worker replan, not resume the old worker's payload.
+    #[error("commit outcome unknown for operation {key}: the connection failed at the boundary")]
+    AmbiguousMutation {
+        identity: Box<ukiel_core::OperationIdentity>,
+        key: String,
+        #[source]
+        source: sqlx::Error,
+    },
+
+    /// The same boundary, on a mutation that carried no identity. Its outcome is
+    /// equally unknown but *undecidable*: there is nothing to look up. Loud and
+    /// permanent, because the fix is to identify the caller, not to retry it —
+    /// and inventing a key after seeing the error would be fabricating the
+    /// evidence.
+    #[error("commit outcome unknown for an unidentified mutation: it cannot be reconciled")]
+    UnidentifiedAmbiguousMutation {
+        #[source]
+        source: sqlx::Error,
+    },
 
     /// A concurrent writer already advanced this topic-partition's ingest
     /// offset past the range being committed (issue 0003: two ingest workers

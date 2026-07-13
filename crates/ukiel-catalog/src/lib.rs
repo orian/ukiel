@@ -10,6 +10,7 @@ mod offsets;
 mod parts;
 mod tables;
 
+pub use commit::OperationLookup;
 pub use error::{CatalogError, CatalogErrorClass};
 pub use gc::GcBacklogs;
 pub use leases::CompactionLease;

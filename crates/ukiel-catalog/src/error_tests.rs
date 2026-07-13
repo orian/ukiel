@@ -156,3 +156,67 @@ fn a_connection_killed_during_the_handshake_is_transport() {
     assert_eq!(err.class(), CatalogErrorClass::Transport);
     assert!(err.is_recoverable_transport());
 }
+
+/// Plan 43: the two boundary errors, and the line between them.
+///
+/// Both mean "the transaction may be durable and we will never hear". What
+/// separates them is whether that question can be *asked*: an identified
+/// mutation has a key the catalog can be looked up by, an unidentified one has
+/// nothing, and inventing a key after the fact would be fabricating the evidence
+/// for the answer.
+#[test]
+fn an_ambiguous_mutation_is_transport_only_when_it_can_be_reconciled() {
+    let identity = ukiel_core::OperationIdentity::ingest(
+        ukiel_core::HypertableId(1),
+        &[ukiel_core::IngestRange {
+            topic: "events".into(),
+            partition: 0,
+            first: 0,
+            last: 9,
+        }],
+        1,
+    )
+    .unwrap();
+
+    let ambiguous = CatalogError::AmbiguousMutation {
+        key: identity.key().to_string(),
+        identity: Box::new(identity),
+        source: sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset by peer",
+        )),
+    };
+    assert_eq!(ambiguous.class(), CatalogErrorClass::Transport);
+    assert!(
+        ambiguous.is_recoverable_transport(),
+        "the role must recover — and then look the operation up"
+    );
+
+    // Undecidable, so loud. Retrying it would be guessing, and the guess that
+    // costs least to make is the one that duplicates data.
+    let unidentified = CatalogError::UnidentifiedAmbiguousMutation {
+        source: sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset by peer",
+        )),
+    };
+    assert_eq!(unidentified.class(), CatalogErrorClass::PermanentDatabase);
+    assert!(!unidentified.is_recoverable_transport());
+}
+
+/// A key collision is the caller's fault and will be the caller's fault next
+/// time. Never retried, never `AlreadyApplied`.
+#[test]
+fn an_operation_key_collision_is_permanent_input() {
+    let err = CatalogError::OperationKeyCollision {
+        key: "ukiel/ingest/v1/dead".into(),
+    };
+    assert_eq!(err.class(), CatalogErrorClass::PermanentInput);
+    assert!(!err.is_recoverable_transport());
+
+    let err = CatalogError::OperationHypertableMismatch {
+        identity: 1,
+        mutation: 2,
+    };
+    assert_eq!(err.class(), CatalogErrorClass::PermanentInput);
+}
