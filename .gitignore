@@ -3,3 +3,6 @@
 /bench/datasets/
 /bench/results/
 /bench/store/
+
+# Claude Code worktrees are checkouts, not content.
+.claude/worktrees/
