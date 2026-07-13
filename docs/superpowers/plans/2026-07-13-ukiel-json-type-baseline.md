@@ -4,6 +4,9 @@
 > progress, run each task's focused tests before its commit, and keep Plan 43's
 > ambiguous-mutation reconciliation out of this work.
 
+**Status:** Ready to execute. This plan is independent of the HA critical path
+and may run in parallel with Plan 43 in a separate worktree.
+
 **Goal:** Add an honest first `json` type to Ukiel, retain a complete Bluesky
 document beside its promoted hot fields, and run JSONBench's five queries over
 both representations. The default baseline is one source file (about one
@@ -18,6 +21,22 @@ extraction functions. That makes a small, deliberately simple baseline useful:
 it prices parse-at-read JSON, compares it with Ukiel's practical promoted-column
 posture on the same rows, and tells us whether columnar shredding deserves a
 later design.
+
+## Execution position and coordination
+
+Plan 44 may execute alongside Plan 43 because it changes the schema/type,
+expression, query, and benchmark paths rather than catalog commit/recovery
+semantics. Use a separate worktree. Both plans touch the roadmap only during
+close-out: the plan that finishes second must rebase that documentation change
+and preserve the other row's delivered status instead of resolving the conflict
+by taking one whole file.
+
+This benchmark's “1M” means roughly one million Bluesky events in one table. It
+does **not** exercise one million logical tables, thousands of hypertables, or
+the full namespace-admission cardinality in issue 0011, and it cannot close that
+evidence gate. Conversely, issue 0011 does not block this bounded feature
+baseline. If only one agent is available, Plan 43 remains first because it is a
+correctness/production gate; Plan 44 follows without changing its scope.
 
 ## Decision: lossless raw JSON plus promoted typed columns
 
@@ -123,8 +142,11 @@ fixture or reinterpreting its results.
 ## Prerequisites and constraints
 
 - Plans 30, 32, 34's shared suite harness, and 39 are executed.
-- Plan 43 remains reserved for ambiguous catalog mutation reconciliation and is
-  independent of this benchmark/type work.
+- Plan 43 owns ambiguous catalog mutation reconciliation and is independent of
+  this benchmark/type work; do not copy any of its catalog API changes here.
+- Issue 0011's million-logical-table catalog proof is a separate post-43
+  evidence gate. Never report this plan's million event rows as tenant/catalog
+  cardinality evidence.
 - Rust edition 2024, toolchain >= 1.96; keep DataFusion 54 and Arrow/Parquet
   58.3 pinned in lockstep.
 - No new JSON/path dependency in this plan. Use `serde_json::Value::pointer` for
@@ -464,6 +486,9 @@ cargo run --release -p ukiel-e2e --bin bench -- \
   catalog optimization hunt without new evidence.
 - [ ] **Step 6: Close out roadmap and plan, then commit:**
 
+  If Plan 43 changed the roadmap concurrently, rebase and edit only row 44 plus
+  the current execution note. Preserve row 43 and issue 0011 sequencing.
+
 ```bash
 git commit -m "docs: record the first Ukiel JSONBench baseline"
 ```
@@ -487,3 +512,5 @@ Plan 44 is complete only when all of the following are true:
    JSONPath claim the implementation did not measure.
 8. The close-out names one next representation decision from the measured
    result instead of silently growing this baseline into a second JSON engine.
+9. No report, README paragraph, or roadmap status describes the ~1M event
+   fixture as evidence for one million logical tables or catalog admission.
