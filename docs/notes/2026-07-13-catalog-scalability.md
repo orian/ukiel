@@ -293,6 +293,66 @@ scheduling rule, not a database limit.
 > rather than reporting the no-ops as swaps — which an earlier version of it did,
 > claiming 62,000 useful merges/s from a partition that only ever held 25 parts.
 
+## Partition leases: the scheduling rule, enforced (plan 41)
+
+The rule above ("do not run many workers against the same partition") is now
+mechanism rather than advice. A compactor claims a renewable lease on
+`(hypertable, partition)` **before it opens a Parquet file**, and that lease
+generation is fenced inside the REPLACE transaction. Re-run of the same A/B on a
+fixture with real merge headroom (`--tables 1 --parts 600000 --state backlogged`
+→ 3,500 live parts in the hot partition, so **no** point is fixture-bounded: every
+run below reports zero no-ops). Two reps per point; the spread is within ±7%.
+
+| shape | contenders | useful swaps/s (optimistic → leased) | conflicts | rollback tax | p99 |
+|---|---:|---|---:|---:|---|
+| same-partition | 2 | 37.7 → **41.3** | 349 → **0** | 48% → **0%** | 202 → **30** ms |
+| same-partition | 8 | 28.4 → **33.4** | 1,794 → **0** | 86% → **0%** | 302 → **30** ms |
+| same-partition | 32 | 9.4 → **18.3** | 2,778 → **0** | 97% → **0%** | 824 → **26** ms |
+| zipf (hot partition) | 2 | 48.1 → **48.8** | 29 → **0** | 6% → **0%** | 107 → **65** ms |
+| zipf | 8 | 70.6 → **121.3** | 701 → **0** | 50% → **0%** | 395 → **119** ms |
+| zipf | 32 | 47.4 → **146.2** | 1,607 → **0** | 77% → **0%** | 1,232 → **236** ms |
+| spread (own partition each) | 2 | 51.0 → 49.2 | 1 → **0** | 0.1% → 0% | 63 → 65 ms |
+| spread | 8 | 123.1 → 122.4 | 33 → **0** | 2.6% → **0%** | 168 → 119 ms |
+| spread | 32 | 111.4 → **148.2** | 465 → **0** | 29% → **0%** | 1,214 → **279** ms |
+
+**Compactor/compactor REPLACE conflicts are zero in every leased point** — not
+reduced, gone: the contender that does not own the partition never plans a merge.
+Optimistic REPLACE stays in the commit path and stays mandatory; it is simply no
+longer what resolves compactor-vs-compactor. It still catches the writers that
+take no lease, which is exactly its job (a catalog test proves a deletion racing a
+lease holder still makes the leased REPLACE conflict).
+
+Three results worth stating plainly:
+
+- **Optimistic REPLACE does not merely waste work at high contention — it loses
+  ground.** Same-partition useful throughput *falls* 37.7 → 9.4 swaps/s going from
+  2 to 32 contenders, because the retry storm crowds out the winners. Under a
+  lease the same 32 contenders do **18.3/s**, roughly 2×, and on the realistic
+  Zipf-hot shape **3.1×** (47.4 → 146.2).
+- **Partition-disjoint work does not regress.** Spread at 2 and 8 contenders is
+  flat within the repeatability band (49.2 vs 51.0; 122.4 vs 123.1) — the lease
+  serializes *inside* a partition, not across the fleet. At 32 it actually *wins*
+  (111.4 → 148.2), because "spread" still collides sometimes (30 partitions, 32
+  contenders) and those collisions were paying the tax.
+- **Latency is the quiet win.** p99 falls 824 → 26 ms at same-partition 32. A
+  worker that skips a partition it does not own returns in one round-trip instead
+  of retrying a doomed transaction five times.
+
+**The coordination is cheap, and priced.** The lease costs one upsert per
+candidate — at the worst point (same-partition, 32 contenders) 2,764 lease ops/s,
+essentially all of them *skips*: a contender is told "not yours" for the price of a
+single primary-key upsert. Against a measured 8,026 commits/s and 20k read QPS
+ceiling, that is inside the noise of the demand model, and it uses the existing
+pool: **no lease adds a connection**, so plan 40's first wall (`max_connections`)
+is exactly where it was — a 7-process fleet at 16 conns still wants 112 against a
+default 100, re-confirmed after this change.
+
+**Understated by construction.** This is the catalog-only bench: the work a losing
+contender throws away here is one `live_partition_parts` read. In the product it is
+a Parquet read, a k-way merge, and an upload — all paid *before* REPLACE says it
+lost. The component test asserts the product-path version directly: two compactors
+on one partition, and exactly one of them touches object storage at all.
+
 ## The driver is expensive, and that is a fleet-sizing fact
 
 At 21k read QPS the **bench driver burns ~6 cores** deserializing ~500k part rows/s
@@ -352,7 +412,9 @@ the failure it prevents is invisible to the metric most people watch.
 
 # OPTION VERDICTS
 
-Each with the deciding number. **No product change ships from plan 40.**
+Each with the deciding number. **No product change ships from plan 40 itself** —
+its one product consequence, partition leases, became plan 41 and is measured
+above (option 11).
 
 | # | option | verdict | the deciding number |
 |---|---|---|---|
@@ -366,6 +428,7 @@ Each with the deciding number. **No product change ships from plan 40.**
 | 8 | Typed stats columns / index changes | **DECLINE** | Buffer hit ratio 1.000; zero I/O waits; no lock waits. JSONB decode cost is **client-side** (the driver's 6 cores), which no Postgres schema change touches. |
 | 9 | Feed horizon / physical partitioning (row 23) | **RE-PRICED** | History is nearly free for reads — a 90%-tombstoned catalog is **6.5× faster** than a 90%-live one. Row 23's motivation is **disk and vacuum, not query latency**, and it should be argued on those terms. |
 | 10 | Hypertable sharding | **DECLINE** | Useful commit TPS is 8,026 against a 205 TPS backfill demand. Sharding is a last resort for a constraint that is 20–150× away. |
+| 11 | **Compaction partition leases** (plan 41) | **SHIPPED** | The one product change plan 40's numbers *did* earn. Compactor/compactor conflicts 2,778 → **0** at 32 same-partition contenders; useful throughput 2× there and 3.1× on the Zipf-hot shape; p99 824 → 26 ms; partition-disjoint work unchanged. Coordination costs one upsert per candidate on the existing pool, so `max_connections` remains the first wall. |
 
 ## The two invariants any future cache or replica must satisfy
 

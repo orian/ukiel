@@ -313,10 +313,27 @@ flush commits and have database-time expiry plus fencing generations.
 Multiple compactors are correctness-safe because optimistic REPLACE selects one
 winner, but duplicate workers can read, merge, and upload the same bytes.
 
-Baseline HA may run multiple replicas and accept this waste. An efficiency
-follow-up may add per-hypertable or partition leases. Unless the lease generation
-is validated in the commit transaction, leases are scheduling hints only;
-REPLACE remains the correctness layer.
+**Delivered (plan 41).** Partition scheduling leases now exist, and the lease
+generation *is* validated inside the REPLACE transaction, so they are more than
+scheduling hints — a zombie owner cannot commit over its successor. They are
+still not the correctness layer: ingest, deletion, and operator actions take no
+lease, so optimistic REPLACE remains what protects the data.
+
+- One renewable lease per `(hypertable, partition)` — the exclusion domain both
+  ladder compaction and finalization actually have — claimed *before* any object
+  work, with PostgreSQL-time expiry and a fencing generation.
+- Renewal runs independently of merge/commit progress; a proven loss or an
+  unreachable catalog cancels the in-flight merge before REPLACE.
+- Candidate discovery reads current live parts, so an abandoned merge stays
+  discoverable with no new feed event (a shared fleet cursor can pass it).
+- Measured: compactor/compactor REPLACE conflicts fall to zero and the wasted
+  object work with them; partition-disjoint throughput is unchanged. Numbers in
+  `docs/notes/2026-07-13-catalog-scalability.md`.
+
+Failover bound: a dead owner's partitions idle for at most
+`compactor.lease_ttl_secs` (default 60s) plus one poll interval before a peer
+reclaims them. The TTL trades failover delay against duplicate work; it is not a
+correctness knob at any value.
 
 On catalog failure:
 
@@ -570,14 +587,25 @@ failover RTO, retry volume, connection recovery, and post-failover headroom.
 - Canonical operation fingerprints.
 - Compactor/deletion/MV operation identities.
 - Lookup/reconciliation API.
-- Monotonic cursor update.
+- ~~Monotonic cursor update.~~ **Delivered (plan 41)**: `set_cursor` never
+  retreats, and a stale or equal write does not refresh `updated_at` — so a
+  delayed replica can neither prolong the GC fence nor impersonate progress.
 - Integration tests for lost commit acknowledgments.
+
+**This phase is the gate on active-active compaction in production.** Plan 41
+made the fleet efficient and failover-safe, not ambiguity-safe: a compactor whose
+commit acknowledgement is lost still cannot tell whether its REPLACE landed. The
+leased commit path already reconciles an idempotency-key replay *before* it
+judges the lease (a worker whose work is durable is told so, rather than being
+told it lost the race and redoing it), so phase 2's canonical operation
+identities splice into a path whose ordering is already fixed and tested.
 
 ### Phase 3: replicated workers
 
 - Dedicated migration/bootstrap job.
 - GC singleton lease.
-- Optional compactor scheduling leases.
+- ~~Optional compactor scheduling leases.~~ **Delivered (plan 41)**: renewable
+  partition leases, generation-fenced inside REPLACE, with HA handoff tests.
 - Horizontal ingest leases and fencing from its dedicated roadmap plan.
 - Rolling-deployment overlap tests.
 
@@ -596,7 +624,9 @@ Initial production shape:
 
 - query role: multiple active replicas across zones;
 - ingest role: one authoritative owner per partition set until leases land;
-- compactor role: two replicas allowed, accepting optimistic-conflict waste;
+- compactor role: two replicas allowed; partition leases (plan 41) remove the
+  optimistic-conflict waste, but enabling active-active in production still waits
+  on phase 2's ambiguous-mutation reconciliation;
 - GC role: two deployed replicas with one renewable owner;
 - collector: every process, with instance-aware metrics;
 - catalog: Aurora writer endpoint through RDS Proxy if pinning measurements are

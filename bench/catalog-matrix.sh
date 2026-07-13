@@ -113,13 +113,18 @@ for ppc in 1 4 16; do
     | grep -E "achieved|saturation|catalog grew"
 done
 
-for shape in same-partition zipf spread; do
-  for n in 2 8 32; do
-    seed mature >/dev/null
-    printf -- "--- conflict shape=%-15s contenders=%-3s " "$shape" "$n"
-    $B catalog conflict --label "cf-$shape-$n" --mode closed --workers "$n" \
-      --duration "$DUR" --warmup "$WARM" --shape "$shape" 2>&1 \
-      | grep -E "useful swaps/s" | head -1
+# Plan 41 A/B: the same shapes and contender counts, coordinated two ways.
+# optimistic = every contender does the work and loses at REPLACE (plan 40).
+# partition-lease = a contender that does not own the partition never plans.
+for coord in optimistic partition-lease; do
+  for shape in same-partition zipf spread; do
+    for n in 2 8 32; do
+      seed mature >/dev/null
+      printf -- "--- conflict coord=%-16s shape=%-15s contenders=%-3s " "$coord" "$shape" "$n"
+      $B catalog conflict --label "cf-$coord-$shape-$n" --mode closed --workers "$n" \
+        --duration "$DUR" --warmup "$WARM" --shape "$shape" --coordination "$coord" 2>&1 \
+        | grep -E "useful swaps/s" | head -1
+    done
   done
 done
 

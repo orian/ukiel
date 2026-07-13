@@ -54,6 +54,7 @@ USAGE:
     bench catalog read|write|conflict|mixed --label L [--mode closed|open] [--workers N] [--rate R]
         [--duration S] [--warmup S] [--timeout-ms N] [--pools N] [--connections-per-pool N]
         [--key-dist uniform|zipf] [--scenario S] [--parts-per-commit N] [--shape S]
+        [--coordination optimistic|partition-lease]   (conflict only; plan 41)
     bench catalog connections [--pools N] [--connections-per-pool N]
     bench clickhouse load --table official|cb [--files N]   ClickHouse reference fixtures
     bench clickhouse run --table official|cb|parquet [--iters N] [--label LABEL]
@@ -201,7 +202,8 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
                 "read" => catalog_load::read(cfg, table).await,
                 "conflict" => {
                     let shape = opt_str(args, "--shape").unwrap_or("same-partition");
-                    catalog_load::conflict(cfg, table, shape).await
+                    let coord = opt_str(args, "--coordination").unwrap_or("optimistic");
+                    catalog_load::conflict(cfg, table, shape, coord).await
                 }
                 "mixed" => catalog_load::mixed(cfg, table).await,
                 _ => {

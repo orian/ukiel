@@ -35,16 +35,15 @@ pub struct Env {
     pub catalog: PostgresCatalog,
     pub store: Arc<dyn ObjectStore>,
     pub ht: HypertableId,
+    /// So a test can open a *second*, independently killable pool.
+    pub url: String,
 }
 
 pub async fn setup() -> Env {
     let pg = Postgres::default().start().await.expect("postgres");
     let port = pg.get_host_port_ipv4(5432).await.unwrap();
-    let catalog = PostgresCatalog::connect(&format!(
-        "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
-    ))
-    .await
-    .unwrap();
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+    let catalog = PostgresCatalog::connect(&url).await.unwrap();
     catalog.migrate().await.unwrap();
     let ht = catalog
         .create_hypertable(
@@ -62,6 +61,7 @@ pub async fn setup() -> Env {
         catalog,
         store,
         ht,
+        url,
     }
 }
 
@@ -1495,5 +1495,68 @@ async fn finalization_and_the_ladder_share_the_partition_lease() {
             .unwrap()
             .is_some(),
         "the finalizer released the partition"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catalog_outage_during_renewal_stops_the_merge() {
+    // Proven loss is not the only way to lose a lease: a catalog we cannot reach
+    // leaves ownership *unknown*, and unknown is not permission to continue. The
+    // merge must stop there — no unfenced REPLACE, no tombstoned inputs — and
+    // the worker must report a real error rather than swallow it as churn.
+    let env = setup().await;
+    for i in 0..2 {
+        add_l0(
+            &env,
+            "d1",
+            vec![json!({"tenant_id": 1, "ts": i, "payload": format!("v{i}")})],
+        )
+        .await;
+    }
+    let before = live_payloads(&env).await;
+
+    // The compactor gets its own pool, so closing it is an outage for the
+    // worker alone and the test can still observe the catalog afterwards.
+    let worker_catalog = PostgresCatalog::connect(&env.url).await.unwrap();
+    let gate = Gate::new();
+    let (store, probe) = probe_store(env.store.clone(), Some(PreCommit::Gate(gate.clone())));
+    let compactor = Compactor::new(
+        worker_catalog.clone(),
+        store,
+        CompactorConfig {
+            worker_name: "outage".into(),
+            lease_ttl_ms: 5_000,
+            lease_renew_interval_ms: 100,
+            ..CompactorConfig::default()
+        },
+    );
+    let pass = tokio::spawn(async move { compactor.run_once().await });
+    gate.wait_for_arrival().await;
+    assert!(probe.uploads() > 0, "uploaded, not yet committed");
+
+    // The catalog goes away underneath the in-flight merge.
+    worker_catalog.pool_for_tests().close().await;
+
+    let result = tokio::time::timeout(Duration::from_secs(10), pass)
+        .await
+        .expect("the merge must be cancelled, not left parked at the gate")
+        .unwrap();
+    assert!(
+        result.is_err(),
+        "an unreachable catalog is a worker error, not routine lease churn"
+    );
+
+    // Nothing landed: the inputs are live, the data is whole, and the uploaded
+    // bytes stay intent-covered for GC.
+    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
+    assert_eq!(parts.len(), 2, "no input was tombstoned: {parts:?}");
+    assert_eq!(live_payloads(&env).await, before);
+    assert_eq!(
+        env.catalog
+            .orphaned_pending_objects(env.ht, 0.0)
+            .await
+            .unwrap()
+            .len(),
+        1
     );
 }

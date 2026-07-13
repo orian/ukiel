@@ -144,6 +144,7 @@ bench catalog seed --label L [--tables N] [--parts N] [--state fresh|mature|back
 bench catalog read|write|conflict|mixed --label L [--mode closed|open] [--workers N] [--rate R]
     [--duration S] [--warmup S] [--timeout-ms N] [--pools N] [--connections-per-pool N]
     [--key-dist uniform|zipf] [--scenario S] [--parts-per-commit N] [--shape S]
+    [--coordination optimistic|partition-lease]     # conflict only (plan 41)
 bench catalog connections [--pools N] [--connections-per-pool N]
 
 bench --help
@@ -155,6 +156,13 @@ bench --help
 create a Parquet file, never touch the object store, and never run a DataFusion
 query — the question is where the single primary stops meeting the SLO.
 
+> **Wipe the stack before running e2e again: `docker compose down -v`.** The seeder
+> leaves `bench_cat_*` hypertables holding ~100k live parts whose paths were never
+> uploaded anywhere. The compactor sweeps *every* hypertable, so a later `make e2e`
+> against the same Postgres will faithfully try to compact them and die on a 404
+> from MinIO. The bench is doing its job and so is the compactor; the fixture is
+> catalog-only by design.
+
 The whole matrix: `bash bench/catalog-matrix.sh` (env: `PARTS`, `TABLES`, `DUR`,
 `WARM`). Results in `docs/notes/2026-07-13-catalog-scalability.md`.
 
@@ -165,6 +173,18 @@ Four things the runbook gets right, each of which produced a wrong number first:
   NanoCPUs is set. A run whose recorded `pg_cpu_limit` differs from its label is
   invalid — every report records its own, which is how a mislabelled sweep was
   caught rather than published.
+- **Give the conflict fixture merge headroom, and each contender its own lease
+  identity.** Two ways this benchmark lies if you let it. (a) A shallow partition
+  merges *out* mid-run and the workers spin on no-ops — the run then measures an
+  exhausted fixture, not contention (it says so on the run; plan 40's published
+  conflict rows carry that caveat). Seed deep: `--tables 1 --parts 600000 --state
+  backlogged` puts ~3,500 live parts in the hot partition. (b) In
+  `--coordination partition-lease`, every contender must be its own lease owner.
+  Reacquisition by the *same* owner is deliberately idempotent — a worker
+  retrying must not invalidate the fence its own in-flight merge holds — so
+  same-owner contenders are all let straight through. An earlier version of the
+  arm gave every worker in a pool one uuid and reported 603 conflicts *under a
+  lease*.
 - **Reseed between points.** The write and conflict workloads *mutate* the catalog
   they measure (one unrecorded write run inflated the hot hypertable from 600 to
   113,380 live parts, and every read after it looked 25× slower for no reason).

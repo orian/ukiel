@@ -705,12 +705,44 @@ pub async fn write(cfg: LoadConfig, ht_name: &str, parts_per_commit: usize) -> a
 ///
 /// A conflict benchmark that reports attempts as throughput is measuring how fast
 /// it can fail.
-pub async fn conflict(cfg: LoadConfig, ht_name: &str, shape: &str) -> anyhow::Result<()> {
+pub async fn conflict(
+    cfg: LoadConfig,
+    ht_name: &str,
+    shape: &str,
+    coordination: &str,
+) -> anyhow::Result<()> {
     use ukiel_core::{CommitOp, PartMeta};
+
+    // `optimistic` is plan 40's arm: every contender does the work and loses at
+    // REPLACE. `partition-lease` is plan 41's: a contender that does not own the
+    // partition never plans a merge at all. In the catalog-only bench the
+    // "work" it skips is a live-parts read; in the product it is a Parquet
+    // read, a k-way merge, and an upload — which is why the two arms understate
+    // the real difference.
+    let leased = match coordination {
+        "optimistic" => false,
+        "partition-lease" => true,
+        other => {
+            anyhow::bail!("unknown --coordination '{other}' (expected optimistic|partition-lease)")
+        }
+    };
+    let coordination = coordination.to_string();
 
     let pools = Arc::new(build_pools(cfg.pools, cfg.connections_per_pool).await?);
     let ht = pools[0].get_hypertable(ht_name).await?;
     let ht_id = ht.id;
+
+    // Each contender stands in for one compactor process, so each gets its own
+    // owner identity. Sharing an owner across contenders would defeat the lease
+    // rather than test it: reacquisition by the *same* owner is deliberately
+    // idempotent (a worker retrying must not invalidate the fence its own
+    // in-flight merge holds), so same-owner contenders are all let straight
+    // through. Measured, not assumed: the first version of this arm handed every
+    // worker in a pool one uuid and reported 603 conflicts *under a lease*.
+    let lease_ttl = Duration::from_secs(60);
+    // A contender that finds the partition owned: the whole point of the lease.
+    let skipped = Arc::new(AtomicU64::new(0));
+    let acquired = Arc::new(AtomicU64::new(0));
 
     // Contention shape. `same-partition` is the worst case (every contender
     // targets one partition); `spread` gives each its own; `zipf` makes one
@@ -726,23 +758,28 @@ pub async fn conflict(cfg: LoadConfig, ht_name: &str, shape: &str) -> anyhow::Re
     let noops = Arc::new(AtomicU64::new(0));
 
     let report = {
-        let (attempts, conflicts, useful, noops, shape) = (
+        let (attempts, conflicts, useful, noops, shape, skipped, acquired) = (
             attempts.clone(),
             conflicts.clone(),
             useful.clone(),
             noops.clone(),
             shape.clone(),
+            skipped.clone(),
+            acquired.clone(),
         );
         run_load("conflict", &cfg, pools.clone(), move |pools, seq| {
-            let (attempts, conflicts, useful, noops, shape) = (
+            let (attempts, conflicts, useful, noops, shape, skipped, acquired) = (
                 attempts.clone(),
                 conflicts.clone(),
                 useful.clone(),
                 noops.clone(),
                 shape.clone(),
+                skipped.clone(),
+                acquired.clone(),
             );
             async move {
                 let cat = &pools[(seq as usize) % pools.len()];
+                let owner = uuid::Uuid::new_v4();
                 let day = match shape.as_str() {
                     "same-partition" => 0,
                     "zipf" => {
@@ -755,23 +792,46 @@ pub async fn conflict(cfg: LoadConfig, ht_name: &str, shape: &str) -> anyhow::Re
                     "day": format!("2026-01-{:02}", day + 1)
                 });
 
+                // Leased arm: claim the partition BEFORE planning anything. A
+                // contender that does not own it stops here — one cheap upsert
+                // instead of a merge it would have thrown away at REPLACE.
+                let lease = if leased {
+                    match cat
+                        .try_acquire_compaction_lease(ht_id, &partition, owner, lease_ttl)
+                        .await?
+                    {
+                        Some(lease) => {
+                            acquired.fetch_add(1, Ordering::Relaxed);
+                            Some(lease)
+                        }
+                        None => {
+                            skipped.fetch_add(1, Ordering::Relaxed);
+                            return Ok((0, 0));
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 // The compactor's loop: read fresh state, plan, swap, and on a
                 // conflict re-read and try again. Bounded, because an unbounded
                 // retry loop would report a latency that is really a livelock.
+                let mut result = Ok((0, 0));
                 for _ in 0..5 {
                     attempts.fetch_add(1, Ordering::Relaxed);
-                    let live = cat.live_parts(ht_id, None).await?;
-                    let inputs: Vec<_> = live
-                        .iter()
-                        .filter(|p| p.meta.partition_values == partition)
-                        .take(4)
-                        .collect();
+                    // The partition read the real compactor does (plan 41), not
+                    // a whole-hypertable scan filtered in Rust. On a fixture deep
+                    // enough to have merge headroom, the scan is what the run
+                    // would end up measuring — and it is not what the product
+                    // does. Both arms read the same way, so the A/B stays fair.
+                    let live = cat.live_partition_parts(ht_id, &partition).await?;
+                    let inputs: Vec<_> = live.iter().take(4).collect();
                     if inputs.len() < 2 {
                         // The partition is merged out. NOT a useful swap — and if
                         // this dominates, the fixture was exhausted and the point
                         // is about the fixture, not about conflict.
                         noops.fetch_add(1, Ordering::Relaxed);
-                        return Ok((0, 0));
+                        break;
                     }
                     let old: Vec<_> = inputs.iter().map(|p| p.id).collect();
                     let new = vec![PartMeta {
@@ -792,13 +852,25 @@ pub async fn conflict(cfg: LoadConfig, ht_name: &str, shape: &str) -> anyhow::Re
                         level: 1,
                         column_stats: None,
                     }];
-                    match cat
-                        .commit(ht_id, CommitOp::Replace { old, new }, None)
-                        .await
-                    {
+                    // Same REPLACE either way — the leased arm adds the fence,
+                    // it does not remove the optimistic check. A conflict in the
+                    // leased arm would mean a NON-compactor writer raced us,
+                    // which is exactly what it is still there to catch.
+                    let committed = match &lease {
+                        Some(lease) => {
+                            cat.commit_compaction_replace(ht_id, lease, old, new, None)
+                                .await
+                        }
+                        None => {
+                            cat.commit(ht_id, CommitOp::Replace { old, new }, None)
+                                .await
+                        }
+                    };
+                    match committed {
                         Ok(_) => {
                             useful.fetch_add(1, Ordering::Relaxed);
-                            return Ok((inputs.len() as u64, 0));
+                            result = Ok((inputs.len() as u64, 0));
+                            break;
                         }
                         Err(ukiel_catalog::CatalogError::Conflict { .. }) => {
                             // Lost the race. Every byte of work in this attempt is
@@ -807,10 +879,18 @@ pub async fn conflict(cfg: LoadConfig, ht_name: &str, shape: &str) -> anyhow::Re
                             conflicts.fetch_add(1, Ordering::Relaxed);
                             tokio::time::sleep(Duration::from_millis(2)).await;
                         }
-                        Err(e) => return Err(e.into()),
+                        Err(e) => {
+                            result = Err(e.into());
+                            break;
+                        }
                     }
                 }
-                Ok((0, 0))
+                // Hand the partition back so a peer can take it immediately;
+                // otherwise the TTL, not the work, would set the pace.
+                if let Some(lease) = &lease {
+                    cat.release_compaction_lease(lease).await?;
+                }
+                result
             }
         })
         .await?
@@ -820,10 +900,12 @@ pub async fn conflict(cfg: LoadConfig, ht_name: &str, shape: &str) -> anyhow::Re
     let c = conflicts.load(Ordering::Relaxed);
     let u = useful.load(Ordering::Relaxed);
     let no = noops.load(Ordering::Relaxed);
+    let sk = skipped.load(Ordering::Relaxed);
+    let acq = acquired.load(Ordering::Relaxed);
     let secs = report.duration_s.max(1.0);
     print_report(&report);
     println!(
-        "  conflict '{shape}': {a} attempts -> {u} USEFUL swaps, {c} conflicts, {no} no-ops\n  \
+        "  conflict '{shape}' [{coordination}]: {a} attempts -> {u} USEFUL swaps, {c} conflicts, {no} no-ops\n  \
          useful swaps/s {:.1}   |   attempted commits/s {:.1} (the number that would flatter us)\n  \
          rollback tax: {:.1}% of attempts thrown away",
         u as f64 / secs,
@@ -834,6 +916,16 @@ pub async fn conflict(cfg: LoadConfig, ht_name: &str, shape: &str) -> anyhow::Re
             0.0
         },
     );
+    if leased {
+        // The coordination cost, priced: what the lease charges Postgres per
+        // second, against the merges it stopped from being thrown away.
+        println!(
+            "  leases: {acq} acquired + {sk} skipped (owned by a peer) = {:.1} lease ops/s\n  \
+             {sk} contenders never planned a merge — in the product, that is the Parquet\n  \
+             read/merge/upload they did not pay for before losing at REPLACE",
+            (acq + sk) as f64 / secs,
+        );
+    }
     if no > u * 2 {
         println!(
             "  ! {no} no-ops vs {u} real swaps — the partition merged OUT during the run, so this\n  \
@@ -842,6 +934,10 @@ pub async fn conflict(cfg: LoadConfig, ht_name: &str, shape: &str) -> anyhow::Re
     }
     let mut v = serde_json::to_value(&report)?;
     v["conflict_shape"] = shape.into();
+    v["coordination"] = coordination.clone().into();
+    v["lease_acquired"] = acq.into();
+    v["lease_skipped"] = sk.into();
+    v["lease_ops_per_s"] = ((acq + sk) as f64 / secs).into();
     v["attempts"] = a.into();
     v["conflicts"] = c.into();
     v["useful_swaps"] = u.into();
