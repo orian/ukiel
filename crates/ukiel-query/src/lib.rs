@@ -7,5 +7,6 @@ pub mod metadata_cache;
 pub mod provider;
 pub mod results;
 pub mod server;
+pub mod view_types;
 
 pub use error::QueryError;
