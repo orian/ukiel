@@ -156,6 +156,13 @@ pub struct LoadReport {
     pub verdict_passes: bool,
     pub verdict_reasons: Vec<String>,
     pub achieved_headroom: f64,
+
+    /// What ran out, and the evidence for it. A knee with no cause cannot decide
+    /// between a pool knob, a replica and sharding.
+    pub saturation: Option<crate::catalog_obs::Attribution>,
+    pub env: Option<crate::catalog_obs::Env>,
+    /// Raw samples, kept so the classification can be argued with.
+    pub samples: Vec<crate::catalog_obs::Sample>,
 }
 
 #[derive(Default)]
@@ -217,6 +224,9 @@ where
     Fut: std::future::Future<Output = anyhow::Result<(u64, u64)>> + Send,
 {
     let demand = Demand::named(&cfg.scenario)?;
+    // A side connection, outside every measured pool — an observer that queued
+    // for the same connections would go blind exactly when the pool saturates.
+    let observer = crate::catalog_obs::Observer::start(&pg_url()).await.ok();
     let counters = Arc::new(Counters::default());
     // A std Mutex, not a tokio one: `record` never awaits while holding it, and a
     // tokio Mutex under thousands of concurrent completions serializes the whole
@@ -365,6 +375,20 @@ where
         }
     }
 
+    let obs_samples = match observer {
+        Some(o) => o.stop().await,
+        None => Vec::new(),
+    };
+    let saturation = Some(crate::catalog_obs::classify(
+        &obs_samples,
+        crate::catalog_obs::pg_cores(),
+        0, // pool waiters: sqlx does not expose them; the canary is separate
+        cfg.duration_s + cfg.warmup_s,
+    ));
+    let env = crate::catalog_obs::snapshot_env(pools[0].pool_for_tests(), 0)
+        .await
+        .ok();
+
     let mut samples = samples.lock().expect("samples lock");
     let mut totals: Vec<f64> = samples.iter().map(|s| s.total_ms).collect();
     let mut queues: Vec<f64> = samples.iter().map(|s| s.queue_ms).collect();
@@ -418,6 +442,9 @@ where
         verdict_passes: verdict.passes,
         verdict_reasons: verdict.reasons,
         achieved_headroom: verdict.achieved_headroom,
+        saturation,
+        env,
+        samples: obs_samples,
     })
 }
 
@@ -488,6 +515,20 @@ pub fn print_report(r: &LoadReport) {
         r.achieved_headroom,
         if r.verdict_passes { "PASS" } else { "FAIL" },
     );
+    if let Some(a) = &r.saturation {
+        println!(
+            "  saturation: {:?}   (pg {:.2} cores, driver {:.2} cores, buffer-hit {:.3}, \
+             peak active {})",
+            a.class,
+            a.pg_cpu_cores_used,
+            a.driver_cpu_cores_used,
+            a.cache_hit_ratio,
+            a.peak_active_backends
+        );
+        for e in &a.evidence {
+            println!("    - {e}");
+        }
+    }
     for reason in &r.verdict_reasons {
         println!("  ! {reason}");
     }

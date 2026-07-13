@@ -22,6 +22,7 @@ use std::process::ExitCode;
 mod bluesky;
 mod catalog;
 mod catalog_load;
+mod catalog_obs;
 mod clickbench;
 mod clickhouse;
 mod hits;
