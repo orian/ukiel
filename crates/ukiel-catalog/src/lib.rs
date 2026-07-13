@@ -5,12 +5,14 @@ mod cursors;
 mod error;
 mod feed;
 mod gc;
+mod leases;
 mod offsets;
 mod parts;
 mod tables;
 
 pub use error::CatalogError;
 pub use gc::GcBacklogs;
+pub use leases::CompactionLease;
 pub use offsets::OffsetRange;
 
 use sqlx::PgPool;

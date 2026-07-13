@@ -8,6 +8,25 @@ pub enum CatalogError {
         live_matched: usize,
     },
 
+    /// A leased REPLACE reached the commit transaction without owning its
+    /// partition any more: the lease expired, was reclaimed, or was released,
+    /// and the fence inside the transaction refused it (plan 41). The commit
+    /// was rolled back — nothing was tombstoned and nothing inserted. For a
+    /// compactor this is ordinary scheduling churn (a peer now owns the
+    /// partition and will redo the work), not a fault.
+    #[error("compaction lease lost for partition {partition} (owner/generation no longer current)")]
+    LeaseLost { partition: String },
+
+    /// A leased REPLACE named parts outside its leased partition — a caller
+    /// bug. Fencing partition A must never license a rewrite of partition B.
+    #[error("leased replace on partition {partition} touches parts outside it")]
+    LeasePartitionMismatch { partition: String },
+
+    /// A lease TTL that PostgreSQL cannot represent (zero, or beyond i64
+    /// milliseconds). Caught in Rust: an unusable interval must not reach SQL.
+    #[error("invalid lease ttl: {0}")]
+    InvalidLeaseTtl(String),
+
     #[error("not found: {0}")]
     NotFound(String),
 

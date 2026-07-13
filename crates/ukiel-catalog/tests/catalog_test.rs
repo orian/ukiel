@@ -1396,3 +1396,256 @@ async fn compaction_candidates_come_from_live_state() {
         "limit is honored"
     );
 }
+
+use std::time::Duration;
+use uuid::Uuid;
+
+/// Backdates a lease so it is expired for the next statement — stands in for a
+/// worker that stalled past its TTL, without sleeping through one.
+async fn expire_lease(
+    catalog: &ukiel_catalog::PostgresCatalog,
+    ht: HypertableId,
+    partition: &serde_json::Value,
+) {
+    sqlx::query(
+        "UPDATE compaction_leases SET expires_at = clock_timestamp() - INTERVAL '1 second'
+         WHERE hypertable_id = $1 AND partition_values = $2",
+    )
+    .bind(ht.0)
+    .bind(partition)
+    .execute(catalog.pool_for_tests())
+    .await
+    .unwrap();
+}
+
+const TTL: Duration = Duration::from_secs(60);
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_lease_winner_under_contention() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let day1 = json!({ "day": "2026-07-01" });
+
+    // 32 contenders (plan 40's worst same-partition shape) hit one partition.
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(32));
+    let mut handles = Vec::new();
+    for _ in 0..32 {
+        let (catalog, barrier, partition) = (catalog.clone(), barrier.clone(), day1.clone());
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            catalog
+                .try_acquire_compaction_lease(ht, &partition, Uuid::new_v4(), TTL)
+                .await
+                .unwrap()
+        }));
+    }
+    let mut won = Vec::new();
+    for h in handles {
+        if let Some(lease) = h.await.unwrap() {
+            won.push(lease);
+        }
+    }
+    assert_eq!(won.len(), 1, "exactly one owner: {won:?}");
+    assert_eq!(won[0].generation, 1);
+    assert_eq!(won[0].partition_values, day1);
+
+    // The 31 losers saw Ok(None) — contention is scheduling, not an error.
+    // A fresh contender still sees None while the owner is live.
+    assert!(
+        catalog
+            .try_acquire_compaction_lease(ht, &day1, Uuid::new_v4(), TTL)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn lease_reacquire_renew_and_release() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let day1 = json!({ "day": "2026-07-01" });
+    let day2 = json!({ "day": "2026-07-02" });
+    let owner = Uuid::new_v4();
+
+    let lease = catalog
+        .try_acquire_compaction_lease(ht, &day1, owner, TTL)
+        .await
+        .unwrap()
+        .expect("free partition");
+    assert_eq!(lease.generation, 1);
+
+    // The same owner reacquiring is idempotent: no generation churn (a retry
+    // must not invalidate the fence its own in-flight merge is holding).
+    let again = catalog
+        .try_acquire_compaction_lease(ht, &day1, owner, TTL)
+        .await
+        .unwrap()
+        .expect("own lease");
+    assert_eq!(again.generation, 1);
+
+    // Renewal extends expiry and preserves the generation.
+    let renewed = catalog
+        .renew_compaction_lease(&lease, Duration::from_secs(120))
+        .await
+        .unwrap()
+        .expect("still ours");
+    assert_eq!(renewed.generation, lease.generation);
+    assert!(renewed.expires_at > again.expires_at);
+
+    // Partitions are independent: a different one is free to another owner.
+    let other = catalog
+        .try_acquire_compaction_lease(ht, &day2, Uuid::new_v4(), TTL)
+        .await
+        .unwrap()
+        .expect("different partition");
+    assert_eq!(other.generation, 1);
+
+    // Release is scoped to the exact owner/generation.
+    assert!(catalog.release_compaction_lease(&renewed).await.unwrap());
+    assert!(
+        !catalog.release_compaction_lease(&renewed).await.unwrap(),
+        "releasing twice is a no-op, not a lie"
+    );
+    // Released -> immediately claimable by anyone, at the next generation.
+    let next = catalog
+        .try_acquire_compaction_lease(ht, &day1, Uuid::new_v4(), TTL)
+        .await
+        .unwrap()
+        .expect("released partition");
+    assert_eq!(next.generation, 1, "the row is gone: a fresh claim");
+}
+
+#[tokio::test]
+async fn expired_lease_is_taken_over_and_stale_owner_is_fenced_out() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let day1 = json!({ "day": "2026-07-01" });
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+
+    let stale = catalog
+        .try_acquire_compaction_lease(ht, &day1, a, TTL)
+        .await
+        .unwrap()
+        .expect("free");
+    // A stalls past its TTL.
+    expire_lease(&catalog, ht, &day1).await;
+
+    // B takes over; reclamation bumps the generation.
+    let fresh = catalog
+        .try_acquire_compaction_lease(ht, &day1, b, TTL)
+        .await
+        .unwrap()
+        .expect("expired lease is reclaimable");
+    assert_eq!(fresh.generation, stale.generation + 1);
+    assert_eq!(fresh.owner_id, b);
+
+    // A wakes up: it can neither renew nor release B's tenancy, and its renewal
+    // failure is a *proven* loss, not an error to retry.
+    assert!(
+        catalog
+            .renew_compaction_lease(&stale, TTL)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!catalog.release_compaction_lease(&stale).await.unwrap());
+    let held = catalog
+        .renew_compaction_lease(&fresh, TTL)
+        .await
+        .unwrap()
+        .expect("B still owns it");
+    assert_eq!(held.owner_id, b);
+
+    // An expired lease cannot renew itself back to life: only a fresh
+    // acquisition (which bumps the generation) restores tenancy.
+    expire_lease(&catalog, ht, &day1).await;
+    assert!(
+        catalog
+            .renew_compaction_lease(&fresh, TTL)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let regained = catalog
+        .try_acquire_compaction_lease(ht, &day1, b, TTL)
+        .await
+        .unwrap()
+        .expect("same owner reclaims");
+    assert_eq!(
+        regained.generation,
+        fresh.generation + 1,
+        "reclaim after expiry bumps the generation even for the same owner"
+    );
+}
+
+#[tokio::test]
+async fn lease_ttl_is_validated_in_rust() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let err = catalog
+        .try_acquire_compaction_lease(ht, &json!({"day": "d"}), Uuid::new_v4(), Duration::ZERO)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CatalogError::InvalidLeaseTtl(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn lease_stats_separate_active_from_abandoned() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let day1 = json!({ "day": "2026-07-01" });
+    let day2 = json!({ "day": "2026-07-02" });
+
+    assert_eq!(catalog.compaction_lease_stats().await.unwrap(), (0, 0.0));
+
+    catalog
+        .try_acquire_compaction_lease(ht, &day1, Uuid::new_v4(), TTL)
+        .await
+        .unwrap()
+        .unwrap();
+    catalog
+        .try_acquire_compaction_lease(ht, &day2, Uuid::new_v4(), TTL)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(catalog.compaction_lease_stats().await.unwrap(), (2, 0.0));
+
+    // An expired, unreclaimed lease is the wedged-fleet signal: it drops out of
+    // the active count and shows up as age.
+    expire_lease(&catalog, ht, &day1).await;
+    let (active, oldest) = catalog.compaction_lease_stats().await.unwrap();
+    assert_eq!(active, 1);
+    assert!(oldest >= 1.0, "expired ~1s ago, got {oldest}");
+}
+
+#[tokio::test]
+async fn lease_migration_applies_to_a_populated_pre_0008_catalog() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    add_l0_part(&catalog, ht, &json!({ "day": "2026-07-01" })).await;
+
+    // Rewind to a pre-0008 catalog that already holds data, then upgrade — the
+    // path a running deployment takes, not the fresh bootstrap setup() covers.
+    let pool = catalog.pool_for_tests();
+    sqlx::query("DROP TABLE compaction_leases")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 8")
+        .execute(pool)
+        .await
+        .unwrap();
+
+    catalog.migrate().await.unwrap();
+
+    let day = json!({ "day": "2026-07-01" });
+    let lease = catalog
+        .try_acquire_compaction_lease(ht, &day, Uuid::new_v4(), TTL)
+        .await
+        .unwrap()
+        .expect("leases work after the upgrade");
+    assert_eq!(lease.generation, 1);
+    // The pre-existing data is untouched by the upgrade.
+    assert_eq!(catalog.live_parts(ht, None).await.unwrap().len(), 1);
+}
