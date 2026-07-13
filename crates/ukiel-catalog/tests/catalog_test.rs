@@ -2040,3 +2040,57 @@ async fn an_idempotent_replay_is_reconciled_before_the_lease_is_judged() {
         "the replay changed nothing"
     );
 }
+
+#[tokio::test]
+async fn the_same_owner_is_fenced_by_generation_alone() {
+    // A restarted (or simply slow) worker can hold the *right* owner id and
+    // still be a zombie: it is the generation, bumped by every reclamation,
+    // that separates its old tenancy from its new one.
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let day1 = json!({ "day": "2026-07-01" });
+    add_l0_part(&catalog, ht, &day1).await;
+    add_l0_part(&catalog, ht, &day1).await;
+    let old = live_ids(&catalog, ht, &day1).await;
+
+    let owner = Uuid::new_v4();
+    let first = catalog
+        .try_acquire_compaction_lease(ht, &day1, owner, TTL)
+        .await
+        .unwrap()
+        .unwrap();
+    expire_lease(&catalog, ht, &day1).await;
+    let second = catalog
+        .try_acquire_compaction_lease(ht, &day1, owner, TTL)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.owner_id, first.owner_id);
+    assert_eq!(second.generation, first.generation + 1);
+
+    let err = catalog
+        .commit_compaction_replace(
+            ht,
+            &first,
+            old.clone(),
+            vec![l1_meta("stale.parquet", &day1)],
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CatalogError::LeaseLost { .. }), "{err:?}");
+
+    catalog
+        .commit_compaction_replace(
+            ht,
+            &second,
+            old,
+            vec![l1_meta("fresh.parquet", &day1)],
+            None,
+        )
+        .await
+        .unwrap();
+    let live = catalog.live_partition_parts(ht, &day1).await.unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].meta.path, "fresh.parquet");
+}

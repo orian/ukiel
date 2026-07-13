@@ -285,7 +285,12 @@ async fn concurrent_ingest_and_compaction_preserve_all_rows() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn competing_compactors_never_lose_data() {
+async fn competing_compactors_do_not_duplicate_object_work() {
+    // Plan 41's whole point. Before leases, both workers read, merged and
+    // uploaded the same partition's Parquet and only *then* discovered at
+    // REPLACE that one of them had wasted all of it. Now the loser never opens
+    // a file. Data safety is not the assertion any more (REPLACE always gave
+    // us that) — efficiency is.
     let env = setup().await;
     for i in 0..4 {
         add_l0(
@@ -297,36 +302,81 @@ async fn competing_compactors_never_lose_data() {
     }
     let before = live_payloads(&env).await;
 
-    // Two compactors with distinct cursors plan from the same live state.
-    let c1 = Compactor::new(
-        env.catalog.clone(),
-        env.store.clone(),
-        CompactorConfig {
-            worker_name: "c1".into(),
-            ..CompactorConfig::default()
-        },
-    );
-    let c2 = Compactor::new(
-        env.catalog.clone(),
-        env.store.clone(),
-        CompactorConfig {
-            worker_name: "c2".into(),
-            ..CompactorConfig::default()
-        },
-    );
-    let (r1, r2) = tokio::join!(c1.run_once(), c2.run_once());
-    let (s1, s2) = (r1.unwrap(), r2.unwrap());
+    // Each worker gets its own probe over the shared store, so "who touched
+    // object storage" is attributable.
+    let (s1, p1) = probe_store(env.store.clone(), None);
+    let (s2, p2) = probe_store(env.store.clone(), None);
+    let c1 = Compactor::new(env.catalog.clone(), s1, worker_config("c1"));
+    let c2 = Compactor::new(env.catalog.clone(), s2, worker_config("c2"));
 
-    // Whatever interleaving happened — one merged, both merged sequentially,
-    // or one conflicted — the data is intact and exactly one L1 lineage wins.
+    let (r1, r2) = tokio::join!(c1.run_once(), c2.run_once());
+    let (stats1, stats2) = (r1.unwrap(), r2.unwrap());
+
+    assert_eq!(
+        stats1.merged_groups + stats2.merged_groups,
+        1,
+        "one useful merge, not two: {stats1:?} {stats2:?}"
+    );
+    assert_eq!(
+        stats1.conflicts + stats2.conflicts,
+        0,
+        "the lease, not the REPLACE, resolved the race: {stats1:?} {stats2:?}"
+    );
+
+    // Exactly one worker paid for Parquet reads and an upload.
+    let touched = [&p1, &p2].map(|p| p.reads() > 0 || p.uploads() > 0);
+    assert_eq!(
+        touched.iter().filter(|t| **t).count(),
+        1,
+        "one worker in object storage: p1={:?} p2={:?}",
+        (p1.reads(), p1.uploads()),
+        (p2.reads(), p2.uploads())
+    );
+
     assert_eq!(live_payloads(&env).await, before);
     let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
-    let total: i64 = parts.iter().map(|p| p.meta.row_count).sum();
-    assert_eq!(total, 4);
-    assert!(
-        s1.merged_groups + s2.merged_groups >= 1,
-        "at least one pass merged: {s1:?} {s2:?}"
+    assert_eq!(parts.iter().map(|p| p.meta.row_count).sum::<i64>(), 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn disjoint_partitions_still_compact_in_parallel() {
+    // The lease serializes *inside* a partition; across partitions the fleet
+    // must still scale. Both workers rendezvous at their pre-commit barrier:
+    // if one worker were doing both merges, the other would never arrive and
+    // this test would hang — the strongest available proof of parallel work.
+    let env = setup().await;
+    for day in ["d1", "d2"] {
+        for i in 0..2 {
+            add_l0(
+                &env,
+                day,
+                vec![json!({"tenant_id": 1, "ts": i, "payload": format!("{day}-{i}")})],
+            )
+            .await;
+        }
+    }
+    let before = live_payloads(&env).await;
+
+    let rendezvous = Arc::new(tokio::sync::Barrier::new(2));
+    let (s1, p1) = probe_store(
+        env.store.clone(),
+        Some(PreCommit::Rendezvous(rendezvous.clone())),
     );
+    let (s2, p2) = probe_store(env.store.clone(), Some(PreCommit::Rendezvous(rendezvous)));
+    let c1 = Compactor::new(env.catalog.clone(), s1, worker_config("c1"));
+    let c2 = Compactor::new(env.catalog.clone(), s2, worker_config("c2"));
+
+    let (r1, r2) = tokio::join!(c1.run_once(), c2.run_once());
+    let (stats1, stats2) = (r1.unwrap(), r2.unwrap());
+
+    assert_eq!(stats1.merged_groups, 1, "{stats1:?}");
+    assert_eq!(stats2.merged_groups, 1, "{stats2:?}");
+    assert_eq!(stats1.conflicts + stats2.conflicts, 0);
+    assert!(p1.uploads() > 0 && p2.uploads() > 0);
+
+    assert_eq!(live_payloads(&env).await, before);
+    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
+    assert_eq!(parts.len(), 2, "one merged run per partition: {parts:?}");
 }
 
 pub async fn sqlx_update_schema(env: &Env, schema: &serde_json::Value) {
@@ -913,4 +963,537 @@ async fn backlog_is_compacted_without_a_new_feed_event() {
         "live state, not the feed, is the work ledger"
     );
     assert_eq!(env.catalog.live_parts(env.ht, None).await.unwrap().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Lease test support (plan 41): who touched object storage, and a hook that can
+// freeze a worker in the one moment where a handoff is dangerous — after its
+// output is uploaded, before its REPLACE.
+// ---------------------------------------------------------------------------
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+use uuid::Uuid;
+
+#[derive(Clone)]
+pub enum PreCommit {
+    /// Park until the test opens the gate; `arrived` says a worker is parked.
+    Gate(Arc<Gate>),
+    /// Meet N-1 other workers here (proves they are working in parallel).
+    Rendezvous(Arc<tokio::sync::Barrier>),
+}
+
+#[derive(Debug)]
+pub struct Gate {
+    arrived: AtomicUsize,
+    open: tokio::sync::Semaphore,
+}
+
+impl Gate {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Gate {
+            arrived: AtomicUsize::new(0),
+            open: tokio::sync::Semaphore::new(0),
+        })
+    }
+    /// Waits until a worker is parked at the gate (i.e. its upload is done and
+    /// only the catalog commit is left).
+    pub async fn wait_for_arrival(&self) {
+        for _ in 0..600 {
+            if self.arrived.load(Ordering::SeqCst) > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("no worker reached the pre-commit gate");
+    }
+    pub fn open(&self) {
+        self.open.add_permits(1);
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct Probe {
+    reads: AtomicUsize,
+    uploads: AtomicUsize,
+}
+
+impl Probe {
+    pub fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+    pub fn uploads(&self) -> usize {
+        self.uploads.load(Ordering::SeqCst)
+    }
+}
+
+/// Counts one worker's object-store traffic and, optionally, fires `pre_commit`
+/// on the `head` of an object *this store wrote* — the last object-store call a
+/// merge makes before it commits.
+struct ProbeStore {
+    inner: Arc<dyn ObjectStore>,
+    probe: Arc<Probe>,
+    written: Mutex<HashSet<String>>,
+    pre_commit: Option<PreCommit>,
+}
+
+fn probe_store(
+    inner: Arc<dyn ObjectStore>,
+    pre_commit: Option<PreCommit>,
+) -> (Arc<dyn ObjectStore>, Arc<Probe>) {
+    let probe = Arc::new(Probe::default());
+    let store = Arc::new(ProbeStore {
+        inner,
+        probe: probe.clone(),
+        written: Mutex::new(HashSet::new()),
+        pre_commit,
+    });
+    (store, probe)
+}
+
+/// A compactor that renews often and expires fast, so a test can drive handoff
+/// in seconds rather than a minute.
+fn worker_config(name: &str) -> CompactorConfig {
+    CompactorConfig {
+        worker_name: name.into(),
+        lease_ttl_ms: 5_000,
+        lease_renew_interval_ms: 200,
+        ..CompactorConfig::default()
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for ProbeStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OsResult<PutResult> {
+        self.probe.uploads.fetch_add(1, Ordering::SeqCst);
+        self.written
+            .lock()
+            .unwrap()
+            .insert(location.as_ref().to_string());
+        self.inner.put_opts(location, payload, opts).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.probe.uploads.fetch_add(1, Ordering::SeqCst);
+        self.written
+            .lock()
+            .unwrap()
+            .insert(location.as_ref().to_string());
+        self.inner.put_multipart_opts(location, opts).await
+    }
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        // The merge's last object-store call is the `head` of the file it just
+        // wrote (`ObjectStoreExt::head` = a head-only `get_opts`), so that is
+        // where a test can freeze a worker between "uploaded" and "committed".
+        // A head of an input part is an ordinary metadata read, not our hook.
+        let ours = options.head && self.written.lock().unwrap().contains(location.as_ref());
+        if ours {
+            match self.pre_commit.clone() {
+                Some(PreCommit::Gate(gate)) => {
+                    gate.arrived.fetch_add(1, Ordering::SeqCst);
+                    let _permit = gate.open.acquire().await.expect("gate not closed");
+                    gate.arrived.fetch_sub(1, Ordering::SeqCst);
+                }
+                Some(PreCommit::Rendezvous(barrier)) => {
+                    barrier.wait().await;
+                }
+                None => {}
+            }
+        } else {
+            self.probe.reads.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.get_opts(location, options).await
+    }
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OsResult<Path>>,
+    ) -> BoxStream<'static, OsResult<Path>> {
+        self.inner.delete_stream(locations)
+    }
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OsResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: object_store::CopyOptions,
+    ) -> OsResult<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+impl fmt::Debug for ProbeStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ProbeStore")
+    }
+}
+
+impl fmt::Display for ProbeStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ProbeStore")
+    }
+}
+
+/// Backdates every lease on a partition: the worker stalled past its TTL.
+async fn expire_leases(env: &Env, day: &str) {
+    sqlx::query(
+        "UPDATE compaction_leases SET expires_at = clock_timestamp() - INTERVAL '1 second'
+         WHERE hypertable_id = $1 AND partition_values = $2",
+    )
+    .bind(env.ht.0)
+    .bind(json!({ "day": day }))
+    .execute(env.catalog.pool_for_tests())
+    .await
+    .unwrap();
+}
+
+async fn lease_generation(env: &Env, day: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT generation FROM compaction_leases
+         WHERE hypertable_id = $1 AND partition_values = $2",
+    )
+    .bind(env.ht.0)
+    .bind(json!({ "day": day }))
+    .fetch_one(env.catalog.pool_for_tests())
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_owner_cannot_commit_after_handoff() {
+    // A is frozen with its output uploaded and only the REPLACE left. Its lease
+    // expires and B takes the partition. When A resumes, the fence inside the
+    // REPLACE transaction — not a check A performed on itself — is what refuses
+    // it. Renewal is turned off (interval > the test) so the *commit* fence is
+    // what is under test here, not the renewal loop.
+    let env = setup().await;
+    for i in 0..2 {
+        add_l0(
+            &env,
+            "d1",
+            vec![json!({"tenant_id": 1, "ts": i, "payload": format!("v{i}")})],
+        )
+        .await;
+    }
+    let before = live_payloads(&env).await;
+
+    let gate = Gate::new();
+    let (store_a, probe_a) = probe_store(env.store.clone(), Some(PreCommit::Gate(gate.clone())));
+    let a = Compactor::new(
+        env.catalog.clone(),
+        store_a,
+        CompactorConfig {
+            worker_name: "a".into(),
+            lease_ttl_ms: 5_000,
+            lease_renew_interval_ms: 600_000, // never renews during the test
+            ..CompactorConfig::default()
+        },
+    );
+    let a_pass = tokio::spawn(async move { a.run_once().await.unwrap() });
+
+    // A is parked: uploaded, uncommitted.
+    gate.wait_for_arrival().await;
+    let generation = lease_generation(&env, "d1").await;
+
+    // A dies as far as the catalog can tell, and peer B claims the partition at
+    // the next generation.
+    expire_leases(&env, "d1").await;
+    let b_lease = env
+        .catalog
+        .try_acquire_compaction_lease(env.ht, &json!({"day": "d1"}), Uuid::new_v4(), TEST_TTL)
+        .await
+        .unwrap()
+        .expect("expired lease is claimable");
+    assert_eq!(b_lease.generation, generation + 1);
+
+    // A resumes into a partition it no longer owns. Its REPLACE is refused.
+    gate.open();
+    let stats_a = a_pass.await.unwrap();
+    assert_eq!(
+        stats_a.merged_groups, 0,
+        "the zombie's REPLACE was fenced out"
+    );
+    assert_eq!(
+        stats_a.conflicts, 0,
+        "and it is lease loss, not an optimistic conflict"
+    );
+    assert!(probe_a.uploads() > 0, "A had already uploaded its output");
+
+    // Nothing of A's landed: its inputs are still live, and the bytes it did
+    // upload stay intent-covered for GC (lease loss never clears an intent).
+    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
+    assert_eq!(parts.len(), 2, "no input was tombstoned: {parts:?}");
+    assert_eq!(
+        env.catalog
+            .orphaned_pending_objects(env.ht, 0.0)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "A's abandoned upload is a tracked orphan, not a leak"
+    );
+
+    // B, holding the partition, does the work A never finished.
+    env.catalog
+        .release_compaction_lease(&b_lease)
+        .await
+        .unwrap();
+    let (store_b, probe_b) = probe_store(env.store.clone(), None);
+    let b = Compactor::new(env.catalog.clone(), store_b, worker_config("b"));
+    assert_eq!(b.run_once().await.unwrap().merged_groups, 1);
+    assert!(probe_b.uploads() > 0);
+
+    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
+    assert_eq!(parts.len(), 1, "{parts:?}");
+    assert_eq!(live_payloads(&env).await, before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dead_owner_hands_its_backlog_to_a_peer() {
+    // A claims the partition and dies without releasing (no graceful shutdown,
+    // no new feed event afterwards). The backlog must still converge once the
+    // lease expires: a cursor-driven fleet would have lost it forever.
+    let env = setup().await;
+    for i in 0..2 {
+        add_l0(
+            &env,
+            "d1",
+            vec![json!({"tenant_id": 1, "ts": i, "payload": format!("v{i}")})],
+        )
+        .await;
+    }
+    let before = live_payloads(&env).await;
+
+    let gate = Gate::new();
+    let (store_a, _probe_a) = probe_store(env.store.clone(), Some(PreCommit::Gate(gate.clone())));
+    let a = Compactor::new(
+        env.catalog.clone(),
+        store_a,
+        CompactorConfig {
+            worker_name: "fleet".into(), // one shared fleet cursor
+            lease_ttl_ms: 5_000,
+            lease_renew_interval_ms: 600_000,
+            ..CompactorConfig::default()
+        },
+    );
+    let a_pass = tokio::spawn(async move { a.run_once().await });
+    gate.wait_for_arrival().await;
+
+    // Kill A mid-merge: the task is dropped, the lease is never released.
+    a_pass.abort();
+    assert!(a_pass.await.unwrap_err().is_cancelled());
+
+    // B shares the cursor name, and A already advanced it past the feed — so B
+    // has no unread event to wake on. It still finds the work in live state,
+    // and the expired lease lets it claim the partition.
+    let (store_b, probe_b) = probe_store(env.store.clone(), None);
+    let b = Compactor::new(env.catalog.clone(), store_b, worker_config("fleet"));
+    assert_eq!(
+        b.run_once().await.unwrap().merged_groups,
+        0,
+        "A's lease is still live: B leaves the partition alone"
+    );
+    assert_eq!(probe_b.uploads(), 0, "and does no object work for it");
+
+    expire_leases(&env, "d1").await;
+    let stats = b.run_once().await.unwrap();
+    assert_eq!(stats.merged_groups, 1, "expiry hands the backlog to B");
+
+    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
+    assert_eq!(parts.len(), 1, "{parts:?}");
+    assert_eq!(live_payloads(&env).await, before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_merge_survives_on_renewals() {
+    // The merge outlives its initial TTL several times over. Renewal is what
+    // keeps it legal — and renewal preserves the generation, so the commit it
+    // finally makes is still fenced by the claim it started with.
+    let env = setup().await;
+    for i in 0..2 {
+        add_l0(
+            &env,
+            "d1",
+            vec![json!({"tenant_id": 1, "ts": i, "payload": format!("v{i}")})],
+        )
+        .await;
+    }
+    let before = live_payloads(&env).await;
+
+    let gate = Gate::new();
+    let (store, _probe) = probe_store(env.store.clone(), Some(PreCommit::Gate(gate.clone())));
+    let compactor = Compactor::new(
+        env.catalog.clone(),
+        store,
+        CompactorConfig {
+            worker_name: "slow".into(),
+            lease_ttl_ms: 1_000,
+            lease_renew_interval_ms: 100,
+            ..CompactorConfig::default()
+        },
+    );
+    let generation_before = {
+        let pass = tokio::spawn(async move { compactor.run_once().await.unwrap() });
+        gate.wait_for_arrival().await;
+        let g = lease_generation(&env, "d1").await;
+        // Park for 3x the TTL: without renewal the lease would be long gone.
+        tokio::time::sleep(Duration::from_millis(3_000)).await;
+        assert_eq!(
+            lease_generation(&env, "d1").await,
+            g,
+            "renewal extends the tenancy without a new generation"
+        );
+        gate.open();
+        let stats = pass.await.unwrap();
+        assert_eq!(stats.merged_groups, 1, "the slow merge committed");
+        g
+    };
+    assert_eq!(generation_before, 1);
+
+    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(live_payloads(&env).await, before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn renewal_loss_cancels_the_merge_before_replace() {
+    // Renewal, not the commit, is the fast path for noticing a handoff: the
+    // moment ownership is provably gone, the merge future is dropped. Nothing
+    // is tombstoned, and the bytes already uploaded stay intent-covered so GC
+    // (not the compactor) is what eventually removes them.
+    let env = setup().await;
+    for i in 0..2 {
+        add_l0(
+            &env,
+            "d1",
+            vec![json!({"tenant_id": 1, "ts": i, "payload": format!("v{i}")})],
+        )
+        .await;
+    }
+    let before = live_payloads(&env).await;
+
+    let gate = Gate::new();
+    let (store, probe) = probe_store(env.store.clone(), Some(PreCommit::Gate(gate.clone())));
+    let compactor = Compactor::new(
+        env.catalog.clone(),
+        store,
+        CompactorConfig {
+            worker_name: "loser".into(),
+            lease_ttl_ms: 5_000,
+            lease_renew_interval_ms: 100,
+            ..CompactorConfig::default()
+        },
+    );
+    let pass = tokio::spawn(async move { compactor.run_once().await.unwrap() });
+    gate.wait_for_arrival().await;
+    assert!(probe.uploads() > 0, "the upload completed before the loss");
+
+    // Someone else takes the partition; the next renewal proves the loss.
+    expire_leases(&env, "d1").await;
+    let thief = env
+        .catalog
+        .try_acquire_compaction_lease(env.ht, &json!({"day": "d1"}), Uuid::new_v4(), TEST_TTL)
+        .await
+        .unwrap()
+        .expect("expired lease is claimable");
+    assert_eq!(thief.generation, 2);
+
+    // The merge is cancelled while still parked: the gate is never opened.
+    let stats = tokio::time::timeout(Duration::from_secs(10), pass)
+        .await
+        .expect("renewal loss must cancel the merge without opening the gate")
+        .unwrap();
+    assert_eq!(stats.merged_groups, 0);
+    assert_eq!(
+        stats.conflicts, 0,
+        "lease loss is not an optimistic conflict"
+    );
+
+    // Inputs untouched, no output registered, uploaded bytes still tracked.
+    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
+    assert_eq!(parts.len(), 2, "no live input was tombstoned: {parts:?}");
+    assert_eq!(live_payloads(&env).await, before);
+    assert_eq!(
+        env.catalog
+            .orphaned_pending_objects(env.ht, 0.0)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the abandoned upload keeps its intent row"
+    );
+}
+
+const TEST_TTL: Duration = Duration::from_secs(60);
+
+#[tokio::test(flavor = "multi_thread")]
+async fn finalization_and_the_ladder_share_the_partition_lease() {
+    // Finalization consumes *every* live part of a partition; a level merge
+    // consumes some of them. They must not run at once — so they take the same
+    // lease, and the one that arrives second finds the partition held.
+    let env = setup().await;
+    for i in 0..3 {
+        add_l0(
+            &env,
+            "d1",
+            vec![json!({"tenant_id": 1, "ts": i, "payload": format!("v{i}")})],
+        )
+        .await;
+    }
+    let before = live_payloads(&env).await;
+
+    let compactor = Compactor::new(
+        env.catalog.clone(),
+        env.store.clone(),
+        CompactorConfig {
+            l0_fanout: 100, // the ladder never triggers; only finalization does
+            fanout: 100,
+            finalize_after_secs: 0,
+            ..worker_config("f1")
+        },
+    );
+
+    // A peer holds the partition: finalization must not touch it.
+    let peer = env
+        .catalog
+        .try_acquire_compaction_lease(env.ht, &json!({"day": "d1"}), Uuid::new_v4(), TEST_TTL)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        compactor.finalize_once().await.unwrap(),
+        0,
+        "a claimed partition is not finalized under its owner"
+    );
+    assert_eq!(env.catalog.live_parts(env.ht, None).await.unwrap().len(), 3);
+
+    // Released: finalization claims it and folds the partition into one run.
+    env.catalog.release_compaction_lease(&peer).await.unwrap();
+    assert_eq!(compactor.finalize_once().await.unwrap(), 1);
+    let parts = env.catalog.live_parts(env.ht, None).await.unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(live_payloads(&env).await, before);
+
+    // The lease is handed back after the sweep, not held until expiry.
+    assert!(
+        env.catalog
+            .try_acquire_compaction_lease(env.ht, &json!({"day": "d1"}), Uuid::new_v4(), TEST_TTL)
+            .await
+            .unwrap()
+            .is_some(),
+        "the finalizer released the partition"
+    );
 }
