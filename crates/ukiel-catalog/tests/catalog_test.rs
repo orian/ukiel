@@ -1480,7 +1480,10 @@ async fn one_lease_winner_under_contention() {
         }
     }
     assert_eq!(won.len(), 1, "exactly one owner: {won:?}");
-    assert_eq!(won[0].generation, 1);
+    // The generation is a sequence draw, not a count: the 31 losers each
+    // evaluated the VALUES list on their way to losing, so the winner's token
+    // says nothing about how many contenders there were.
+    assert!(won[0].generation > 0);
     assert_eq!(won[0].partition_values, day1);
 
     // The 31 losers saw Ok(None) — contention is scheduling, not an error.
@@ -1507,7 +1510,6 @@ async fn lease_reacquire_renew_and_release() {
         .await
         .unwrap()
         .expect("free partition");
-    assert_eq!(lease.generation, 1);
 
     // The same owner reacquiring is idempotent: no generation churn (a retry
     // must not invalidate the fence its own in-flight merge is holding).
@@ -1516,7 +1518,7 @@ async fn lease_reacquire_renew_and_release() {
         .await
         .unwrap()
         .expect("own lease");
-    assert_eq!(again.generation, 1);
+    assert_eq!(again.generation, lease.generation);
 
     // Renewal extends expiry and preserves the generation.
     let renewed = catalog
@@ -1533,7 +1535,7 @@ async fn lease_reacquire_renew_and_release() {
         .await
         .unwrap()
         .expect("different partition");
-    assert_eq!(other.generation, 1);
+    assert!(other.generation > 0);
 
     // Release is scoped to the exact owner/generation.
     assert!(catalog.release_compaction_lease(&renewed).await.unwrap());
@@ -1541,13 +1543,18 @@ async fn lease_reacquire_renew_and_release() {
         !catalog.release_compaction_lease(&renewed).await.unwrap(),
         "releasing twice is a no-op, not a lie"
     );
-    // Released -> immediately claimable by anyone, at the next generation.
+    // Released -> immediately claimable by anyone, and at a generation that has
+    // never been used before (issue 0013 — the row is gone, but the token
+    // sequence is not).
     let next = catalog
         .try_acquire_compaction_lease(ht, &day1, Uuid::new_v4(), TTL)
         .await
         .unwrap()
         .expect("released partition");
-    assert_eq!(next.generation, 1, "the row is gone: a fresh claim");
+    assert!(
+        next.generation > renewed.generation,
+        "a released generation is not recycled"
+    );
 }
 
 #[tokio::test]
@@ -1571,7 +1578,7 @@ async fn expired_lease_is_taken_over_and_stale_owner_is_fenced_out() {
         .await
         .unwrap()
         .expect("expired lease is reclaimable");
-    assert_eq!(fresh.generation, stale.generation + 1);
+    assert!(fresh.generation > stale.generation);
     assert_eq!(fresh.owner_id, b);
 
     // A wakes up: it can neither renew nor release B's tenancy, and its renewal
@@ -1606,10 +1613,9 @@ async fn expired_lease_is_taken_over_and_stale_owner_is_fenced_out() {
         .await
         .unwrap()
         .expect("same owner reclaims");
-    assert_eq!(
-        regained.generation,
-        fresh.generation + 1,
-        "reclaim after expiry bumps the generation even for the same owner"
+    assert!(
+        regained.generation > fresh.generation,
+        "reclaim after expiry takes a new generation even for the same owner"
     );
 }
 
@@ -1679,7 +1685,7 @@ async fn lease_migration_applies_to_a_populated_pre_0008_catalog() {
         .await
         .unwrap()
         .expect("leases work after the upgrade");
-    assert_eq!(lease.generation, 1);
+    assert!(lease.generation > 0);
     // The pre-existing data is untouched by the upgrade.
     assert_eq!(catalog.live_parts(ht, None).await.unwrap().len(), 1);
 }
@@ -1746,7 +1752,7 @@ async fn leased_replace_commits_only_for_the_current_generation() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(b.generation, lease.generation + 1);
+    assert!(b.generation > lease.generation);
 
     let old = live_ids(&catalog, ht, &day1).await;
     let err = catalog
@@ -2078,8 +2084,8 @@ async fn an_idempotent_replay_is_reconciled_before_the_lease_is_judged() {
 #[tokio::test]
 async fn the_same_owner_is_fenced_by_generation_alone() {
     // A restarted (or simply slow) worker can hold the *right* owner id and
-    // still be a zombie: it is the generation, bumped by every reclamation,
-    // that separates its old tenancy from its new one.
+    // still be a zombie: it is the generation, freshly drawn by every
+    // reclamation, that separates its old tenancy from its new one.
     let (_pg, catalog) = common::setup().await;
     let ht = setup_hypertable(&catalog).await;
     let day1 = json!({ "day": "2026-07-01" });
@@ -2100,7 +2106,7 @@ async fn the_same_owner_is_fenced_by_generation_alone() {
         .unwrap()
         .unwrap();
     assert_eq!(second.owner_id, first.owner_id);
-    assert_eq!(second.generation, first.generation + 1);
+    assert!(second.generation > first.generation);
 
     let err = catalog
         .commit_compaction_replace(
@@ -2361,4 +2367,155 @@ async fn a_hot_partition_never_occupies_a_finalize_window_slot() {
         "the one window slot went to the partition that can actually finalize"
     );
     assert_eq!(quiet.eligible, 1);
+}
+
+/// Issue 0013 — the ABA the old per-row counter allowed.
+///
+/// Clean release *deletes* the lease row, so the next acquisition used to insert
+/// a fresh row at generation 1. Combined with a stable process owner id, that
+/// made `(partition, owner A, generation 1)` reachable twice — and those three
+/// fields are exactly what renew, release and the fenced REPLACE compare. A
+/// caller that held its old token across the release (a delayed cleanup task,
+/// in-process concurrency, or a reconciliation lifecycle carrying an operation
+/// across a worker rebuild) could act on a *later* tenancy of its own process.
+#[tokio::test]
+async fn a_released_lease_generation_is_never_reissued() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let day1 = json!({ "day": "2026-07-01" });
+    add_l0_part(&catalog, ht, &day1).await;
+    add_l0_part(&catalog, ht, &day1).await;
+
+    // One process, one owner id — the case the row counter could not separate.
+    let owner = Uuid::new_v4();
+    let stale = catalog
+        .try_acquire_compaction_lease(ht, &day1, owner, TTL)
+        .await
+        .unwrap()
+        .expect("free");
+    assert!(catalog.release_compaction_lease(&stale).await.unwrap());
+
+    let current = catalog
+        .try_acquire_compaction_lease(ht, &day1, owner, TTL)
+        .await
+        .unwrap()
+        .expect("released partition is immediately claimable");
+    assert_eq!(current.owner_id, stale.owner_id);
+    assert!(
+        current.generation > stale.generation,
+        "a released generation must not be reissued: {} -> {}",
+        stale.generation,
+        current.generation
+    );
+
+    // The retained token is inert against the new tenancy on all three paths.
+    assert!(
+        catalog
+            .renew_compaction_lease(&stale, TTL)
+            .await
+            .unwrap()
+            .is_none(),
+        "a pre-release token must not renew its successor"
+    );
+    assert!(
+        !catalog.release_compaction_lease(&stale).await.unwrap(),
+        "a pre-release token must not release its successor"
+    );
+    let old = live_ids(&catalog, ht, &day1).await;
+    let err = catalog
+        .commit_compaction_replace(ht, &stale, old, vec![l1_meta("aba.parquet", &day1)], None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CatalogError::LeaseLost { .. }), "{err:?}");
+    assert_eq!(
+        catalog.live_partition_parts(ht, &day1).await.unwrap().len(),
+        2,
+        "the fenced-out commit tombstoned nothing"
+    );
+
+    // The current tenancy still works, and renewal still preserves its fence.
+    let renewed = catalog
+        .renew_compaction_lease(&current, TTL)
+        .await
+        .unwrap()
+        .expect("the live tenancy");
+    assert_eq!(renewed.generation, current.generation);
+
+    // A *different* owner taking the partition after a release gets a fresh
+    // token too — the same invariant, with the owner id no longer masking it.
+    assert!(catalog.release_compaction_lease(&current).await.unwrap());
+    let third = catalog
+        .try_acquire_compaction_lease(ht, &day1, Uuid::new_v4(), TTL)
+        .await
+        .unwrap()
+        .expect("free");
+    assert!(third.generation > current.generation);
+}
+
+/// The sequence is a *catalog* token, not a per-partition one: two partitions
+/// never share a generation, so a token is unambiguous on its own.
+#[tokio::test]
+async fn lease_generations_are_unique_across_partitions() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let owner = Uuid::new_v4();
+    let mut seen = std::collections::HashSet::new();
+    for d in 1..=5 {
+        let lease = catalog
+            .try_acquire_compaction_lease(ht, &json!({ "day": format!("d{d}") }), owner, TTL)
+            .await
+            .unwrap()
+            .expect("free");
+        assert!(
+            seen.insert(lease.generation),
+            "generation {} was handed out twice",
+            lease.generation
+        );
+    }
+}
+
+/// An upgrade, not a fresh install: a catalog already carrying generations must
+/// start the sequence *above* every one of them, or a live tenancy could be
+/// re-issued as a new one — the very bug, reintroduced by the fix.
+#[tokio::test]
+async fn generation_sequence_starts_above_existing_leases() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let pool = catalog.pool_for_tests();
+
+    // Rewind to a pre-0010 catalog that already holds a high-generation lease
+    // (plan 41's row counter could produce any value on a long-lived partition).
+    sqlx::query("DROP SEQUENCE compaction_lease_generation_seq")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 10")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO compaction_leases
+             (hypertable_id, partition_values, owner_id, generation, expires_at)
+         VALUES ($1, $2, $3, 4242, clock_timestamp() - INTERVAL '1 second')",
+    )
+    .bind(ht.0)
+    .bind(json!({ "day": "legacy" }))
+    .bind(Uuid::new_v4())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    catalog.migrate().await.unwrap();
+
+    // Reclaiming the legacy partition — the exact case that must not collide.
+    let reclaimed = catalog
+        .try_acquire_compaction_lease(ht, &json!({ "day": "legacy" }), Uuid::new_v4(), TTL)
+        .await
+        .unwrap()
+        .expect("the expired legacy lease is reclaimable");
+    assert!(
+        reclaimed.generation > 4242,
+        "the sequence must start above every generation the old counter handed out, got {}",
+        reclaimed.generation
+    );
 }

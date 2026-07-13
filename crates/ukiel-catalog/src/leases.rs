@@ -21,6 +21,11 @@ use crate::{CatalogError, PostgresCatalog};
 /// A held claim on one partition's compaction. `owner_id` + `generation`
 /// identify the tenancy; the REPLACE transaction re-reads and fences on both,
 /// so this struct is a token, never a cached authority.
+///
+/// `generation` comes from a catalog-wide sequence, so it is unique across
+/// every tenancy of every partition and never reused — including after a clean
+/// release. It is *not* a per-row counter: nothing may read meaning into the
+/// distance between two generations, only into their order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionLease {
     pub hypertable_id: HypertableId,
@@ -70,10 +75,17 @@ impl PostgresCatalog {
     /// Claims a partition for `ttl`, or reports that a live peer holds it.
     ///
     /// One statement, so the claim is atomic under any number of contenders.
-    /// It takes the row when it is free or expired (reclamation, generation+1),
-    /// and refreshes it idempotently when we already hold it (generation
-    /// preserved — the caller's in-flight merge keeps its fence). Any other
-    /// unexpired owner is `Ok(None)`: ordinary scheduling contention.
+    /// It takes the row when it is free or expired (reclamation, a fresh
+    /// generation), and refreshes it idempotently when we already hold it
+    /// (generation preserved — the caller's in-flight merge keeps its fence).
+    /// Any other unexpired owner is `Ok(None)`: ordinary scheduling contention.
+    ///
+    /// Every new tenancy draws its generation from a catalog-owned sequence
+    /// (migration 0010), so a token is never reused — not even after a clean
+    /// release, which deletes the row and used to reset the counter to 1
+    /// (issue 0013). A contender that loses the `ON CONFLICT` still evaluates
+    /// the VALUES list and burns a sequence value it never uses; the token needs
+    /// uniqueness and ordering, not density.
     pub async fn try_acquire_compaction_lease(
         &self,
         hypertable_id: HypertableId,
@@ -85,14 +97,15 @@ impl PostgresCatalog {
         let sql = format!(
             "INSERT INTO compaction_leases
                  (hypertable_id, partition_values, owner_id, generation, expires_at)
-             VALUES ($1, $2, $3, 1, clock_timestamp() + $4 * INTERVAL '1 millisecond')
+             VALUES ($1, $2, $3, nextval('compaction_lease_generation_seq'),
+                     clock_timestamp() + $4 * INTERVAL '1 millisecond')
              ON CONFLICT (hypertable_id, partition_values) DO UPDATE
              SET owner_id = EXCLUDED.owner_id,
                  generation = CASE
                      WHEN compaction_leases.owner_id = EXCLUDED.owner_id
                       AND compaction_leases.expires_at > clock_timestamp()
                      THEN compaction_leases.generation
-                     ELSE compaction_leases.generation + 1
+                     ELSE EXCLUDED.generation
                  END,
                  expires_at = EXCLUDED.expires_at,
                  updated_at = clock_timestamp()
