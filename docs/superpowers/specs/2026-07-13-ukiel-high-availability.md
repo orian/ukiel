@@ -1,6 +1,6 @@
 # Ukiel High Availability Design
 
-Status: Proposed
+Status: Proposed (Phase 1 delivered — plan 42; Phase 2 is the active-active gate)
 Date: 2026-07-13
 Scope: ukield and its worker crates when the catalog runs on a managed,
 single-writer PostgreSQL service such as Amazon Aurora PostgreSQL.
@@ -570,16 +570,50 @@ failover RTO, retry volume, connection recovery, and post-failover headroom.
 
 ## Implementation phases
 
-### Phase 1: safe transient recovery
+### Phase 1: safe transient recovery — **DELIVERED (plan 42, 2026-07-13)**
 
-- Catalog error classification.
-- Retry/deadline/backoff policy.
-- Role state machine and supervision changes.
-- Role-aware health and metrics.
-- Configurable SQLx pool lifecycle.
-- Query 503 behavior.
-- Ingest pause/reconcile behavior.
-- GC fail-closed behavior.
+All of it, proven end-to-end by S10 (`make e2e-ha`), which cuts PostgreSQL
+traffic through a Toxiproxy in front of the database and restores it:
+
+- **Catalog error classification** (`CatalogError::class()`), by SQLSTATE and
+  structured SQLx variants — never message text. Unknown errors default to
+  *permanent*, so an unclassified failure cannot become an infinite retry.
+- **Retry/deadline/backoff policy**: exponential, capped, and jittered from the
+  process identity, so a fleet that loses its connections at the same instant
+  does not knock in lockstep on the writer that has just been promoted. Every
+  wait is cancellable; no pooled connection is held while sleeping.
+- **Role supervision**: a recoverable catalog failure drops *that* worker,
+  degrades *that* role, and rebuilds it from authority. Its siblings keep
+  running and the process does not exit. A permanent failure still fails fast.
+- **Role-aware health**: `/healthz` never touches PostgreSQL (a liveness probe
+  that did would restart the whole fleet on a failover); `/readyz` is structured
+  and reports catalog reachability *and* per-role state — a role that is
+  `Reconciling` is not ready, because it has not finished reloading.
+- **Configurable, lazy SQLx pool**: the process binds its listeners and reports
+  `Starting` before the catalog is reachable, and the same pool reaches the
+  promoted writer without a restart.
+- **Query 503**: catalog admission (session + physical plan, where live parts
+  are read) is bounded and separated from execution. Unreachable catalog → 503 +
+  `Retry-After` + `{"retryable": true}`, never a stale plan and never a 400. A
+  plan that already owns its file list finishes from object storage.
+- **Ingest reconcile**: a catalog failure tears down every route (siblings must
+  not keep consuming while the role is degraded); the rebuilt worker reloads
+  catalog offsets and re-seeks Kafka. No Kafka group offsets are ever committed.
+- **GC fail-closed**: destructive work is authorized **one candidate at a time**,
+  re-read from authority. A catalog lost mid-pass cannot license the deletion of
+  a second object from a list nothing can still vouch for.
+
+**Measured** (local fault proxy, not an Aurora RTO claim): outage → readiness 503
+within one probe interval; **recovery to fully Healthy in 1.5–2.8 s** across 8
+consecutive runs, with the process never exiting and every event produced during
+the outage visible exactly once afterwards.
+
+One product bug was found by the fault injection rather than by reasoning: a
+connection cut *mid-handshake* surfaces as `sqlx::Error::Protocol`
+("unexpected response from SSLRequest: 0x00"), not as an I/O error. Classified
+permanent, it failed the compactor role and took the process down on ~1 run in 4
+— exactly the crash loop this phase exists to prevent. It is transport, and there
+is a regression test.
 
 ### Phase 2: ambiguous mutation safety
 

@@ -2,6 +2,12 @@
 
 > **For agentic workers:** Execute this plan task-by-task. Use checkbox (`- [ ]`) progress, run each task's focused tests before its commit, and do not combine Plan 43's ambiguous-operation identity work into this plan.
 
+> **Status: Executed 2026-07-13.** All eight tasks landed (commits `e2f7d30` ..
+> the close-out). HA design Phase 1 is marked delivered; measured recovery and
+> the bug the fault injection found are recorded there and in roadmap row 42.
+> Plan 43's ambiguous-mutation reconciliation remains unclaimed and remains the
+> production gate for active-active compaction.
+
 **Goal:** A temporary PostgreSQL/Aurora writer outage must degrade ukield, not crash-loop the fleet. Queries that cannot obtain an authoritative catalog plan return a bounded, retryable 503; ingest stops consuming and later reloads catalog offsets before seeking Kafka; compaction abandons stale plans and replans from live parts; GC performs no deletion from a stale candidate list. Roles automatically resume after connectivity and role-specific reconciliation, while liveness remains healthy and readiness exposes the degradation.
 
 **Driver:** `docs/superpowers/specs/2026-07-13-ukiel-high-availability.md`, implementation phase 1. Plan 41 made active-active compaction ownership-safe and efficient, but the current process still cancels every role when one worker returns an error, catalog errors have no stable classification, SQLx pool behavior is mostly fixed, query catalog failures become HTTP 400, and startup catalog failure exits before health endpoints exist.
@@ -158,11 +164,11 @@ retry_after_secs = 1
 
 Validate min <= max, all nonzero timeouts, retry base <= max, and jitter in `[0, 1]`. The fleet-wide connection budget remains a deployment invariant from plan 40; log `max_connections * process_count` in deployment docs, not as a value one process can validate.
 
-- [ ] **Step 1: Failing pure classification tests.** Construct every `CatalogError` variant plus representative SQLx database errors with test doubles where possible. Pin SQLSTATE mappings and unknown-defaults-permanent. Do not assert display strings.
-- [ ] **Step 2: Failing pool/config tests.** Defaults, invalid combinations, lazy construction against an unavailable address, and existing `connect_with_pool_size` delegation.
-- [ ] **Step 3: Implement.** Emit `catalog_operation_total{operation,outcome,error_class}` at the catalog call boundary only where an operation name already exists; do not hand-edit every method in this task. Full role metrics land in Task 2.
-- [ ] **Step 4: Verify:** `cargo test -p ukiel-catalog -- --test-threads=2 && cargo test -p ukield --lib`.
-- [ ] **Step 5: Commit:**
+- [x] **Step 1: Failing pure classification tests.** Construct every `CatalogError` variant plus representative SQLx database errors with test doubles where possible. Pin SQLSTATE mappings and unknown-defaults-permanent. Do not assert display strings.
+- [x] **Step 2: Failing pool/config tests.** Defaults, invalid combinations, lazy construction against an unavailable address, and existing `connect_with_pool_size` delegation.
+- [x] **Step 3: Implement.** Emit `catalog_operation_total{operation,outcome,error_class}` at the catalog call boundary only where an operation name already exists; do not hand-edit every method in this task. Full role metrics land in Task 2.
+- [x] **Step 4: Verify:** `cargo test -p ukiel-catalog -- --test-threads=2 && cargo test -p ukield --lib`.
+- [x] **Step 5: Commit:**
 
 ```bash
 git commit -m "feat: classify catalog failures and configure SQLx pool lifecycle"
@@ -219,11 +225,11 @@ Metrics:
 - `worker_pause_seconds{role}`;
 - pool size/idle plus acquire timeout totals available from classified errors.
 
-- [ ] **Step 1: Failing pure tests** for legal/illegal transitions, snapshot serialization, secret-free summaries, backoff bounds/cap/reset/jitter, and cancellation during sleep.
-- [ ] **Step 2: Implement registry and probe loop.** Use `std::sync::RwLock` only for tiny snapshot mutations; clone a snapshot before serialization and never hold the lock across await.
-- [ ] **Step 3: Metrics tests** using the existing recorder pattern; state transition must clear the previous one-hot gauge.
-- [ ] **Step 4: Verify:** `cargo test -p ukield --lib`.
-- [ ] **Step 5: Commit:**
+- [x] **Step 1: Failing pure tests** for legal/illegal transitions, snapshot serialization, secret-free summaries, backoff bounds/cap/reset/jitter, and cancellation during sleep.
+- [x] **Step 2: Implement registry and probe loop.** Use `std::sync::RwLock` only for tiny snapshot mutations; clone a snapshot before serialization and never hold the lock across await.
+- [x] **Step 3: Metrics tests** using the existing recorder pattern; state transition must clear the previous one-hot gauge.
+- [x] **Step 4: Verify:** `cargo test -p ukield --lib`.
+- [x] **Step 5: Commit:**
 
 ```bash
 git commit -m "feat: catalog recovery state, jittered probes, and role health registry"
@@ -267,11 +273,11 @@ Startup uses the lazy catalog pool. Bind health/query/metrics listeners and expo
 
 Do not mark a role Healthy merely because its future was spawned. Task 5 adds the worker-ready handshake. Until then it remains `Reconciling`.
 
-- [ ] **Step 1: Failing supervisor tests** with a scripted fake role: transient failure -> degraded -> probe -> reconciling -> rebuilt; permanent failure still cancels; shutdown interrupts backoff; another healthy role remains running throughout recoverable failure.
-- [ ] **Step 2: Refactor `run.rs`.** Remove only the recoverable-error global cancellation behavior. Infrastructure task panic/bind failure and permanent worker failure keep fail-fast semantics.
-- [ ] **Step 3: Startup test:** start ukield pointed at a closed port, prove `/healthz` responds 200 and the process remains alive; then make catalog reachable (test seam may swap a scripted probe rather than move a real port) and prove initialization advances.
-- [ ] **Step 4: Verify:** `cargo test -p ukield -- --test-threads=2`.
-- [ ] **Step 5: Commit:**
+- [x] **Step 1: Failing supervisor tests** with a scripted fake role: transient failure -> degraded -> probe -> reconciling -> rebuilt; permanent failure still cancels; shutdown interrupts backoff; another healthy role remains running throughout recoverable failure.
+- [x] **Step 2: Refactor `run.rs`.** Remove only the recoverable-error global cancellation behavior. Infrastructure task panic/bind failure and permanent worker failure keep fail-fast semantics.
+- [x] **Step 3: Startup test:** start ukield pointed at a closed port, prove `/healthz` responds 200 and the process remains alive; then make catalog reachable (test seam may swap a scripted probe rather than move a real port) and prove initialization advances.
+- [x] **Step 4: Verify:** `cargo test -p ukield -- --test-threads=2`.
+- [x] **Step 5: Commit:**
 
 ```bash
 git commit -m "feat: recover catalog-failed roles without cancelling ukield"
@@ -313,11 +319,11 @@ Metrics:
 - `catalog_operation_duration_seconds{operation="query_admission"}`;
 - existing query request counters retain one outcome per request.
 
-- [ ] **Step 1: Failing HTTP tests:** transport error -> 503 + Retry-After + stable JSON; zero admission budget -> deterministic 503; bad SQL remains 400; zero statement timeout remains 408; liveness remains 200 during catalog failure.
-- [ ] **Step 2: Physical-plan split test:** construct a query plan, break catalog access, execute the already-built plan successfully from its object-store inputs. A new query during the same outage returns 503.
-- [ ] **Step 3: Structured readiness tests** for Starting, Healthy, Degraded, Reconciling, Failed, and object-store failure. Assert bodies contain no catalog URL/error detail.
-- [ ] **Step 4: Implement and verify:** `cargo test -p ukiel-query -- --test-threads=2 && cargo test -p ukield --test server_test -- --test-threads=2`.
-- [ ] **Step 5: Commit:**
+- [x] **Step 1: Failing HTTP tests:** transport error -> 503 + Retry-After + stable JSON; zero admission budget -> deterministic 503; bad SQL remains 400; zero statement timeout remains 408; liveness remains 200 during catalog failure.
+- [x] **Step 2: Physical-plan split test:** construct a query plan, break catalog access, execute the already-built plan successfully from its object-store inputs. A new query during the same outage returns 503.
+- [x] **Step 3: Structured readiness tests** for Starting, Healthy, Degraded, Reconciling, Failed, and object-store failure. Assert bodies contain no catalog URL/error detail.
+- [x] **Step 4: Implement and verify:** `cargo test -p ukiel-query -- --test-threads=2 && cargo test -p ukield --test server_test -- --test-threads=2`.
+- [x] **Step 5: Commit:**
 
 ```bash
 git commit -m "feat: bound catalog query admission and expose role-aware readiness"
@@ -352,11 +358,11 @@ git commit -m "feat: bound catalog query admission and expose role-aware readine
 - A transport error around `commit_compaction_replace` increments `compactor_ambiguous_commit_total`, drops the plan, and relies on live-state replanning. It is **not** retried in place. Keep the Plan 43 production gate explicit.
 - Conflict and LeaseLost retain their current in-pass replan/scheduling behavior and do not degrade the role.
 
-- [ ] **Step 1: Ingest recovery test.** Fail catalog at flush, destroy the worker attempt, recover, reload offsets, and prove the batch is represented exactly once whether the scripted commit outcome is “not applied” or “applied but response lost.” Assert no Kafka group offset commit is introduced.
-- [ ] **Step 2: Multi-route test.** One route's catalog failure drops/pauses all route consumers; no sibling advances while degraded; all routes reload before Healthy.
-- [ ] **Step 3: Compactor recovery tests.** Catalog loss during candidate read and during lease renewal causes attempt restart; after recovery it converges from live state without a new feed event. A commit-transport failure is counted ambiguous and never directly replayed.
-- [ ] **Step 4: Verify:** `cargo test -p ukiel-ingest -- --test-threads=2 && cargo test -p ukiel-compactor -- --test-threads=2 && cargo test -p ukield --lib`.
-- [ ] **Step 5: Commit:**
+- [x] **Step 1: Ingest recovery test.** Fail catalog at flush, destroy the worker attempt, recover, reload offsets, and prove the batch is represented exactly once whether the scripted commit outcome is “not applied” or “applied but response lost.” Assert no Kafka group offset commit is introduced.
+- [x] **Step 2: Multi-route test.** One route's catalog failure drops/pauses all route consumers; no sibling advances while degraded; all routes reload before Healthy.
+- [x] **Step 3: Compactor recovery tests.** Catalog loss during candidate read and during lease renewal causes attempt restart; after recovery it converges from live state without a new feed event. A commit-transport failure is counted ambiguous and never directly replayed.
+- [x] **Step 4: Verify:** `cargo test -p ukiel-ingest -- --test-threads=2 && cargo test -p ukiel-compactor -- --test-threads=2 && cargo test -p ukield --lib`.
+- [x] **Step 5: Commit:**
 
 ```bash
 git commit -m "feat: reconcile ingest offsets and compaction state after catalog recovery"
@@ -382,11 +388,11 @@ On transient catalog error, the GC attempt returns to the ukield recovery superv
 
 Collector families remain non-fatal exactly as today. Catalog-family failure may update catalog reachability telemetry but must not independently flip healthy data-plane roles or cancel the process. After recovery the next tick overwrites gauges; add `collector_errors_total` assertions rather than a new collector recovery loop.
 
-- [ ] **Step 1: Failing GC tests:** fail catalog after deleting candidate 1; candidate 2 remains present; recovery stamps/reprocesses candidate 1 idempotently then handles candidate 2. Repeat for orphan sweep and listing reconcile.
-- [ ] **Step 2: Implement one-at-a-time authoritative APIs.** Record query count and explain why the extra round trip is accepted: S3 deletion dominates and correctness is the goal; batch claims are a measured follow-up only.
-- [ ] **Step 3: Collector test:** several failed catalog-family ticks never stop metrics/query roles; a later success refreshes gauges.
-- [ ] **Step 4: Verify:** `cargo test -p ukiel-gc -- --test-threads=2 && cargo test -p ukield --test collector_test -- --test-threads=2`.
-- [ ] **Step 5: Commit:**
+- [x] **Step 1: Failing GC tests:** fail catalog after deleting candidate 1; candidate 2 remains present; recovery stamps/reprocesses candidate 1 idempotently then handles candidate 2. Repeat for orphan sweep and listing reconcile.
+- [x] **Step 2: Implement one-at-a-time authoritative APIs.** Record query count and explain why the extra round trip is accepted: S3 deletion dominates and correctness is the goal; batch claims are a measured follow-up only.
+- [x] **Step 3: Collector test:** several failed catalog-family ticks never stop metrics/query roles; a later success refreshes gauges.
+- [x] **Step 4: Verify:** `cargo test -p ukiel-gc -- --test-threads=2 && cargo test -p ukield --test collector_test -- --test-threads=2`.
+- [x] **Step 5: Commit:**
 
 ```bash
 git commit -m "feat: fail GC closed and rebuild destructive state after catalog outage"
@@ -421,11 +427,11 @@ S10 sequence:
 
 This suite covers disconnect-before/read/in-flight behavior, not commit-after-acknowledgement loss—that requires the Plan 43 fault point inside the transaction response path. State this in the test module and HA design close-out.
 
-- [ ] **Step 1: Implement proxy helper with idempotent create/reset.** A prior failed run must not leave toxics affecting the next run.
-- [ ] **Step 2: Implement S10 and `make e2e-ha`.** Use deadlines with diagnostic snapshots, never unbounded sleeps.
-- [ ] **Step 3: Run S10 at least three consecutive times** to catch timing flake; record observed outage/recovery duration and retry count.
-- [ ] **Step 4: Run normal `make e2e`** to prove the optional profile changed nothing.
-- [ ] **Step 5: Commit:**
+- [x] **Step 1: Implement proxy helper with idempotent create/reset.** A prior failed run must not leave toxics affecting the next run.
+- [x] **Step 2: Implement S10 and `make e2e-ha`.** Use deadlines with diagnostic snapshots, never unbounded sleeps.
+- [x] **Step 3: Run S10 at least three consecutive times** to catch timing flake; record observed outage/recovery duration and retry count.
+- [x] **Step 4: Run normal `make e2e`** to prove the optional profile changed nothing.
+- [x] **Step 5: Commit:**
 
 ```bash
 git commit -m "test: catalog outage degrades and recovers ukield without restart"
@@ -441,7 +447,7 @@ git commit -m "test: catalog outage degrades and recovers ukield without restart
 - Modify: `ukield.example.toml`
 - Modify: `README.md` only if its operational run instructions mention readiness/startup
 
-- [ ] **Step 1: Full verification:**
+- [x] **Step 1: Full verification:**
 
 ```bash
 cargo fmt --check
@@ -451,10 +457,10 @@ make e2e
 make e2e-ha
 ```
 
-- [ ] **Step 2: Record measured compose recovery:** outage duration, time to 503, recovery-to-Healthy, retries per process, maximum backoff, ingest pause duration/buffer posture, and whether any role/process exited. These are local fault-proxy numbers, not an Aurora RTO claim.
-- [ ] **Step 3: Update HA design:** mark Phase 1 delivered, document exact state transitions and query error contract, retain Phase 2 as the active-active production gate, retain dedicated migration/bootstrap ownership in Phase 3, and retain Aurora/RDS Proxy proof in Phase 4.
-- [ ] **Step 4: Mark roadmap row 42 Executed** with the measured result and point to S10. Do not mark the overall HA design Implemented.
-- [ ] **Step 5: Commit:**
+- [x] **Step 2: Record measured compose recovery:** outage duration, time to 503, recovery-to-Healthy, retries per process, maximum backoff, ingest pause duration/buffer posture, and whether any role/process exited. These are local fault-proxy numbers, not an Aurora RTO claim.
+- [x] **Step 3: Update HA design:** mark Phase 1 delivered, document exact state transitions and query error contract, retain Phase 2 as the active-active production gate, retain dedicated migration/bootstrap ownership in Phase 3, and retain Aurora/RDS Proxy proof in Phase 4.
+- [x] **Step 4: Mark roadmap row 42 Executed** with the measured result and point to S10. Do not mark the overall HA design Implemented.
+- [x] **Step 5: Commit:**
 
 ```bash
 git commit -m "docs: safe catalog transient recovery delivered and fault-tested"
