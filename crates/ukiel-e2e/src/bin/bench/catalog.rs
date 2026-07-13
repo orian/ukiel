@@ -270,6 +270,12 @@ pub struct SeedSummary {
     pub label: String,
     pub state: String,
     pub tables: u32,
+    /// Issue 0011: the cardinality the *defining* claim is about. Plan 40 seeded
+    /// none of these — it measured a catalog with four hypertables and zero
+    /// logical tables, and one million packing-key *values*, which is not the
+    /// same thing as one million tenants' metadata.
+    pub logical_tables: i64,
+    pub namespaces: i64,
     pub total_parts: i64,
     pub live_parts: i64,
     pub tombstoned_parts: i64,
@@ -281,13 +287,82 @@ pub struct SeedSummary {
     pub day_partitions: u32,
     pub parts_table_bytes: i64,
     pub parts_indexes_bytes: i64,
+    /// Parts one tenant's `live_parts_pruned` actually returns, sampled across the
+    /// key space. Recorded because a capacity number is meaningless without it:
+    /// 2 ms returning 7 parts and 2 ms returning 7,000 are not the same system.
+    pub tenant_parts_p50: i64,
+    pub tenant_parts_p99: i64,
     /// Rows in `parts` that are NOT this fixture's — they share the table, its
     /// indexes and its vacuum budget, so they are recorded, not ignored.
     pub foreign_parts: i64,
 }
 
 pub const BENCH_TABLE_PREFIX: &str = "bench_cat_";
+/// The one logical table every tenant has. `UNIQUE (namespace_id, name)` means a
+/// million tenants can all call it `events`, which is what a real deployment
+/// looks like — and it makes `get_logical_table` a two-column index probe, the
+/// exact shape the admission path issues.
+pub const BENCH_LOGICAL_TABLE: &str = "events";
 const DAY_PARTITIONS: u32 = 30;
+
+/// What to build. Independent knobs (issue 0011): `State` still supplies the
+/// *default* live/history/hot split, but each can be overridden, because the
+/// question "does a million-tenant catalog work" is not answerable by a fixture
+/// whose shape is derived entirely from one enum.
+#[derive(Debug, Clone)]
+pub struct SeedSpec {
+    pub label: String,
+    pub hypertables: u32,
+    pub total_parts: i64,
+    pub state: State,
+    pub packing_keys: u64,
+    pub dedicated_frac: f64,
+    /// How many keys a *packed* (non-dedicated) part spans. `None` = derive it
+    /// from `target_fanout`, which is what you almost always want.
+    ///
+    /// This is the single most consequential realism knob at scale, and plan 40's
+    /// implicit `packing_keys / 20` only looked harmless because its key space was
+    /// large and its part count was not. At a million tenants it means every packed
+    /// file holds fifty thousand of them, so one tenant's `live_parts_pruned`
+    /// matches ~5% of the hypertable — **measured: 1,198 parts** for the median
+    /// tenant, where plan 16 measured the *product's* median tenant planning 7
+    /// files. A fixture that fans out two orders of magnitude wider than the
+    /// product is not measuring the product; it is measuring itself.
+    pub key_band: Option<u64>,
+    /// Parts the median tenant should match — the physical constraint the band is
+    /// solved for. A hypertable's files tile the key space: with `P` live parts
+    /// over `K` keys, a file covering `B` keys is matched by a given key about
+    /// `P·B/K` times, so a *fixed* band cannot hold fan-out constant while the
+    /// part count moves across three orders of magnitude. Solving for the band
+    /// instead is what keeps 10k, 1M and 10M parts comparable — and keeps all
+    /// three looking like the product.
+    ///
+    /// Default 7: plan 16's measured median-tenant file count.
+    pub target_fanout: f64,
+    /// Tenants. Each gets `tables_per_namespace` logical tables. The namespace id
+    /// *is* the packing key (the v1 convention the provider encodes), so this is
+    /// also how many distinct tenant slices the read path can ask for.
+    pub namespaces: i64,
+    pub tables_per_namespace: u32,
+    /// Overrides for the state-derived split. `None` = use the state's fraction.
+    pub live_parts: Option<i64>,
+    pub historical_parts: Option<i64>,
+    pub hot_live_parts: Option<i64>,
+}
+
+impl SeedSpec {
+    /// `(live, history, hot_live)` — the override wins, the state is the default.
+    fn split(&self) -> (i64, i64, i64) {
+        let live = self.live_parts.unwrap_or_else(|| {
+            (self.total_parts as f64 * self.state.live_fraction()).round() as i64
+        });
+        let history = self.historical_parts.unwrap_or(self.total_parts - live);
+        let hot = self
+            .hot_live_parts
+            .unwrap_or_else(|| (live as f64 * self.state.hot_fraction()).round() as i64);
+        (live, history, hot.min(live))
+    }
+}
 
 /// `bench catalog seed …` — bulk-build a catalog state.
 ///
@@ -299,26 +374,35 @@ const DAY_PARTITIONS: u32 = 30;
 /// live/tombstoned split, L0/L1+ levels, day partitions, key ranges, and plan-16
 /// `column_stats` (Int64 bounds, roaring bitmaps, row-group spans) — because row
 /// width, TOAST pressure and JSONB decode are part of what we are measuring.
-#[allow(clippy::too_many_arguments)]
-pub async fn seed(
-    label: &str,
-    tables: u32,
-    total_parts: i64,
-    state: State,
-    packing_keys: u64,
-    dedicated_frac: f64,
-) -> anyhow::Result<()> {
+pub async fn seed(spec: SeedSpec) -> anyhow::Result<()> {
+    let SeedSpec {
+        ref label,
+        hypertables: tables,
+        total_parts,
+        state,
+        packing_keys,
+        dedicated_frac,
+        namespaces,
+        tables_per_namespace,
+        ..
+    } = spec;
     let cat = ukiel_catalog::PostgresCatalog::connect(&pg_url()).await?;
     cat.migrate().await?;
     let pool = cat.pool_for_tests().clone();
 
     reset_bench_objects(&pool).await?;
 
-    let live_total = (total_parts as f64 * state.live_fraction()).round() as i64;
+    let (live_total, history_total, hot_live) = spec.split();
+    // Each hypertable owns a contiguous slice of the tenant space, and both the
+    // tenant→hypertable mapping and the parts' key ranges are derived from this
+    // one number — if they disagree, tenants resolve to a table that does not hold
+    // their key and every `live_parts_pruned` returns zero.
+    let keys_per_table = (packing_keys / tables.max(1) as u64).max(1);
     println!(
-        "seeding '{label}': {tables} tables, {total_parts} parts \
-         ({live_total} live / {} tombstoned), state {state:?}, {packing_keys} keys",
-        total_parts - live_total
+        "seeding '{label}': {tables} hypertables, {} logical tables over {namespaces} namespaces, \
+         {total_parts} parts ({live_total} live / {history_total} tombstoned, {hot_live} hot), \
+         state {state:?}, {packing_keys} keys, {keys_per_table} keys per hypertable",
+        namespaces * tables_per_namespace as i64
     );
 
     // One hypertable per table, plus one commit per (table, role) to hang parts
@@ -346,6 +430,52 @@ pub async fn seed(
         ht_ids.push(id);
     }
 
+    // The tenants' metadata — the thing issue 0011 exists for. One row per
+    // (namespace, table), namespace id == packing key (the v1 convention the
+    // provider encodes: `slice = namespace.0`), spread round-robin over the
+    // hypertables. Bulk-inserted, because a million product-API calls would
+    // measure the seeder.
+    //
+    // This is what plan 40 never had: it created hypertables and parts and *no
+    // logical tables at all*, then resolved one hypertable once before the run.
+    // A million packing-key values is not a million tenants' metadata, and the
+    // index depth, the namespace-local listing and the session build are exactly
+    // the costs that a key-space knob cannot reach.
+    let seeded_logical = if namespaces > 0 && tables_per_namespace > 0 {
+        let mut done = 0i64;
+        const CHUNK: i64 = 200_000;
+        while done < namespaces {
+            let batch = CHUNK.min(namespaces - done);
+            // The hypertable ids come in as an *array*, indexed by `ns % n`. The
+            // obvious `LATERAL (... ORDER BY id OFFSET ns % n LIMIT 1)` re-scans
+            // the hypertable list once per tenant — a thousand rows each, a
+            // billion in total — and turns a 20-second seed into an overnight one.
+            sqlx::query(
+                r#"
+                INSERT INTO logical_tables (namespace_id, name, hypertable_id)
+                SELECT ns,
+                       CASE WHEN t = 0 THEN $4 ELSE $4 || '_' || t END,
+                       $5[LEAST((ns - 1) / $6, array_length($5, 1) - 1) + 1]
+                FROM generate_series($1 + 1, $1 + $2) AS ns,
+                     generate_series(0, $3 - 1) AS t
+                "#,
+            )
+            .bind(done)
+            .bind(batch)
+            .bind(tables_per_namespace as i64)
+            .bind(BENCH_LOGICAL_TABLE)
+            .bind(&ht_ids)
+            .bind(keys_per_table as i64)
+            .execute(&pool)
+            .await
+            .context("bulk logical-table insert")?;
+            done += batch;
+        }
+        namespaces * tables_per_namespace as i64
+    } else {
+        0
+    };
+
     // Two commits per table: one that created the live parts, one that
     // tombstoned the history. Enough to keep the FKs and the feed honest without
     // pretending to reconstruct a real commit history.
@@ -364,23 +494,52 @@ pub async fn seed(
         }
     }
 
-    // The hot hypertable is table 0: `hot_fraction` of live parts land there and
+    // The hot hypertable is table 0: `hot_live` of the live parts land there and
     // the rest spread over the others. A uniform spread would hide exactly the
     // failure mode the state model exists to expose.
-    let hot_live = (live_total as f64 * state.hot_fraction()).round() as i64;
     let cold_live = live_total - hot_live;
-    let history = total_parts - live_total;
+    let history = history_total;
 
+    // The old seeder gave every hypertable parts spanning the whole key space,
+    // which is not what a deployment looks like and, at a million tenants over two
+    // thousand hypertables, is not even coherent: a table holding 500 tenants was
+    // given parts whose key ranges covered all million, so a tenant's
+    // `live_parts_pruned` on its own (cold) hypertable returned **zero parts** —
+    // 99.95% of the population measuring an empty catalog. The band is therefore
+    // solved *per table*, against that table's own tenant count and part count, so
+    // every tenant — hot table or cold — sees a realistic fan-out.
     let started = std::time::Instant::now();
+    // Remainders are handed to the first tables rather than dropped. Integer
+    // division across 2,000 tables silently lost 17% of the parts at the 10k point.
+    let mut cold_left = cold_live;
+    let mut hist_left = history;
     for (i, &ht) in ht_ids.iter().enumerate() {
+        let cold_tables = (tables as i64 - 1).max(1);
         let live_here = if i == 0 {
             hot_live
         } else if tables > 1 {
-            cold_live / (tables as i64 - 1)
+            let share = cold_live / cold_tables + i64::from((cold_live % cold_tables) >= i as i64);
+            share.min(cold_left)
         } else {
             0
         };
-        let hist_here = history / tables as i64;
+        if i > 0 {
+            cold_left -= live_here;
+        }
+        let hist_here = {
+            let share = history / tables as i64 + i64::from((history % tables as i64) > i as i64);
+            share.min(hist_left)
+        };
+        hist_left -= hist_here;
+
+        // The band this table needs for its tenants to see `target_fanout` parts.
+        let band = spec.key_band.unwrap_or_else(|| {
+            let packed = live_here.max(1) as f64 * (1.0 - dedicated_frac);
+            ((keys_per_table as f64 * spec.target_fanout) / packed.max(1.0))
+                .round()
+                .clamp(1.0, keys_per_table as f64) as u64
+        });
+        let key_lo = i as u64 * keys_per_table + 1;
         if live_here > 0 {
             insert_parts(
                 &pool,
@@ -389,9 +548,13 @@ pub async fn seed(
                 None,
                 live_here,
                 state,
-                packing_keys,
                 dedicated_frac,
                 i,
+                KeySpace {
+                    lo: key_lo,
+                    span: keys_per_table,
+                    band,
+                },
             )
             .await?;
         }
@@ -405,9 +568,13 @@ pub async fn seed(
                 Some(del_commit[i]),
                 hist_here,
                 state,
-                packing_keys,
                 dedicated_frac,
                 i,
+                KeySpace {
+                    lo: key_lo,
+                    span: keys_per_table,
+                    band,
+                },
             )
             .await?;
         }
@@ -419,7 +586,7 @@ pub async fn seed(
         .await?;
     let seed_secs = started.elapsed().as_secs_f64();
 
-    let summary = summarize(&pool, label, state, tables, packing_keys).await?;
+    let summary = summarize(&pool, label, state, tables, packing_keys, seeded_logical).await?;
     println!(
         "seeded in {seed_secs:.1}s: {} parts ({} live, {} tombstoned), hot-table live {}, \
          live L0 {}, dedicated {}, with-bitmap {}\n  parts table {:.1} MiB + indexes {:.1} MiB",
@@ -432,6 +599,11 @@ pub async fn seed(
         summary.parts_with_bitmap,
         summary.parts_table_bytes as f64 / 1048576.0,
         summary.parts_indexes_bytes as f64 / 1048576.0,
+    );
+    println!(
+        "  per-tenant fan-out (through the tenant's own hypertable): p50 {} parts, p99 {} \
+         — plan 16 measured the product's median tenant at 7 files",
+        summary.tenant_parts_p50, summary.tenant_parts_p99
     );
     verify_via_product_api(&cat, &summary).await?;
     crate::report::write_json(&format!("catalog-seed-{label}.json"), &summary)?;
@@ -492,13 +664,92 @@ async fn verify_via_product_api(
         })
         .filter(|ok| *ok)
         .count();
+    // The tenant metadata, through the *same two calls* query admission makes.
+    // Plan 40 never made them: it resolved one hypertable once, before the run,
+    // and then looped on parts. A seed that claims a million tenants but cannot
+    // be read one tenant at a time is the fixture this issue was filed about.
+    if summary.namespaces > 0 {
+        use ukiel_core::NamespaceId;
+        // A tenant in the middle of the id space *and* the middle of its
+        // hypertable's slice. A part's key range runs upward from its `kmin`, so
+        // the first few keys of a slice are covered by fewer parts than the rest —
+        // a tenant sampled exactly on that edge would report zero and say nothing
+        // about the fixture.
+        let keys_per_table = (summary.packing_keys / summary.tables.max(1) as u64).max(1) as i64;
+        let ns = NamespaceId(summary.namespaces / 2 + keys_per_table / 2);
+        let listed = cat.list_logical_tables(ns).await.with_context(|| {
+            format!("namespace {ns} must list its tables — this is the admission path")
+        })?;
+        if listed.is_empty() {
+            bail!(
+                "namespace {ns} lists no logical tables, but the fixture claims {} over {} namespaces",
+                summary.logical_tables,
+                summary.namespaces
+            );
+        }
+        let one = cat
+            .get_logical_table(ns, &listed[0].name)
+            .await
+            .context("get_logical_table on a listed name")?;
+        let mapped = cat.get_hypertable_by_id(one.hypertable_id).await?;
+        // And the slice the provider would ask for: `slice == namespace id`.
+        let tenant_parts = cat.live_parts_pruned(mapped.id, Some(ns.0), &[]).await?;
+        println!(
+            "  verified tenant path: namespace {ns} → {} logical table(s) → hypertable '{}' → \
+             live_parts_pruned(slice={}) = {} parts",
+            listed.len(),
+            mapped.name,
+            ns.0,
+            tenant_parts.len()
+        );
+    }
+
     println!(
         "  verified via product API: live_parts_pruned {} parts (key {probe} prunes to {}), \
          {with_stats} with stats, {decodable} bitmaps decode",
         all.len(),
         pruned.len()
     );
+
+    // The check that stops a silently *broken* fixture — as opposed to a
+    // legitimately sparse one.
+    //
+    // A median tenant resolving to zero parts is only a bug when there were enough
+    // live parts to cover the hypertables in the first place. With 1,000 live parts
+    // spread over 2,000 hypertables, most tenants genuinely have no data — and that
+    // is a real deployment state (a million registered tenants who have barely
+    // ingested), worth measuring and worth saying out loud. The same result *while*
+    // there are 100k live parts to go round means the tenant→hypertable mapping has
+    // come adrift from the key slices, and every latency under it would be a lie.
+    if summary.namespaces > 0 && summary.tenant_parts_p50 == 0 {
+        if summary.live_parts >= 2 * summary.tables as i64 {
+            bail!(
+                "the median tenant's live_parts_pruned returns ZERO parts, but the fixture has \
+                 {} live parts over {} hypertables — the tenant→hypertable mapping has come \
+                 adrift from the key slices, and every latency measured here would be a lie",
+                summary.live_parts,
+                summary.tables
+            );
+        }
+        println!(
+            "  NOTE: the median tenant resolves to ZERO parts — {} live parts cannot cover {} \
+             hypertables. A real state (a million registered tenants, almost no data): this \
+             point measures the metadata path against an almost-empty parts table.",
+            summary.live_parts, summary.tables
+        );
+    }
     Ok(())
+}
+
+/// The tenant slice one hypertable owns, and how wide its packed parts are.
+#[derive(Debug, Clone, Copy)]
+struct KeySpace {
+    /// First packing key belonging to this hypertable.
+    lo: u64,
+    /// How many keys it owns.
+    span: u64,
+    /// How many of them one packed part covers.
+    band: u64,
 }
 
 /// Bulk-insert one population with `generate_series` — one statement, not one
@@ -511,9 +762,9 @@ async fn insert_parts(
     del_commit: Option<i64>,
     n: i64,
     state: State,
-    packing_keys: u64,
     dedicated_frac: f64,
     table_idx: usize,
+    keys: KeySpace,
 ) -> anyhow::Result<()> {
     // Chunked so one statement never builds a multi-GB result set.
     const CHUNK: i64 = 200_000;
@@ -539,7 +790,7 @@ async fn insert_parts(
                 'ht/' || $1 || '/L' || (CASE WHEN random() < $6 THEN 0 ELSE 1 END) || '/' || gen_random_uuid() || '.parquet',
                 jsonb_build_object('day', to_char(DATE '2026-01-01' + ((g % $9)::int), 'YYYY-MM-DD')),
                 k.kmin,
-                CASE WHEN random() < $7 THEN k.kmin ELSE k.kmin + ($8 / 20)::bigint END,
+                CASE WHEN random() < $7 THEN k.kmin ELSE k.kmin + $12 END,
                 100000 + (random() * 900000)::bigint,
                 10000000 + (random() * 130000000)::bigint,
                 (CASE WHEN random() < $6 THEN 0 ELSE 1 END)::smallint,
@@ -548,18 +799,25 @@ async fn insert_parts(
                   -- already exact for them, exactly as the writers decide.
                   WHEN random() < $7 THEN
                     jsonb_build_object('tenant_id', jsonb_build_object('min', k.kmin, 'max', k.kmin),
-                                       'ts', jsonb_build_object('min', 1767225600000::bigint, 'max', 1769817600000::bigint))
+                                       'ts', jsonb_build_object('min', d.ts_min, 'max', d.ts_max))
                   ELSE
                     jsonb_build_object(
-                      'tenant_id', jsonb_build_object('min', k.kmin, 'max', k.kmin + ($8 / 20)::bigint),
-                      'ts', jsonb_build_object('min', 1767225600000::bigint, 'max', 1769817600000::bigint),
+                      'tenant_id', jsonb_build_object('min', k.kmin, 'max', k.kmin + $12),
+                      'ts', jsonb_build_object('min', d.ts_min, 'max', d.ts_max),
                       'packing_keys', $10::text,
                       'key_row_groups', $11::jsonb)
                 END,
                 $2,
                 $3
             FROM generate_series(1, $4) AS g,
-                 LATERAL (SELECT ((g * 2654435761 + $5) % $8)::bigint AS kmin) k
+                 -- The key lands inside THIS hypertable's tenant slice.
+                 LATERAL (SELECT $13 + ((g * 2654435761 + $5) % $8)::bigint AS kmin) k,
+                 -- The ts bounds must track the part's *own* day, or a key+time
+                 -- probe prunes all-or-nothing and the time predicate measures
+                 -- nothing. (They did not, before issue 0011: every part claimed
+                 -- the same 30-day span, which is not what a writer produces.)
+                 LATERAL (SELECT 1767225600000::bigint + (g % $9) * 86400000 AS ts_min,
+                                 1767225600000::bigint + (g % $9) * 86400000 + 86399999 AS ts_max) d
             "#,
         )
         .bind(ht)
@@ -569,10 +827,12 @@ async fn insert_parts(
         .bind(done + table_idx as i64 * 7919) // decorrelate keys across tables
         .bind(state.l0_fraction())
         .bind(dedicated_frac)
-        .bind(packing_keys as i64)
+        .bind(keys.span as i64)
         .bind(DAY_PARTITIONS as i64)
         .bind(fake_bitmap())
         .bind(fake_spans())
+        .bind(keys.band as i64)
+        .bind(keys.lo as i64)
         .execute(pool)
         .await
         .context("bulk part insert")?;
@@ -603,12 +863,46 @@ fn fake_spans() -> serde_json::Value {
     )
 }
 
+/// Parts one tenant's `live_parts_pruned` returns — sampled through the tenant's
+/// **own** hypertable, exactly as the admission path resolves it.
+///
+/// Measured, never derived. The fan-out is a consequence of the key band, the
+/// dedicated fraction, the part count and the tenant→hypertable mapping all
+/// interacting, and the only trustworthy way to know it is to ask the question the
+/// product asks. Sampling the hot hypertable alone (the first version of this) is
+/// how a fixture reports a healthy 7 while 99.95% of its tenants resolve to zero.
+async fn tenant_fanout(pool: &PgPool, namespaces: i64) -> anyhow::Result<(i64, i64)> {
+    if namespaces <= 0 {
+        return Ok((0, 0));
+    }
+    let mut counts: Vec<i64> = Vec::new();
+    for i in 0..200i64 {
+        // Spread across the whole tenant space, so hot-table and cold-table
+        // tenants appear in proportion to how many there are.
+        let ns = (i * 9973 + 17) % namespaces + 1;
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM parts p
+             JOIN logical_tables lt ON lt.hypertable_id = p.hypertable_id
+             WHERE lt.namespace_id = $1 AND p.deleted_by_commit IS NULL
+               AND p.packing_key_min <= $1 AND p.packing_key_max >= $1",
+        )
+        .bind(ns)
+        .fetch_one(pool)
+        .await?;
+        counts.push(n);
+    }
+    counts.sort_unstable();
+    Ok((counts[counts.len() / 2], counts[counts.len() * 99 / 100]))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn summarize(
     pool: &PgPool,
     label: &str,
     state: State,
     tables: u32,
     packing_keys: u64,
+    _seeded_logical: i64,
 ) -> anyhow::Result<SeedSummary> {
     // Scoped to the bench's OWN hypertables. Counting `FROM parts` unfiltered
     // would fold in whatever else lives in this Postgres (e.g. a ClickBench
@@ -654,9 +948,25 @@ async fn summarize(
         .fetch_one(pool)
         .await?;
 
+    // Counted, never assumed: a seed that claims a million tenants and produced
+    // nine hundred thousand is exactly the failure this issue was filed about.
+    let (logical_tables, namespaces): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(DISTINCT namespace_id) FROM logical_tables
+         WHERE hypertable_id IN (SELECT id FROM hypertables WHERE name LIKE $1)",
+    )
+    .bind(format!("{BENCH_TABLE_PREFIX}%"))
+    .fetch_one(pool)
+    .await?;
+
+    let (tenant_parts_p50, tenant_parts_p99) = tenant_fanout(pool, namespaces).await?;
+
     Ok(SeedSummary {
         label: label.to_string(),
         state: format!("{state:?}").to_lowercase(),
+        logical_tables,
+        namespaces,
+        tenant_parts_p50,
+        tenant_parts_p99,
         tables,
         total_parts: row.get::<i64, _>("total"),
         live_parts: row.get::<i64, _>("live"),

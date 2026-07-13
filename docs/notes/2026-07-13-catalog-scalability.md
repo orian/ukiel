@@ -167,7 +167,11 @@ the single primary stops meeting the SLO, not how fast the scan layer is.
 
 Fixture: 25k parts / 4 hypertables / 30 day-partitions / 1M packing keys, with
 real plan-16 `column_stats` (roaring bitmaps + row-group spans, so JSONB and TOAST
-width are honest). Machine: 12 physical cores (24 threads), Postgres 17 in compose,
+width are honest). **This fixture contains no `logical_tables` at all**, and the
+read workload resolves one hypertable once before the run — so nothing below is
+evidence about *tenant metadata* cardinality. That gap was filed as issue 0011 and
+is now closed by the measurement at the end of this note, which re-runs the claim
+against a million real logical tables. Machine: 12 physical cores (24 threads), Postgres 17 in compose,
 `max_connections = 100`. Driver and Postgres are co-located.
 SLO: query-admission p99 ≤ 50 ms, commit p99 ≤ 100 ms, zero timeouts,
 2× headroom (steady) / 1.25× (surge).
@@ -452,3 +456,85 @@ and what happens when lag exceeds the limit.
 - A backlogged catalog as the *steady* state (not a transient) → reads drop to
   ~4k QPS, and the compactor's ability to keep up becomes the question, not the
   primary's throughput.
+
+
+---
+
+# MEASURED (issue 0011, 2026-07-13): the million-logical-table proof
+
+Plan 40's headline was measured on a catalog with **four hypertables and zero
+logical tables**. A million packing-key *values* is not a million tenants'
+metadata: index depth, namespace-local listing and session construction all scale
+with the second and not the first. So the claim was re-run against the shape it is
+actually about.
+
+Fixture: **1,000,000 logical tables over 1,000,000 namespaces, 2,000 hypertables**,
+parts at 10k / 1M / 10M, `mature`. The namespace id *is* the packing key
+(`slice = namespace.0`). Two reps per point, agreeing within ~2%.
+Reproduce: `bench/run-issue-0011.sh`; hashes in `bench/manifests/issue-0011.json`.
+
+## The headline stands — and now it is about tenants
+
+**One primary is nowhere near the wall at a million tenants.** Every point passes
+the capacity gate with zero timeouts; the worst configuration measured (full
+admission at 10M parts) still clears **26×** the steady demand of 167 read QPS.
+
+`op/s` / `p99 ms` / `catalog rows per op`:
+
+| parts | parts-only (plan 40's workload) | catalog admission (typical tenant) | catalog admission (zipf) | full admission (+ session & plan) | cold buffers |
+|---|---|---|---|---|---|
+| 10k | 44,422 / 0.6 / 6 | 23,432 / 1.0 / 0 | 22,486 / 1.2 / 1 | 9,712 / 2.4 | 23,245 / 1.0 |
+| 1M | 7,142 / 4.4 / 93 | 18,429 / 1.3 / 6 | 15,331 / 2.3 / 14 | 7,595 / 3.9 | 16,089 / 2.2 |
+| 10M | 782 / 39.4 / **928** | 17,224 / 1.3 / 8 | 7,081 / 16.6 / **88** | 4,387 / 20.2 | 7,114 / 16.0 |
+
+**The tenant metadata is free.** `list_logical_tables` and `get_logical_table` are
+index probes on `logical_tables_namespace_id_name_key`, and catalog-only admission
+holds 17–23k op/s at p99 1.0–1.3 ms for the typical tenant at *every* part count.
+Adding the three metadata round trips to the parts-only call roughly halves
+throughput at the small point (44k → 23k) and costs nothing at the large ones — the
+metadata is not where the money goes at any scale measured.
+
+**A cold cache is a non-event**: 7,114 op/s cold vs 7,081 warm at 10M (buffer-hit
+0.92 vs 0.89). The partial live index keeps the working set small, as plan 40
+argued — now checked rather than assumed.
+
+## What actually costs, at a million tenants
+
+**1. The parts fan-out, not the tenant count.** The slow columns are slow because
+they return more rows: 88 and 928 catalog rows per op at 10M, against 8 for the
+typical tenant. And those rows are then *discarded* by the provider's key bitmap —
+the catalog ships the bitmap so the client can use it to throw away the row that
+carried it. Filed as **issue 0014**; this fixture is the first with enough parts in
+one hypertable to make it visible.
+
+**2. Query admission is CPU-bound in the process, not in the catalog.** Full
+admission (SessionContext + physical plan) burns **8.6–8.9 of 12 cores in the
+driver** while Postgres sits at 2.5–3.6, capping one ukield at ~4.4–9.7k
+admissions/s. This sharpens plan 40's "~1 core per 3.5k catalog reads/s" note: the
+per-request wall is DataFusion planning, and no amount of Postgres scaling moves
+it. Fleet sizing must budget for it.
+
+## Two bench bugs found on the way — both would have invalidated the result
+
+**The saturation classifier was blind outside the main checkout.** It located
+Postgres by the hard-coded container name `ukiel-postgres-1`. Anywhere else — a git
+worktree, a renamed directory, `COMPOSE_PROJECT_NAME` — `docker inspect` failed,
+Postgres CPU read as **0.00 cores**, and the classifier then attributed *every* run
+to the driver, confidently and with a number. It now resolves the container by its
+compose service label. Plan 40's attributions above are unaffected (it ran where the
+guess was right), but a classifier that says "0.00 cores" is worse than one that
+says it cannot tell.
+
+**The fixture was silently empty.** Every hypertable was given parts spanning the
+whole key space. With a million tenants over 2,000 hypertables, a table owning 500
+tenants held parts whose ranges covered all million — so 99.95% of tenants resolved
+to **zero parts**, and the catalog would have looked magnificent while being asked
+nothing at all. Key bands are now solved per hypertable from a target fan-out; the
+seeder *measures* the fan-out it achieved (median tenant 7–8 parts, against plan
+16's measured 7 for the real product) and **fails the run** if the median tenant
+resolves to nothing while there are enough live parts to go round.
+
+A fixture that returns nothing is indistinguishable from a fast one, unless you
+check. That is the whole lesson of issue 0011, and it applies to plan 40's original
+fixture too: its numbers were real, but they were not answering the question the
+project was asking them.

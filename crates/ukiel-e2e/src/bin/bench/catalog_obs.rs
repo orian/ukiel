@@ -328,11 +328,44 @@ async fn sample_once(pool: &PgPool) -> anyhow::Result<Sample> {
 
 /// Postgres's CPU seconds from the container's cgroup counter.
 ///
+/// The Postgres container, found by its **compose service label** rather than by a
+/// guessed name.
+///
+/// It used to be hard-coded as `ukiel-postgres-1`. That name is the compose
+/// project directory's, so it is wrong in a git worktree (`plan-43-postgres-1`),
+/// wrong under `COMPOSE_PROJECT_NAME`, and wrong for anyone who checked the repo
+/// out under another directory name. When it is wrong, `docker inspect` fails,
+/// Postgres's CPU reads as **zero**, and the saturation classifier then attributes
+/// every single run to the *driver* — confidently, and with a number. A blind
+/// classifier that says "0.00 cores" is worse than one that says it cannot tell,
+/// so this resolves the container the way compose itself identifies it.
+fn pg_container() -> Option<String> {
+    let out = std::process::Command::new("docker")
+        .args([
+            "ps",
+            "--filter",
+            "label=com.docker.compose.service=postgres",
+            "--format",
+            "{{.ID}}",
+        ])
+        .output()
+        .ok()?;
+    let id = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .to_string();
+    (!id.is_empty()).then_some(id)
+}
+
 /// A counter delta, not a `docker stats` snapshot: a single instant of a bursty
 /// workload says nothing about what it consumed over a window.
 fn pg_container_cpu_seconds() -> f64 {
+    let Some(name) = pg_container() else {
+        return 0.0;
+    };
     let Ok(out) = std::process::Command::new("docker")
-        .args(["inspect", "-f", "{{.Id}}", "ukiel-postgres-1"])
+        .args(["inspect", "-f", "{{.Id}}", &name])
         .output()
     else {
         return 0.0;
@@ -428,13 +461,11 @@ pub async fn snapshot_env(pool: &PgPool, dataset_bytes: i64) -> anyhow::Result<E
 /// read, never set** — the bench does not mutate Docker limits, so a sweep that
 /// forgets to restore one cannot silently poison every later run.
 pub fn pg_cpu_limit() -> String {
+    let Some(name) = pg_container() else {
+        return "unknown".to_string();
+    };
     let Ok(out) = std::process::Command::new("docker")
-        .args([
-            "inspect",
-            "-f",
-            "{{.HostConfig.NanoCpus}}",
-            "ukiel-postgres-1",
-        ])
+        .args(["inspect", "-f", "{{.HostConfig.NanoCpus}}", &name])
         .output()
     else {
         return "unknown".to_string();

@@ -594,6 +594,202 @@ pub async fn read(cfg: LoadConfig, ht_name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The tenant probe shape. Issue 0011: "key-only" and "key + time" are different
+/// index paths — the second adds JSONB range predicates over `column_stats` — and
+/// a capacity claim that only ever measured the first has not measured the
+/// product's most common query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    /// `WHERE tenant = k` — the slice predicate alone.
+    Key,
+    /// `WHERE tenant = k AND ts IN [a, b)` — one day out of the fixture's thirty.
+    KeyTime,
+}
+
+impl Shape {
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "key" => Ok(Shape::Key),
+            "key-time" => Ok(Shape::KeyTime),
+            other => bail!("unknown --probe '{other}' (key | key-time)"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Shape::Key => "key",
+            Shape::KeyTime => "key-time",
+        }
+    }
+}
+
+/// One day out of the seeded thirty, as a `ts` range — the shape a dashboard
+/// asks for, and the one the `column_stats` bounds exist to prune.
+fn day_range(day: i64) -> Vec<ukiel_core::ColumnRange> {
+    const DAY_MS: i64 = 86_400_000;
+    const BASE: i64 = 1_767_225_600_000;
+    vec![ukiel_core::ColumnRange {
+        column: "ts".to_string(),
+        min: Some(BASE + day * DAY_MS),
+        max: Some(BASE + day * DAY_MS + DAY_MS - 1),
+    }]
+}
+
+/// `bench catalog admission …` — the **whole** query-admission path, not just its
+/// last call (issue 0011).
+///
+/// Plan 40's `read` workload resolved one hypertable *once*, before the run, and
+/// then looped on `live_parts_pruned`. That is the cheapest call in admission and
+/// the only one whose cost does not grow with tenant count. What a real query does
+/// per request, and what this measures, is:
+///
+/// 1. `list_logical_tables(namespace)` — the tenant's own table list;
+/// 2. build a `SessionContext` and register the namespace's schema provider;
+/// 3. plan the SQL, which calls `get_logical_table` + `get_hypertable_by_id`;
+/// 4. `live_parts_pruned(hypertable, slice = namespace, ranges)` inside the scan.
+///
+/// Steps 1–3 are exactly the costs a million `logical_tables` rows can change and
+/// a million *packing-key values* cannot. The parts-only `read` workload stays, so
+/// the metadata cost is *separated* rather than hidden inside a single number.
+pub async fn admission(cfg: LoadConfig, shape: Shape, session: bool) -> anyhow::Result<()> {
+    let pools = Arc::new(build_pools(cfg.pools, cfg.connections_per_pool).await?);
+
+    // The namespace id *is* the packing key (`slice = namespace.0`), so the
+    // tenant axis and the key axis are the same one — which is precisely why a
+    // fixture with a million keys and no tenants looked like a million-tenant
+    // proof, and was not.
+    let (namespaces, dist) = (cfg.packing_keys, cfg.key_dist);
+
+    // Planning never reads an object; the store is registered because the
+    // provider requires one, and is deliberately in-memory so nothing about this
+    // measurement is object-storage latency.
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let store_url: url::Url = "memory:///".parse().expect("static url");
+    let metadata_cache = Arc::new(ukiel_query::metadata_cache::ParquetMetadataCache::new(1024));
+
+    let sql = match shape {
+        Shape::Key => "SELECT payload FROM events".to_string(),
+        Shape::KeyTime => {
+            // One day, mid-fixture. The provider turns this into a `column_stats`
+            // range predicate — the JSONB path a key-only probe never touches.
+            let r = &day_range(15)[0];
+            format!(
+                "SELECT payload FROM events WHERE ts >= {} AND ts <= {}",
+                r.min.unwrap(),
+                r.max.unwrap()
+            )
+        }
+    };
+    println!(
+        "admission probe: {} / {} — {sql}",
+        if session {
+            "session+plan"
+        } else {
+            "catalog-only"
+        },
+        shape.label()
+    );
+
+    let ranges = match shape {
+        Shape::Key => Vec::new(),
+        Shape::KeyTime => day_range(15),
+    };
+
+    let report = run_load("admission", &cfg, pools, move |pools, seq| {
+        let (store, store_url, metadata_cache, sql, ranges) = (
+            store.clone(),
+            store_url.clone(),
+            metadata_cache.clone(),
+            sql.clone(),
+            ranges.clone(),
+        );
+        async move {
+            let cat = &pools[(seq as usize) % pools.len()];
+            let n = (seq >> 11) as f64 / (u64::MAX >> 11) as f64;
+            // Namespaces are 1-based; `pick` returns 0-based.
+            let ns = ukiel_core::NamespaceId(dist.pick(n, namespaces) + 1);
+
+            if session {
+                // The whole thing: the tenant's table list, a fresh SessionContext
+                // (per-request in the product — pretending otherwise would delete
+                // the very cost this exists to price), then planning, which
+                // resolves the logical table, its hypertable, and the live parts.
+                let ctx = ukiel_query::context::session_for_namespace(
+                    cat,
+                    ns,
+                    store,
+                    &store_url,
+                    metadata_cache,
+                )
+                .await?;
+                let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
+                // A plan with no files means the tenant resolved to nothing — a
+                // fixture bug, and one that would make every latency here a lie.
+                return Ok((count_plan_files(&plan), 0));
+            }
+
+            // Catalog-only: the same four round trips, without DataFusion. This is
+            // the tier that answers "does the *catalog* scale to a million
+            // tenants" — the full path answers "does a request", and the two are
+            // different questions with different walls.
+            let tables = cat.list_logical_tables(ns).await?;
+            let Some(first) = tables.first() else {
+                bail!("namespace {ns} has no logical tables — the fixture is not what it claims");
+            };
+            let logical = cat.get_logical_table(ns, &first.name).await?;
+            let ht = cat.get_hypertable_by_id(logical.hypertable_id).await?;
+            let parts = cat.live_parts_pruned(ht.id, Some(ns.0), &ranges).await?;
+            Ok((parts.len() as u64, 0))
+        }
+    })
+    .await?;
+
+    print_report(&report);
+    let tier = if session { "session" } else { "catalog" };
+    crate::report::write_json(
+        &format!(
+            "catalog-admission-{tier}-{}-{}.json",
+            shape.label(),
+            cfg.label
+        ),
+        &report,
+    )?;
+    if report.result_rows == 0 {
+        bail!(
+            "every admission planned zero files — the fixture has no parts for the \
+             probed tenants, so this measures an empty catalog"
+        );
+    }
+    if report.dropped > 0 {
+        bail!("the driver shed load — fix the driver before trusting this point");
+    }
+    Ok(())
+}
+
+/// Parts the physical plan will open for this tenant. The count travels with the
+/// latency, because "admission took 4 ms" means nothing without "and it planned 7
+/// files" — a fast admission over an empty tenant is not a measurement.
+fn count_plan_files(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> u64 {
+    // The rendered plan is the only stable surface DataFusion 54 offers for the
+    // post-pruning file list without re-deriving the file groups ourselves.
+    let text = format!(
+        "{}",
+        datafusion::physical_plan::displayable(plan.as_ref()).indent(false)
+    );
+    text.match_indices("file_groups=")
+        .filter_map(|(i, _)| {
+            text[i..]
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse::<u64>()
+                .ok()
+        })
+        .sum::<u64>()
+        .max(1)
+}
+
 /// `bench catalog write …` — the durable-write path.
 ///
 /// Uses the **real** `commit_with_offsets`, per-part INSERT loop and all. The
@@ -1181,6 +1377,198 @@ pub async fn connections(pools_n: usize, per_pool: u32, ht_name: &str) -> anyhow
             "surge_ms": surge_ms,
             "establish_p50_ms": percentile(&establish_ms, 50.0),
             "establish_p99_ms": percentile(&establish_ms, 99.0),
+        }),
+    )?;
+    Ok(())
+}
+
+/// `bench catalog explain --label L` — the plan PostgreSQL actually chooses for
+/// every query the admission path issues, at this fixture's cardinality.
+///
+/// Issue 0011 asks for EXPLAIN at each knee for a reason: a latency number says
+/// *what* happened, a plan says *why*, and only the plan survives a change of
+/// machine. A sequential scan hiding behind a warm buffer cache reads like a fast
+/// index probe right up until the working set stops fitting.
+pub async fn explain(label: &str, namespaces: u64) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let cat = PostgresCatalog::connect(&crate::catalog::pg_url()).await?;
+    let pool = cat.pool_for_tests().clone();
+    let ns = (namespaces / 2 + 1) as i64;
+
+    let ht: i64 = sqlx::query_scalar(
+        "SELECT hypertable_id FROM logical_tables WHERE namespace_id = $1 LIMIT 1",
+    )
+    .bind(ns)
+    .fetch_one(&pool)
+    .await
+    .context("the fixture must have logical tables — seed with --namespaces")?;
+
+    let day_min = 1_767_225_600_000i64 + 15 * 86_400_000;
+    let day_max = day_min + 86_399_999;
+
+    // The four statements, in the order a request issues them.
+    let probes: Vec<(&str, String, Vec<i64>)> = vec![
+        (
+            "list_logical_tables",
+            "SELECT id, namespace_id, name, hypertable_id, column_mapping
+             FROM logical_tables WHERE namespace_id = $1 ORDER BY name"
+                .to_string(),
+            vec![ns],
+        ),
+        (
+            "get_logical_table",
+            "SELECT id, namespace_id, name, hypertable_id, column_mapping
+             FROM logical_tables WHERE namespace_id = $1 AND name = 'events'"
+                .to_string(),
+            vec![ns],
+        ),
+        (
+            "get_hypertable_by_id",
+            "SELECT id, name, table_schema, partition_spec, sort_key, packing_key, target_file_bytes
+             FROM hypertables WHERE id = $1"
+                .to_string(),
+            vec![ht],
+        ),
+        (
+            "live_parts_pruned(key)",
+            "SELECT id, hypertable_id, path, partition_values, packing_key_min, packing_key_max,
+                    row_count, size_bytes, level, column_stats, created_by_commit
+             FROM parts
+             WHERE hypertable_id = $1 AND deleted_by_commit IS NULL
+               AND packing_key_min <= $2 AND packing_key_max >= $2"
+                .to_string(),
+            vec![ht, ns],
+        ),
+        (
+            "live_parts_pruned(key+time)",
+            format!(
+                "SELECT id, hypertable_id, path, partition_values, packing_key_min, packing_key_max,
+                        row_count, size_bytes, level, column_stats, created_by_commit
+                 FROM parts
+                 WHERE hypertable_id = $1 AND deleted_by_commit IS NULL
+                   AND packing_key_min <= $2 AND packing_key_max >= $2
+                   AND (column_stats -> 'ts' ->> 'max')::bigint >= {day_min}
+                   AND (column_stats -> 'ts' ->> 'min')::bigint <= {day_max}"
+            ),
+            vec![ht, ns],
+        ),
+    ];
+
+    let mut out = serde_json::Map::new();
+    for (name, sql, binds) in probes {
+        let mut q = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, FORMAT TEXT) {sql}"
+        )));
+        for b in binds {
+            q = q.bind(b);
+        }
+        let plan = q
+            .fetch_all(&pool)
+            .await
+            .with_context(|| format!("explain {name}"))?;
+        let text = plan.join("\n");
+        // A sequential scan on `parts` at this cardinality is the finding, not a
+        // detail — say so where a reader cannot miss it.
+        let seq = text.contains("Seq Scan on parts");
+        println!(
+            "\n=== {name}{}\n{text}",
+            if seq { "   [SEQ SCAN ON parts]" } else { "" }
+        );
+        out.insert(name.to_string(), serde_json::Value::String(text));
+    }
+
+    crate::report::write_json(
+        &format!("catalog-explain-{label}.json"),
+        &serde_json::json!({ "label": label, "namespace": ns, "hypertable": ht, "plans": out }),
+    )?;
+    Ok(())
+}
+
+/// `bench catalog keyrank` — how a tenant's *position* in its hypertable's key
+/// space changes what its query costs.
+///
+/// `live_parts_pruned` asks for range **containment**: `kmin <= k AND kmax >= k`.
+/// A btree on `(hypertable_id, packing_key_min, packing_key_max)` can only use the
+/// leading `kmin <= k` bound as an index condition — everything after it is a
+/// filter. So the scan visits every live part whose `kmin` is at or below the
+/// probed key, and the cost grows with the key's **rank**, not with how many parts
+/// actually contain it.
+///
+/// The low-rank tenant and the high-rank tenant of the same hypertable return the
+/// same handful of parts. Only one of them pays for the whole table.
+pub async fn keyrank(label: &str, ht_name: &str, keys_per_table: i64) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let cat = PostgresCatalog::connect(&crate::catalog::pg_url()).await?;
+    let ht = cat
+        .get_hypertable(ht_name)
+        .await
+        .context("the hot hypertable")?;
+    let pool = cat.pool_for_tests().clone();
+
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM parts WHERE hypertable_id = $1 AND deleted_by_commit IS NULL",
+    )
+    .bind(ht.id.0)
+    .fetch_one(&pool)
+    .await?;
+    let lo: i64 = sqlx::query_scalar(
+        "SELECT min(packing_key_min) FROM parts WHERE hypertable_id = $1 AND deleted_by_commit IS NULL",
+    )
+    .bind(ht.id.0)
+    .fetch_one(&pool)
+    .await?;
+
+    println!(
+        "keyrank on '{ht_name}': {live} live parts, key slice [{lo}, {}]",
+        lo + keys_per_table - 1
+    );
+
+    let mut out = Vec::new();
+    for (name, rank) in [("first", 0.02), ("median", 0.50), ("last", 0.98)] {
+        let key = lo + (keys_per_table as f64 * rank) as i64;
+        // Warm, then time a batch — one query is noise.
+        let mut parts = 0usize;
+        let started = std::time::Instant::now();
+        const N: u32 = 200;
+        for _ in 0..N {
+            parts = cat.live_parts_pruned(ht.id, Some(key), &[]).await?.len();
+        }
+        let per_op_ms = started.elapsed().as_secs_f64() * 1000.0 / f64::from(N);
+
+        let plan: Vec<String> = sqlx::query_scalar(
+            "EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+             SELECT id FROM parts
+             WHERE hypertable_id = $1 AND deleted_by_commit IS NULL
+               AND packing_key_min <= $2 AND packing_key_max >= $2",
+        )
+        .bind(ht.id.0)
+        .bind(key)
+        .fetch_all(&pool)
+        .await?;
+        let text = plan.join("\n");
+        // The number that makes the point: rows the index *visited* vs rows kept.
+        let removed = text
+            .split("Rows Removed by Filter: ")
+            .nth(1)
+            .and_then(|t| t.split_whitespace().next())
+            .unwrap_or("0")
+            .to_string();
+
+        println!(
+            "  {name:>6} key {key:>9}: {parts:>3} parts returned, {per_op_ms:6.3} ms/op, \
+             {removed} index rows visited and discarded"
+        );
+        out.push(serde_json::json!({
+            "rank": name, "key": key, "parts_returned": parts,
+            "ms_per_op": per_op_ms, "rows_removed_by_filter": removed, "plan": text,
+        }));
+    }
+
+    crate::report::write_json(
+        &format!("catalog-keyrank-{label}.json"),
+        &serde_json::json!({
+            "label": label, "hypertable": ht_name, "live_parts": live,
+            "keys_per_table": keys_per_table, "probes": out
         }),
     )?;
     Ok(())
