@@ -8,7 +8,7 @@ ukiel-core = { workspace = true }
 ukiel-catalog = { workspace = true }
 ukiel-expr = { workspace = true }
 arrow = { workspace = true }
-parquet = { workspace = true }
+parquet = { workspace = true, features = ["async", "object_store"] }
 object_store = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -1,0 +1,15 @@
+[package]
+name = "prod-synth-contract"
+version.workspace = true
+edition.workspace = true
+
+# The public artifact contract between the three plan-45 executables. It parses
+# no profile, generates nothing, contacts no service, and benchmarks nothing —
+# it is types and version checks. Keeping it that small is what lets all three
+# tools depend on it without any of them depending on each other.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }

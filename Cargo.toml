@@ -1,6 +1,23 @@
 [workspace]
 resolver = "2"
-members = ["crates/ukiel-core", "crates/ukiel-catalog", "crates/ukiel-ingest", "crates/ukiel-query", "crates/ukiel-compactor", "crates/ukiel-gc", "crates/ukiel-expr", "crates/ukield", "crates/ukiel-e2e"]
+members = [
+    "crates/ukiel-core",
+    "crates/ukiel-catalog",
+    "crates/ukiel-ingest",
+    "crates/ukiel-query",
+    "crates/ukiel-compactor",
+    "crates/ukiel-gc",
+    "crates/ukiel-expr",
+    "crates/ukield",
+    "crates/ukiel-e2e",
+    # Plan 45 (prod-synth). Three single-purpose executables joined only by the
+    # versioned manifest in `prod-synth-contract`; no executable package may
+    # depend on another executable package.
+    "tools/prod-synth-contract",
+    "tools/prod-synth",
+    "tools/ukiel-prod-load",
+    "tools/ukiel-prod-bench",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -15,7 +32,13 @@ chrono = { version = "0.4", features = ["serde"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "json", "migrate", "macros", "uuid"] }
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 arrow = "58.3"
-parquet = { version = "58.3", features = ["async", "object_store"] }
+# Base features only. `async` + `object_store` drag in tokio, object_store and
+# reqwest, and `ukiel-core` needs none of them — it only touches the Parquet
+# writer properties and footer statistics. Leaving them on here put a whole
+# service client stack in the offline `prod-synth` generator's dependency graph
+# (caught by tools/prod-synth/tests/boundary.rs). The two crates that really do
+# read asynchronously from an object store turn them on themselves.
+parquet = { version = "58.3" }
 object_store = "0.13"
 rdkafka = { version = "0.39", features = ["cmake-build", "tokio"] }
 uuid = { version = "1", features = ["v4"] }
@@ -55,6 +78,10 @@ ukiel-compactor = { path = "crates/ukiel-compactor" }
 ukiel-gc = { path = "crates/ukiel-gc" }
 ukiel-expr = { path = "crates/ukiel-expr" }
 ukield = { path = "crates/ukield" }
+prod-synth-contract = { path = "tools/prod-synth-contract" }
+# Plan 45: the generator must build without a service client in the graph, so it
+# takes its CLI from `clap` and nothing else new.
+clap = { version = "4", features = ["derive"] }
 
 # Optimized release build (used by `--release`, incl. the macro perf bench and
 # `ukield`). ThinLTO gives cross-crate inlining across the whole graph

@@ -1,0 +1,34 @@
+[package]
+name = "prod-synth"
+version.workspace = true
+edition.workspace = true
+description = "Deterministically compile an anonymized workload profile into a portable, synthetic, production-shaped Parquet fixture."
+
+# Plan 45's hard boundary: this must stay installable and runnable with nothing
+# but a Rust toolchain — no PostgreSQL, no Kafka, no object store, no HTTP, no
+# DataFusion. `ukiel-core` is the one Ukiel dependency, and only for the stable
+# schema/sort/Parquet-writer primitives, so the fixture is written the way the
+# product writes files rather than the way a benchmark wishes it did.
+#
+# Forbidden here, and enforced by tools/prod-synth/tests/boundary.rs:
+#   ukiel-e2e, ukield, ukiel-catalog, ukiel-query, ukiel-ingest, ukiel-compactor.
+
+[dependencies]
+prod-synth-contract = { workspace = true }
+ukiel-core = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "prod-synth"
+path = "src/main.rs"

@@ -1,15 +1,20 @@
-# Ukiel Plan 45: Production-Shaped Synthetic PostHog
+# Ukiel Plan 45: Production-Shaped Synthetic Event Workload
 
 > **For agentic workers:** Execute this plan task-by-task. Use checkbox
 > (`- [ ]`) progress, run each task's focused tests before its commit, and do not
-> start until issue 0014's catalog key-filter implementation has merged.
+> cross tool boundaries: the generator, loader, and benchmark runner are separate
+> executables joined only by a versioned manifest.
 
-**Status:** Ready after issue 0014 merges.
+**Status:** Ready. Issue 0014 has merged; this plan validates its behavior against
+the captured production shape.
 
 **Goal:** Turn the anonymized ClickHouse observations in `docs/prod-info/` into
-a deterministic synthetic PostHog fixture. Use it to test Ukiel's real catalog,
-Parquet scan, namespace isolation, and representative event queries with the
-production tenant/part shape instead of independent random numbers.
+a deterministic synthetic event fixture named **prod-synth**. Ship the offline
+generator as a standalone, single-purpose CLI that anyone with a Rust toolchain
+can run without Ukiel services. Separate executables load that artifact into
+Ukiel and benchmark it. Use the fixture to test Ukiel's real catalog, Parquet
+scan, namespace isolation, and representative event queries with the production
+tenant/part shape instead of independent random numbers.
 
 **Why now:** The issue-0014 investigation showed that a plausible-looking random
 fixture can answer the wrong question. Production has a median 11 exact parts per
@@ -21,17 +26,24 @@ shape, but not enough to claim a byte-for-byte or column-value replica.
 
 ## Execution position and boundaries
 
-Issue 0014 is a hard prerequisite. This plan consumes the final `key_filter` and
-truthful-bitmap write path plus its range-only benchmark arm; it must not guess
-those APIs while another agent is changing them. Rebase after the issue lands.
+Issue 0014 is merged. This plan consumes its final `key_filter`, truthful-bitmap
+write path, and range-only benchmark semantics; it must not copy their
+implementation into the generator. Product-specific metadata is derived only by
+the loader through Ukiel's normal write path.
 The four source files under `docs/prod-info/` must be tracked in the same
-revision as the parser tests; the benchmark never fetches production metadata
+revision as the parser tests; no tool fetches production metadata
 from the network.
 
 Plan 44 is **not** a prerequisite. Until native logical JSON lands, `properties`
 is stored as valid JSON text in an `utf8` field, matching the physical reality of
 the captured ClickHouse `String` column. A later JSON plan may add extraction
 queries over the same generated values.
+
+The generated data, artifact paths, manifest format, table names, CLI names, and
+query-suite names use `prod-synth`, not a source-product name. The source workload
+is acknowledged only as provenance in documentation and the input profile. The
+artifact must identify itself as synthetic and profile-derived; it must never
+present itself as a production copy.
 
 This is a new house benchmark. It does not replace ClickBench, JSONBench, the
 catalog saturation suite, or their recorded baselines:
@@ -45,6 +57,50 @@ catalog saturation suite, or their recorded baselines:
 No production code or migration should be necessary. If implementation appears
 to require either, stop and document the missing product capability before
 expanding this benchmark plan.
+
+## Tool boundaries
+
+Plan 45 produces three executables, not another command family inside the existing
+8k-line `ukiel-e2e` `bench` binary:
+
+| executable | package | one responsibility | allowed side effects |
+|---|---|---|---|
+| `prod-synth` | `tools/prod-synth` | validate a profile and deterministically produce or verify a portable fixture | local filesystem only |
+| `ukiel-prod-load` | `tools/ukiel-prod-load` | load one existing manifest into an explicitly selected Ukiel test deployment, or create its ephemeral catalog-only form | catalog and object-store writes declared by the command |
+| `ukiel-prod-bench` | `tools/ukiel-prod-bench` | measure an existing load and compare scoped Ukiel results with raw DataFusion | read-only service access plus local result files |
+
+The artifact pipeline is:
+
+```text
+docs/prod-info/
+    -> prod-synth
+    -> manifest.json + topology.json + parquet/
+    -> ukiel-prod-load
+    -> explicitly named Ukiel fixture
+    -> ukiel-prod-bench
+```
+
+The tools communicate through `ukiel-prod-synth/v1`; they do not call each
+other's command handlers or reach into another binary's modules. The manifest is
+the public contract. Its serde types and version checks live in the tiny
+`tools/prod-synth-contract` library, which performs no profile parsing,
+generation, service access, or benchmarking. All three executables may depend on
+that contract library; no executable package may depend on another executable
+package.
+
+`prod-synth` remains usable without compiling PostgreSQL, Kafka, object-store,
+HTTP, or DataFusion clients. It may depend on `ukiel-core` only for stable
+schema/Parquet writer primitives; it must not depend on `ukiel-e2e`, `ukield`,
+`ukiel-catalog`, `ukiel-query`, `ukiel-ingest`, or `ukiel-compactor`.
+
+The separation is enforced by tests and dependency inspection:
+
+- `cargo install --path tools/prod-synth` succeeds from a fresh checkout;
+- `prod-synth --help`, `profile`, `generate`, and `verify` need no running service;
+- the loader accepts a manifest path and cannot invoke topology generation;
+- the benchmark runner accepts a manifest/load identity and cannot generate or
+  mutate a fixture; and
+- no command assumes the repository working directory or a fixed `bench/` path.
 
 ## What the source can and cannot tell us
 
@@ -85,22 +141,29 @@ query frequency, host identity, or replica identity. The generator therefore:
 - records source bytes, ClickHouse part type, and ClickHouse merge level only as
   provenance. It never writes them as a generated Ukiel part's size or level.
 
-## Generator design
+## Generator and artifact design
 
-### Two outputs from one topology
+### Two representations from one topology
 
-`bench posthog synth` compiles a `SyntheticTopology` once and feeds:
+`prod-synth generate` compiles a `SyntheticTopology` once and writes:
 
-1. **Catalog topology:** truthful ranges, exact packing-key bitmaps, bounded key
-   filters, row weights, and time stats. It can be seeded without objects for a
-   fast range-vs-filter/admission measurement.
-2. **Materialized data:** actual sorted Parquet files and matching catalog rows.
-   Here `row_count` and `size_bytes` come from the generated file, never from
-   scaled ClickHouse counters.
+1. **Portable topology:** exact memberships, truthful ranges, row weights, time
+   statistics, and representative tenants. It contains no PostgreSQL rows and no
+   precomputed Ukiel `key_filter`. The loader can consume it for a fast
+   catalog-only measurement.
+2. **Materialized data:** actual sorted Parquet files described by the same
+   manifest. Here `row_count` and `size_bytes` come from the generated files,
+   never from scaled ClickHouse counters.
 
 The manifest fingerprints the input profile, generator version, seed, topology,
 and every output file. A report from one seed or tier must be impossible to
 mistake for another.
+
+Generation requires an explicit `--output`; examples in this plan use
+`bench/datasets/prod-synth/<label>/`, but the executable itself has no repository
+default. Output is a temporary sibling directory renamed atomically only after
+verification. `prod-synth verify <manifest>` performs offline structural,
+digest, footer, and census verification and never contacts Ukiel.
 
 ### Deterministic topology compilation
 
@@ -152,7 +215,7 @@ library sampling helpers whose algorithm is absent from the manifest contract.
 versioned defaults. Every override is recorded. `shape` is not an acceptance
 gate and does not pretend to reproduce the source's 4.47B observed rows.
 
-### PostHog-shaped schema
+### Production-derived event schema
 
 Generate a supported subset of the captured event table:
 
@@ -174,6 +237,8 @@ the last two sort expressions; Ukiel declares columns rather than arbitrary sort
 expressions, so direct string ordering is an explicit adaptation. The packing key
 remains first.
 
+The field selection and event vocabulary are derived from the captured event
+workload, but generated artifacts use only the neutral `prod-synth` identity.
 The non-profile dimensions are synthetic and labelled as such:
 
 - a fixed skewed vocabulary containing `$pageview`, `$autocapture`,
@@ -202,17 +267,23 @@ generator but must define Ukiel day partitioning as a separate experiment.
 
 ## Fidelity gates
 
-Generation fails before reporting if any invariant is false:
+Offline generation fails before reporting if any invariant is false:
 
 - exact part count equals the selected profile count per shard;
 - every part and tenant degree equals its compiled graph margin;
 - part ranges are derived from and bracket every exact member;
-- every exact member is accepted by the stored key filter;
-- decoding the stored packing-key bitmap returns the manifest key set exactly;
-- actual Parquet rows, footer key/timestamp bounds, catalog `row_count`, and
-  object `size_bytes` agree;
+- actual Parquet rows, footer key/timestamp bounds, manifest counts, and file
+  sizes agree;
 - generated count queries agree with the generator census; and
 - the same seed/config/profile digest produces the same topology/file digests.
+
+Loading fails before reporting success if any service-side invariant is false:
+
+- decoding each product-derived packing-key bitmap returns the manifest key set;
+- every exact member is accepted by the product-derived key filter;
+- object HEAD, manifest file size, and catalog `size_bytes` agree;
+- actual rows, manifest rows, and catalog `row_count` agree; and
+- the loaded manifest digest and fixture label are recorded together.
 
 For `baseline`, compare generated and source one-shard distributions:
 
@@ -234,18 +305,25 @@ Print every source/generated pair. Do not silently loosen a failed tolerance.
 
 **Files:**
 
-- Create: `crates/ukiel-e2e/src/bin/bench/posthog/mod.rs`
-- Create: `crates/ukiel-e2e/src/bin/bench/posthog/profile.rs`
-- Modify: `crates/ukiel-e2e/src/bin/bench/main.rs`
-- Test: profile module unit tests
+- Modify: `Cargo.toml` (add the standalone tool package to the workspace)
+- Create: `tools/prod-synth-contract/Cargo.toml`
+- Create: `tools/prod-synth-contract/src/lib.rs`
+- Create: `tools/prod-synth/Cargo.toml`
+- Create: `tools/prod-synth/README.md`
+- Create: `tools/prod-synth/src/lib.rs`
+- Create: `tools/prod-synth/src/main.rs`
+- Create: `tools/prod-synth/src/profile.rs`
+- Track: all four files under `docs/prod-info/`
+- Test: `tools/prod-synth/tests/profile.rs`
 
 **Interfaces:**
 
-- `PosthogProfile::load(path) -> Result<PosthogProfile>`
+- package and binary name `prod-synth`
+- `ProductionProfile::load(path) -> Result<ProductionProfile>`
 - typed `TableObservation`, `PartObservation`, and `TenantObservation`
 - `ProfileSummary` with digests, counts, quantiles, summed part degree, mean
   tenant degree, and the active-tenant estimate
-- `bench posthog profile [--profile docs/prod-info]`
+- `prod-synth profile --profile DIR --report FILE`
 
 - [ ] **Step 1: Write failing parser/validation tests.** Pin 68 parts, 534
   tenant samples, 2,389,316 memberships, exact p50/p90 11/43, range p50 63,
@@ -255,16 +333,19 @@ Print every source/generated pair. Do not silently loosen a failed tolerance.
 - [ ] **Step 2: Implement streaming loading and stable quantiles.** Hash raw
   bytes, not reserialized structs. `show-create.sql` is hashed provenance, not a
   schema language to parse.
-- [ ] **Step 3: Add the CLI/report.** Write
-  `bench/results/posthog-profile-<digest>.json` and print the sampling/replica
-  caveats.
-- [ ] **Step 4: Verify and commit.**
+- [ ] **Step 3: Add the CLI/report.** Require an explicit report path, print the
+  sampling/replica caveats, and make `--help` work without a repository cwd.
+- [ ] **Step 4: Prove standalone installation.** Install into a temporary root
+  and run `--help` and `profile` without any Ukiel service.
+- [ ] **Step 5: Verify and commit.**
 
 ```bash
-cargo test -p ukiel-e2e --bin bench posthog::profile
+cargo test -p prod-synth profile
+cargo run -p prod-synth -- profile --profile docs/prod-info --report /tmp/prod-synth-profile.json
+cargo install --path tools/prod-synth --root /tmp/prod-synth-install
 cargo fmt --check
-cargo clippy -p ukiel-e2e --bin bench -- -D warnings
-git commit -m "bench: parse and validate production PostHog shape"
+cargo clippy -p prod-synth --all-targets -- -D warnings
+git commit -m "tools: parse and validate the production event shape"
 ```
 
 ---
@@ -273,16 +354,17 @@ git commit -m "bench: parse and validate production PostHog shape"
 
 **Files:**
 
-- Create: `crates/ukiel-e2e/src/bin/bench/posthog/topology.rs`
-- Create: `crates/ukiel-e2e/src/bin/bench/posthog/rng.rs`
-- Test: topology/rng unit tests
+- Create: `tools/prod-synth/src/topology.rs`
+- Create: `tools/prod-synth/src/rng.rs`
+- Create: `tools/prod-synth-contract/src/manifest.rs`
+- Test: `tools/prod-synth/tests/topology.rs`
 
 **Interfaces:**
 
 - `TopologyConfig { tier, tenants, rows_per_shard, shards, seed }`
 - `SyntheticTopology { tenants, parts, memberships, summary }`
 - `compile(profile, config) -> Result<SyntheticTopology>`
-- manifest format `ukiel-posthog-synth/v1`
+- manifest format `ukiel-prod-synth/v1`
 
 - [ ] **Step 1: Pin PRNG/scaling math.** Golden sequence; exact rounded totals;
   tier expansion; too-few rows reports the required minimum.
@@ -290,15 +372,15 @@ git commit -m "bench: parse and validate production PostHog shape"
   sequences; exact margins; no duplicates; deterministic digest; seed change.
 - [ ] **Step 3: Implement the specified compiler.** Keep tenant fields joint.
   Derive ranges/fanout only after graph realization.
-- [ ] **Step 4: Run smoke/baseline in memory.** All fidelity gates pass; store
-  reports only under gitignored `bench/results/`.
+- [ ] **Step 4: Run smoke/baseline in memory.** All fidelity gates pass; write
+  reports only to the explicit path supplied by the caller.
 - [ ] **Step 5: Verify and commit.**
 
 ```bash
-cargo test -p ukiel-e2e --bin bench posthog::topology
+cargo test -p prod-synth topology
 cargo fmt --check
-cargo clippy -p ukiel-e2e --bin bench -- -D warnings
-git commit -m "bench: compile production-shaped tenant and part topology"
+cargo clippy -p prod-synth --all-targets -- -D warnings
+git commit -m "tools: compile production-shaped tenant and part topology"
 ```
 
 ---
@@ -307,38 +389,45 @@ git commit -m "bench: compile production-shaped tenant and part topology"
 
 **Files:**
 
-- Create: `crates/ukiel-e2e/src/bin/bench/posthog/generate.rs`
-- Modify: `crates/ukiel-e2e/Cargo.toml` only for workspace-pinned dependencies
-- Modify: `crates/ukiel-e2e/src/bin/bench/main.rs`
-- Test: generator unit tests with a tiny profile
+- Create: `tools/prod-synth/src/generate.rs`
+- Create: `tools/prod-synth/src/value_model.rs`
+- Modify: `tools/prod-synth-contract/src/manifest.rs`
+- Modify: `tools/prod-synth/Cargo.toml` only for generator dependencies
+- Test: `tools/prod-synth/tests/generate.rs`
 
 **Interfaces:**
 
-- `bench posthog synth --tier smoke|baseline|shape [--profile DIR]`
-  `[--label L] [--seed N] [--tenants N] [--rows-per-shard N] [--shards N]`
-- output `bench/datasets/posthog-synth/<label>/`
+- `prod-synth generate --tier smoke|baseline|shape --profile DIR --output DIR`
+  `[--seed N] [--tenants N] [--rows-per-shard N] [--shards N]`
+- `prod-synth verify MANIFEST`
+- example output `bench/datasets/prod-synth/<label>/`; never an implicit default
 - `manifest.json` with all digests/configuration, source/generated summaries,
-  `ValueModel`, per-part bitmap/stats, actual rows/bytes, and representative
-  tenants
+  `ValueModel`, exact membership topology, actual rows/bytes, and representative
+  tenants. Ukiel bitmaps and key filters are not generated here.
 
 - [ ] **Step 1: Define schema/value model/manifest round-trip tests.** Unknown
   manifest versions fail closed.
 - [ ] **Step 2: Write a failing tiny generation test.** Assert sorted rows,
   valid JSON, promoted equality, repeated distinct IDs, deterministic UUIDs,
-  time/footer/bitmap truth, and identical file digests on rerun.
+  time/footer/membership truth, and identical file digests on rerun.
 - [ ] **Step 3: Implement bounded generation.** One part at a time, bounded
   Arrow batches, actual closed-file size. Never materialize all rows in memory.
 - [ ] **Step 4: Make output atomic.** Temporary sibling then rename after all
   gates; refuse overwrite without explicit `--replace` scoped to that label.
-- [ ] **Step 5: Run smoke twice and prove byte determinism.**
-- [ ] **Step 6: Verify and commit.**
+- [ ] **Step 5: Implement offline verification.** Recompute profile, topology,
+  file, footer, schema, census, and manifest digests without network access.
+- [ ] **Step 6: Run smoke twice and prove byte determinism.**
+- [ ] **Step 7: Verify and commit.**
 
 ```bash
-cargo test -p ukiel-e2e --bin bench posthog::generate
-cargo run --release -p ukiel-e2e --bin bench -- posthog synth --tier smoke --label plan45-smoke
+cargo test -p prod-synth generate
+cargo run --release -p prod-synth -- generate --tier smoke --profile docs/prod-info \
+  --output bench/datasets/prod-synth/plan45-smoke
+cargo run --release -p prod-synth -- verify \
+  bench/datasets/prod-synth/plan45-smoke/manifest.json
 cargo fmt --check
-cargo clippy -p ukiel-e2e --bin bench -- -D warnings
-git commit -m "bench: generate deterministic synthetic PostHog parquet"
+cargo clippy -p prod-synth --all-targets -- -D warnings
+git commit -m "tools: generate deterministic production-shaped parquet"
 ```
 
 ---
@@ -347,56 +436,67 @@ git commit -m "bench: generate deterministic synthetic PostHog parquet"
 
 **Files:**
 
-- Create: `crates/ukiel-e2e/src/bin/bench/posthog/load.rs`
-- Modify: `crates/ukiel-e2e/src/bin/bench/main.rs`
-- Test: ignored integration test in `crates/ukiel-e2e/tests/`
+- Modify: `Cargo.toml` (add the loader package to the workspace)
+- Create: `tools/ukiel-prod-load/Cargo.toml`
+- Create: `tools/ukiel-prod-load/src/main.rs`
+- Create: `tools/ukiel-prod-load/src/load.rs`
+- Create: `tools/ukiel-prod-load/src/catalog_only.rs`
+- Test: `tools/ukiel-prod-load/tests/load.rs`
 
 **Interfaces:**
 
-- `bench posthog load --label L`
-- `bench posthog catalog-seed --label L --ephemeral` for the topology-only arm
-- hypertable `posthog_events_synth_<label>`, packing key `team_id`
+- `ukiel-prod-load materialized --manifest FILE --label L --config FILE`
+- `ukiel-prod-load catalog-only --manifest FILE --label L --ephemeral --catalog-url URL`
+- hypertable `prod_synth_events_<label>`, packing key `team_id`
 - source partition provenance in `partition_values`
 - logical table `events` for heavy, median, light, high-overfetch,
   low-overfetch, and a deterministic tenant sample
+- no profile parsing, topology compilation, row generation, or benchmark commands
 
-- [ ] **Step 1: Write the failing integration test.** Generate tiny data,
-  upload and commit it, then assert object HEAD = manifest = catalog bytes;
+- [ ] **Step 1: Write the failing integration test.** Generate a tiny artifact
+  with `prod-synth`, load it, then assert object HEAD = manifest = catalog bytes;
   actual rows = manifest = catalog rows; every member is returned; exact-absent
-  members are removed by provider bitmap.
-- [ ] **Step 2: Implement product-path create/upload/ADD.** Use normal metadata
-  builders and issue-0014 key-filter derivation. Set-based fake part rows are
-  forbidden for this 68-part materialized fixture. The separate ephemeral arm
-  may bulk-seed the same truthful topology with `size_bytes = 0` and
-  `catalog-only://` paths because it measures no object behavior.
-- [ ] **Step 3: Verify catalog shape.** Per representative tenant report range,
+  members are removed by the provider bitmap.
+- [ ] **Step 2: Validate the artifact boundary.** Load and verify
+  `ukiel-prod-synth/v1`, reject unknown versions or digest mismatches before
+  connecting to a service, and never regenerate missing data.
+- [ ] **Step 3: Implement product-path create/upload/ADD.** Use normal metadata
+  builders so the product derives roaring bitmaps and issue-0014 key filters.
+  Set-based fake part rows are forbidden for the materialized fixture. The
+  separate ephemeral arm may bulk-seed the same truthful topology with
+  `size_bytes = 0` and `catalog-only://` paths because it measures no object
+  behavior.
+- [ ] **Step 4: Verify catalog shape.** Per representative tenant report range,
   shipped-filter, and exact counts. Assert zero false negatives.
-- [ ] **Step 4: Make lifecycle loud.** Require a fresh label and distinguish
+- [ ] **Step 5: Make lifecycle loud.** Require a fresh label and distinguish
   catalog-only seeds from materialized loads. The ephemeral command requires a
   disposable stack, refuses to run alongside configured compactor/GC roles,
   cleans its hypertables/commits/parts on success, and attempts the same cleanup
   on error. If cleanup fails, exit with the exact manual reset command. Never
   leave fake paths silently for a background compactor.
-- [ ] **Step 5: Verify and commit.**
+- [ ] **Step 6: Verify and commit.**
 
 ```bash
-cargo test -p ukiel-e2e --test posthog_synth_test -- --ignored --nocapture
+cargo test -p ukiel-prod-load --test load -- --ignored --nocapture
 cargo fmt --check
-cargo clippy -p ukiel-e2e --bin bench -- -D warnings
-git commit -m "bench: load truthful synthetic PostHog fixture into Ukiel"
+cargo clippy -p ukiel-prod-load --all-targets -- -D warnings
+git commit -m "tools: load a prod-synth artifact into Ukiel"
 ```
 
 ---
 
-### Task 5: Scoped PostHog queries and raw-file reference
+### Task 5: Scoped prod-synth queries and raw-file reference
 
 **Files:**
 
-- Create: `bench/queries/posthog-synth/queries.sql`
-- Create: `bench/queries/posthog-synth/README.md`
-- Create: `crates/ukiel-e2e/src/bin/bench/posthog/run.rs`
-- Modify: `crates/ukiel-e2e/src/bin/bench/main.rs`
-- Test: rendering/result unit tests and ignored integration test
+- Modify: `Cargo.toml` (add the benchmark package to the workspace)
+- Create: `bench/queries/prod-synth/queries.sql`
+- Create: `bench/queries/prod-synth/README.md`
+- Create: `tools/ukiel-prod-bench/Cargo.toml`
+- Create: `tools/ukiel-prod-bench/src/main.rs`
+- Create: `tools/ukiel-prod-bench/src/catalog.rs`
+- Create: `tools/ukiel-prod-bench/src/queries.rs`
+- Test: `tools/ukiel-prod-bench/tests/benchmark.rs`
 
 **Query set:**
 
@@ -413,32 +513,35 @@ user SQL. Raw DataFusion reads the same files and adds the equivalent explicit
 
 **Interfaces:**
 
-- `bench posthog run --label L [--iters N]`
+- `ukiel-prod-bench queries --manifest FILE --label L --result FILE [--iters N]`
+- `ukiel-prod-bench catalog --manifest FILE --label L --result FILE [--range-only]`
 - classes: heavy, median, light, high-overfetch, low-overfetch
 - one warmup then median of five by default
 - report source/generated geometry, range/filter/exact candidates, planned
   files, returned rows, Ukiel/raw timings and all fixture digests
+- no generation, upload, catalog mutation, or cleanup commands
 
 - [ ] **Step 1: Test query rendering.** Quoted `"mat_$current_url"` and
   `"mat_$lib"` survive; comparison queries have deterministic ordering.
 - [ ] **Step 2: Write failing end-to-end equivalence.** All queries/classes agree
   between scoped Ukiel and raw DataFusion; count equals census; range-only
   false candidates are not read.
-- [ ] **Step 3: Implement runner/report.** Separate generation/load/query time.
-  Record failed queries and fail after attempting the rest.
-- [ ] **Step 4: Add `bench posthog catalog --label L [--range-only]` for an
-  existing materialized load, and share its measurement code with
-  `catalog-seed --ephemeral`. Use the same tenants/topology and issue-0014
-  before/after arms. Report rows/bytes and latency, but do not call 68 parts a
-  saturation test.
-- [ ] **Step 5: Verify and commit.**
+- [ ] **Step 3: Implement runner/report.** Measure query time only; generation
+  and loading are facts read from the manifest/load record, not actions this
+  process may perform. Record failed queries and fail after attempting the rest.
+- [ ] **Step 4: Implement the catalog command for an existing load.** Use the
+  same tenants/topology and issue-0014 before/after arms. Report rows/bytes and
+  latency, but do not call 68 parts a saturation test.
+- [ ] **Step 5: Enforce read-only behavior.** Fail startup if the requested
+  command would require creating, loading, repairing, or cleaning a fixture.
+- [ ] **Step 6: Verify and commit.**
 
 ```bash
-cargo test -p ukiel-e2e --bin bench posthog::run
-cargo test -p ukiel-e2e --test posthog_synth_test -- --ignored --nocapture
+cargo test -p ukiel-prod-bench
+cargo test -p ukiel-prod-bench --test benchmark -- --ignored --nocapture
 cargo fmt --check
-cargo clippy -p ukiel-e2e --bin bench -- -D warnings
-git commit -m "bench: run scoped PostHog queries over production-shaped data"
+cargo clippy -p ukiel-prod-bench --all-targets -- -D warnings
+git commit -m "tools: benchmark a loaded prod-synth artifact"
 ```
 
 ---
@@ -449,7 +552,8 @@ git commit -m "bench: run scoped PostHog queries over production-shaped data"
 
 - Modify: `bench/README.md`
 - Modify: `docs/prod-info/README.md`
-- Create: `docs/notes/2026-07-14-synthetic-posthog-baseline.md`
+- Modify: `tools/prod-synth/README.md`
+- Create: `docs/notes/2026-07-14-prod-synth-baseline.md`
 - Modify: `docs/superpowers/plans/2026-07-05-ukiel-v1-roadmap.md`
 - Modify: this plan
 
@@ -459,38 +563,59 @@ git commit -m "bench: run scoped PostHog queries over production-shaped data"
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 make test
+cargo install --path tools/prod-synth --root /tmp/prod-synth-install
+/tmp/prod-synth-install/bin/prod-synth --help
 ```
 
-- [ ] **Step 2: On a clean stack run baseline, one shard.** Record machine/SHA,
-  all digests, generation bytes/time, load time, fidelity pairs, catalog A/B,
+- [ ] **Step 2: From a clean checkout, generate and verify the one-shard
+  baseline with no services running.** Record profile, topology, and file
+  digests plus generation bytes/time. Copy or move the completed portable
+  artifact to the benchmark host; do not regenerate it inside the loader.
+- [ ] **Step 3: On a clean disposable stack, load that exact manifest and run the
+  baseline.** Record machine/SHA, load time, fidelity pairs, catalog A/B,
   scoped/raw results, and whether issue 0014 removes overfetch before SQLx.
-- [ ] **Step 3: Run smoke with `--shards 10` in catalog-only mode.** Candidate
-  counts add while density/overfetch distributions stay stable. Materializing
-  10x data is not an acceptance gate.
-- [ ] **Step 4: Write runbook/limitations.** Include lifecycle, gitignored paths,
-  exact commands, properties-as-utf8, replica caveat, and why ClickHouse
-  bytes/levels are not copied.
-- [ ] **Step 5: Mark row 45 executed with measured conclusions and commit.**
+- [ ] **Step 4: Generate smoke with `--shards 10`, load its topology in
+  catalog-only mode, and measure it.** Candidate counts add while
+  density/overfetch distributions stay stable. Materializing 10x data is not an
+  acceptance gate.
+- [ ] **Step 5: Write three runbooks.** The generator runbook covers installation,
+  explicit inputs/outputs, determinism, portability, and offline verification.
+  The loader runbook covers mutation scope and cleanup. The benchmark runbook
+  covers read-only execution and result interpretation. Include
+  properties-as-utf8, replica caveats, and why ClickHouse bytes/levels are not
+  copied.
+- [ ] **Step 6: Mark row 45 executed with measured conclusions and commit.**
 
 ```bash
-git add bench/README.md docs/prod-info/README.md docs/notes/2026-07-14-synthetic-posthog-baseline.md \
+git add Cargo.toml tools/prod-synth-contract tools/prod-synth \
+  tools/ukiel-prod-load tools/ukiel-prod-bench \
+  bench/README.md bench/queries/prod-synth docs/prod-info \
+  docs/notes/2026-07-14-prod-synth-baseline.md \
   docs/superpowers/plans/2026-07-05-ukiel-v1-roadmap.md \
-  docs/superpowers/plans/2026-07-14-ukiel-synthetic-posthog.md
-git commit -m "bench: record production-shaped synthetic PostHog baseline"
+  docs/superpowers/plans/2026-07-14-ukiel-prod-synth.md
+git commit -m "bench: record the production-shaped prod-synth baseline"
 ```
 
 ## Final acceptance
 
 Plan 45 is complete only when:
 
-- a fresh checkout compiles the committed profile into the same manifest;
+- a fresh checkout installs `prod-synth`, and its offline CLI compiles the
+  committed profile into the same manifest without any service running;
+- the generator has none of the forbidden service/client dependencies, and no
+  executable package depends on another executable package;
 - baseline contains real Parquet objects and truthful catalog metadata;
 - generated distributions pass the pinned fidelity gates;
 - scoped Ukiel results equal raw DataFusion for every query/class;
 - catalog range/filter/exact counts are recorded together;
+- generator, loader, and benchmark remain separate executables joined by the
+  versioned manifest, with their declared side-effect boundaries intact;
+- generated artifacts, commands, paths, tables, and query suites use the neutral
+  `prod-synth` identity;
 - no source byte total, ClickHouse level, or invented value distribution is
   presented as measured Ukiel production behavior; and
-- another operator can reproduce the baseline from the runbook alone.
+- another operator can generate the portable artifact and reproduce the loaded
+  baseline from the three runbooks alone.
 
 ## Self-review notes
 

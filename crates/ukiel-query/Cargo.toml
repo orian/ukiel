@@ -33,4 +33,4 @@ ukiel-compactor = { workspace = true }
 testcontainers-modules = { workspace = true }
 tempfile = { workspace = true }
 reqwest = { workspace = true }
-parquet = { workspace = true }
+parquet = { workspace = true, features = ["async", "object_store"] }

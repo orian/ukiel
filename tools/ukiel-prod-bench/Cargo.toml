@@ -1,0 +1,6 @@
+[package]
+name = "ukiel-prod-bench"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
