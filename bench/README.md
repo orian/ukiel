@@ -85,8 +85,9 @@ needed for the default local stack.
 |---|---|---|---|
 | ClickBench `hits` | `datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_{0..99}.parquet` | ~14.8 GB (100 files, ~150 MB each) | ~100M |
 | Bluesky (JSONBench) | `clickhouse-public-datasets.s3.amazonaws.com/bluesky/file_{0001..1000}.json.gz` | 100M tier ≈ 12.5 GB gz (100 files, 1M events each); 1B tier = 125 GB gz | 1M/file |
+| **prod-synth** (plan 45) | **generated** from `docs/prod-info/` — nothing to download | baseline ≈ 1.3 GB (68 parts) | 30M |
 
-Fetch (both use `curl -C -`, so interrupted downloads resume):
+Fetch (both downloadable sets use `curl -C -`, so interrupted downloads resume):
 
 ```bash
 make bench-fetch-hits                 # all 100 hits files (~15 GB)
@@ -106,6 +107,34 @@ Re-running `make bench-fetch-*` with the files already present is **resume-only*
 not another 15 GB download. `bench/bench.sh` never touches the datasets — only
 `docker compose down -v` (which wipes MinIO/Postgres/Kafka volumes, not
 `bench/datasets/`).
+
+### prod-synth (plan 45) — the production-shaped suite
+
+The only dataset here that is **generated rather than downloaded**, and the only one whose
+*geometry* comes from a real workload: the tenant-to-part membership graph, the activity
+skew, and the sparse key ranges are reconstructed from the anonymized capture in
+`docs/prod-info/`. Column values are declared synthetic and claim nothing.
+
+It is a **separate three-binary pipeline**, not another command family inside the `bench`
+binary — an offline generator, a mutating loader, and a read-only runner, joined only by a
+versioned manifest on disk:
+
+```bash
+prod-synth      generate --tier baseline --profile docs/prod-info --output bench/datasets/prod-synth/baseline
+prod-synth      verify   bench/datasets/prod-synth/baseline/manifest.json
+ukiel-prod-load materialized --manifest .../manifest.json --label baseline --config ukield.example.toml
+ukiel-prod-bench catalog     --manifest .../manifest.json --label baseline --config ... --result cat.json
+ukiel-prod-bench queries     --manifest .../manifest.json --label baseline --config ... --result q.json
+```
+
+Runbooks: `tools/prod-synth/README.md`, `tools/ukiel-prod-load/README.md`,
+`tools/ukiel-prod-bench/README.md`. Baseline results:
+`docs/notes/2026-07-14-prod-synth-baseline.md`.
+
+**It does not replace anything.** ClickBench and JSONBench remain the standard
+comparisons; plan 40 remains the catalog capacity proof. prod-synth answers a question
+neither of them can: what the catalog's key filter and the scoped query path do when the
+tenant/part geometry is the one production actually has.
 
 ---
 

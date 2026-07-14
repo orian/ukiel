@@ -137,6 +137,34 @@ consistent with different query scopes or replica coverage. Therefore, treat the
 JSONL files as distribution samples unless the original query scope is available;
 do not use their summed bytes as an authoritative single-shard capacity figure.
 
+### The two JSONL files were captured at different part scopes
+
+Found while building plan 45's generator, and load-bearing for anyone who reads these
+numbers:
+
+`tenant-fanout.jsonl` reports **63** `range_parts` for 502 of its 534 tenants. But
+`part-geometry.jsonl` contains only **61** parts whose `key_span` is greater than 1 — the
+other 7 hold a single key each, and a single-key part's `[min, max]` interval contains
+exactly one tenant, its own.
+
+A tenant cannot be inside 63 part-ranges when only 61 ranges have any width at all. The
+two files therefore do not describe the same set of parts: one of the extraction queries
+saw a part population the other did not. This is exactly the hazard the paragraph above
+warns about, now confirmed.
+
+What it means in practice:
+
+- **61, not 68, is the ceiling** on any tenant's range-candidate count against these part
+  records. A fidelity gate stated as a fraction of 68 (e.g. "range saturation ≥ 90% of the
+  part count") is unsatisfiable by construction.
+- `range_parts` and `range_overfetch` remain useful as **distributions** — the shape of the
+  over-fetch is the finding, and it is dramatic either way — but their absolute counts
+  cannot be joined to `part-geometry.jsonl` record-for-record.
+- `exact_parts` has the same problem in the tail: a handful of sampled tenants report being
+  in 62–63 parts, which is not realizable against 61 multi-key parts plus 7 single-key ones
+  unless one tenant owns most of the single-key parts. Plan 45's generator repairs this by
+  bounding the degree sequence on Gale-Ryser feasibility, and records every repair.
+
 ## Using the data for Ukiel benchmarks
 
 Sample complete JSONL records rather than drawing every field independently. Part

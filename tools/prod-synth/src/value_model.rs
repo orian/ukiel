@@ -150,7 +150,9 @@ impl<'a> RowGen<'a> {
         }
     }
 
-    pub fn next(&mut self) -> Row {
+    /// Draw one row. Named `draw`, not `next`: this is not an iterator, and calling it
+    /// one would invite `for r in gen` — which would be an infinite loop.
+    pub fn draw(&mut self) -> Row {
         let event = self.model.events[self.rng.weighted(&self.event_w)]
             .value
             .clone();

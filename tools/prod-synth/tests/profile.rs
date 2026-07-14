@@ -207,10 +207,8 @@ fn rejects_an_overfetch_that_does_not_match_its_own_counts() {
 #[test]
 fn accepts_the_sources_own_rounding_but_not_more() {
     // 63/29 = 2.1724137... recorded as 2.172. Half an ulp at three decimals.
-    let ok = format!(
-        r#"{{"tenant_rows":100,"exact_parts":29,"range_parts":63,"range_overfetch":2.172}}"#
-    );
-    let dir = profile_with("tenant-fanout.jsonl", &ok);
+    let ok = r#"{"tenant_rows":100,"exact_parts":29,"range_parts":63,"range_overfetch":2.172}"#;
+    let dir = profile_with("tenant-fanout.jsonl", ok);
     assert!(
         ProductionProfile::load(dir.path()).is_ok(),
         "three-decimal rounding is what the source does and must be accepted"

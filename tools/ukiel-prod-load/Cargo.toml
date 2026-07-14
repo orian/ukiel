@@ -2,5 +2,42 @@
 name = "ukiel-prod-load"
 version.workspace = true
 edition.workspace = true
+description = "Load one prod-synth manifest into an explicitly selected Ukiel deployment."
+
+# The one *mutating* tool in the plan-45 pipeline, and the only one that touches a
+# service. It reads a manifest and writes to a catalog and an object store, and it
+# does nothing else: it cannot parse a profile, compile a topology, generate a row,
+# or run a benchmark. If a fixture is missing it says so; it never makes one.
+#
+# It depends on `ukield` for the config format and the object-store builder, so a
+# fixture lands in the deployment the *product's own* configuration describes rather
+# than in one this tool invented a parallel notion of.
 
 [dependencies]
+prod-synth-contract = { workspace = true }
+ukiel-core = { workspace = true }
+ukiel-catalog = { workspace = true }
+ukield = { workspace = true }
+object_store = { workspace = true, features = ["aws"] }
+arrow = { workspace = true }
+parquet = { workspace = true, features = ["async", "object_store"] }
+tokio = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# The loader's tests run against a throwaway PostgreSQL rather than the compose
+# stack, so they run in `make test` instead of only when someone remembers.
+testcontainers-modules = { workspace = true }
+
+[[bin]]
+name = "ukiel-prod-load"
+path = "src/main.rs"

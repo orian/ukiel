@@ -5122,10 +5122,53 @@ dependencies = [
 [[package]]
 name = "ukiel-prod-bench"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "clap",
+ "datafusion",
+ "futures",
+ "object_store",
+ "prod-synth-contract",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "testcontainers-modules",
+ "tokio",
+ "toml",
+ "ukiel-catalog",
+ "ukiel-core",
+ "ukiel-prod-load",
+ "ukiel-query",
+ "ukield",
+ "url",
+]
 
 [[package]]
 name = "ukiel-prod-load"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "bytes",
+ "clap",
+ "futures",
+ "object_store",
+ "parquet",
+ "prod-synth-contract",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "testcontainers-modules",
+ "tokio",
+ "toml",
+ "ukiel-catalog",
+ "ukiel-core",
+ "ukield",
+ "uuid",
+]
 
 [[package]]
 name = "ukiel-query"

@@ -5,8 +5,51 @@
 > cross tool boundaries: the generator, loader, and benchmark runner are separate
 > executables joined only by a versioned manifest.
 
-**Status:** Ready. Issue 0014 has merged; this plan validates its behavior against
-the captured production shape.
+**Status:** **Executed** (2026-07-14). All six tasks landed. Results and measured
+numbers: `docs/notes/2026-07-14-prod-synth-baseline.md`. Runbooks:
+`tools/prod-synth/README.md`, `tools/ukiel-prod-load/README.md`,
+`tools/ukiel-prod-bench/README.md`.
+
+## Deviations from this plan, and why
+
+Four things in the plan below turned out to be wrong or unbuildable. They are recorded
+here rather than quietly fixed, because each one is a fact about the source data or the
+problem, not a matter of taste.
+
+**1. The topology algorithm (step 5) cannot run as specified.** It bounds the tenant
+degree repair to `1..part_count` and to matching the margins. That is necessary and not
+sufficient: 7 source parts hold exactly one key, so they scale to capacity 1, while the
+resample yields ~37 tenants needing two or more of those 7 slots. The degree sequence is
+**not bigraphic** and Havel-Hakimi fails outright, whatever the sums say. The repair now
+bounds on **Gale-Ryser feasibility**. It costs 1.1% of tenants at baseline — inside the
+plan's own 2% ceiling — all in the extreme tail, and it moves neither gated quantile.
+
+**2. The `range_overfetch p90` saturation gate is unsatisfiable as written.** It asks for
+"p90 in the same saturation bucket (at least 90% of source part count)" — 61.2 of 68. The
+source's own two capture files disagree: `tenant-fanout.jsonl` reports up to 63 range
+candidates, but `part-geometry.jsonl` holds only **61** parts with a key range wider than a
+point, and a single-key part is a range candidate for exactly one tenant. No graph over 61
+multi-key parts can put a tenant in 63 ranges. Saturation is asserted against the
+**achievable maximum** instead — a strictly stronger statement than 90% — and every manifest
+carries a note explaining the discrepancy. Documented in `docs/prod-info/README.md`.
+
+**3. Baseline is 30M rows per shard, not 5M.** The tier table and the activity-skew gate
+contradict each other. A baseline topology has ~168k memberships and every membership must
+carry at least one row (the plan's own rule, and a necessary one — a part must contain the
+tenants the catalog says it contains). At 5M rows that floor, not the activity weights,
+decides the row count of **70% of tenants**, and the measured p90/p50 skew collapses to 18
+against the source's 98. 26.4M is where the median tenant's weight-share clears its floor;
+30M clears it, and the skew gates pass. Cost: ~1.3GB instead of ~220MB.
+
+**4. The loader/bench integration tests are not `--ignored`.** They run against a throwaway
+PostgreSQL (testcontainers) and an in-memory object store, so they run in `make test`. A
+check that only runs when someone remembers to run it is a check that rots.
+
+One packaging fix was also needed: the workspace enabled `parquet`'s `async` +
+`object_store` features globally, so `ukiel-core` — and any offline tool built on it —
+dragged in tokio, `object_store` and reqwest. Moved to the two crates that genuinely read
+asynchronously from an object store, which is what makes `cargo install --path
+tools/prod-synth` work with only a Rust toolchain.
 
 **Goal:** Turn the anonymized ClickHouse observations in `docs/prod-info/` into
 a deterministic synthetic event fixture named **prod-synth**. Ship the offline
@@ -325,19 +368,19 @@ Print every source/generated pair. Do not silently loosen a failed tolerance.
   tenant degree, and the active-tenant estimate
 - `prod-synth profile --profile DIR --report FILE`
 
-- [ ] **Step 1: Write failing parser/validation tests.** Pin 68 parts, 534
+- [x] **Step 1: Write failing parser/validation tests.** Pin 68 parts, 534
   tenant samples, 2,389,316 memberships, exact p50/p90 11/43, range p50 63,
   and estimate 142,066. Invalid JSONL, negative/non-finite values,
   `observed_rows > physical_rows`, inconsistent density, and inconsistent
   overfetch must name the file and record.
-- [ ] **Step 2: Implement streaming loading and stable quantiles.** Hash raw
+- [x] **Step 2: Implement streaming loading and stable quantiles.** Hash raw
   bytes, not reserialized structs. `show-create.sql` is hashed provenance, not a
   schema language to parse.
-- [ ] **Step 3: Add the CLI/report.** Require an explicit report path, print the
+- [x] **Step 3: Add the CLI/report.** Require an explicit report path, print the
   sampling/replica caveats, and make `--help` work without a repository cwd.
-- [ ] **Step 4: Prove standalone installation.** Install into a temporary root
+- [x] **Step 4: Prove standalone installation.** Install into a temporary root
   and run `--help` and `profile` without any Ukiel service.
-- [ ] **Step 5: Verify and commit.**
+- [x] **Step 5: Verify and commit.**
 
 ```bash
 cargo test -p prod-synth profile
@@ -366,15 +409,15 @@ git commit -m "tools: parse and validate the production event shape"
 - `compile(profile, config) -> Result<SyntheticTopology>`
 - manifest format `ukiel-prod-synth/v1`
 
-- [ ] **Step 1: Pin PRNG/scaling math.** Golden sequence; exact rounded totals;
+- [x] **Step 1: Pin PRNG/scaling math.** Golden sequence; exact rounded totals;
   tier expansion; too-few rows reports the required minimum.
-- [ ] **Step 2: Write failing graph tests.** Hand-built graphical/impossible
+- [x] **Step 2: Write failing graph tests.** Hand-built graphical/impossible
   sequences; exact margins; no duplicates; deterministic digest; seed change.
-- [ ] **Step 3: Implement the specified compiler.** Keep tenant fields joint.
+- [x] **Step 3: Implement the specified compiler.** Keep tenant fields joint.
   Derive ranges/fanout only after graph realization.
-- [ ] **Step 4: Run smoke/baseline in memory.** All fidelity gates pass; write
+- [x] **Step 4: Run smoke/baseline in memory.** All fidelity gates pass; write
   reports only to the explicit path supplied by the caller.
-- [ ] **Step 5: Verify and commit.**
+- [x] **Step 5: Verify and commit.**
 
 ```bash
 cargo test -p prod-synth topology
@@ -405,19 +448,19 @@ git commit -m "tools: compile production-shaped tenant and part topology"
   `ValueModel`, exact membership topology, actual rows/bytes, and representative
   tenants. Ukiel bitmaps and key filters are not generated here.
 
-- [ ] **Step 1: Define schema/value model/manifest round-trip tests.** Unknown
+- [x] **Step 1: Define schema/value model/manifest round-trip tests.** Unknown
   manifest versions fail closed.
-- [ ] **Step 2: Write a failing tiny generation test.** Assert sorted rows,
+- [x] **Step 2: Write a failing tiny generation test.** Assert sorted rows,
   valid JSON, promoted equality, repeated distinct IDs, deterministic UUIDs,
   time/footer/membership truth, and identical file digests on rerun.
-- [ ] **Step 3: Implement bounded generation.** One part at a time, bounded
+- [x] **Step 3: Implement bounded generation.** One part at a time, bounded
   Arrow batches, actual closed-file size. Never materialize all rows in memory.
-- [ ] **Step 4: Make output atomic.** Temporary sibling then rename after all
+- [x] **Step 4: Make output atomic.** Temporary sibling then rename after all
   gates; refuse overwrite without explicit `--replace` scoped to that label.
-- [ ] **Step 5: Implement offline verification.** Recompute profile, topology,
+- [x] **Step 5: Implement offline verification.** Recompute profile, topology,
   file, footer, schema, census, and manifest digests without network access.
-- [ ] **Step 6: Run smoke twice and prove byte determinism.**
-- [ ] **Step 7: Verify and commit.**
+- [x] **Step 6: Run smoke twice and prove byte determinism.**
+- [x] **Step 7: Verify and commit.**
 
 ```bash
 cargo test -p prod-synth generate
@@ -453,28 +496,28 @@ git commit -m "tools: generate deterministic production-shaped parquet"
   low-overfetch, and a deterministic tenant sample
 - no profile parsing, topology compilation, row generation, or benchmark commands
 
-- [ ] **Step 1: Write the failing integration test.** Generate a tiny artifact
+- [x] **Step 1: Write the failing integration test.** Generate a tiny artifact
   with `prod-synth`, load it, then assert object HEAD = manifest = catalog bytes;
   actual rows = manifest = catalog rows; every member is returned; exact-absent
   members are removed by the provider bitmap.
-- [ ] **Step 2: Validate the artifact boundary.** Load and verify
+- [x] **Step 2: Validate the artifact boundary.** Load and verify
   `ukiel-prod-synth/v1`, reject unknown versions or digest mismatches before
   connecting to a service, and never regenerate missing data.
-- [ ] **Step 3: Implement product-path create/upload/ADD.** Use normal metadata
+- [x] **Step 3: Implement product-path create/upload/ADD.** Use normal metadata
   builders so the product derives roaring bitmaps and issue-0014 key filters.
   Set-based fake part rows are forbidden for the materialized fixture. The
   separate ephemeral arm may bulk-seed the same truthful topology with
   `size_bytes = 0` and `catalog-only://` paths because it measures no object
   behavior.
-- [ ] **Step 4: Verify catalog shape.** Per representative tenant report range,
+- [x] **Step 4: Verify catalog shape.** Per representative tenant report range,
   shipped-filter, and exact counts. Assert zero false negatives.
-- [ ] **Step 5: Make lifecycle loud.** Require a fresh label and distinguish
+- [x] **Step 5: Make lifecycle loud.** Require a fresh label and distinguish
   catalog-only seeds from materialized loads. The ephemeral command requires a
   disposable stack, refuses to run alongside configured compactor/GC roles,
   cleans its hypertables/commits/parts on success, and attempts the same cleanup
   on error. If cleanup fails, exit with the exact manual reset command. Never
   leave fake paths silently for a background compactor.
-- [ ] **Step 6: Verify and commit.**
+- [x] **Step 6: Verify and commit.**
 
 ```bash
 cargo test -p ukiel-prod-load --test load -- --ignored --nocapture
@@ -521,20 +564,20 @@ user SQL. Raw DataFusion reads the same files and adds the equivalent explicit
   files, returned rows, Ukiel/raw timings and all fixture digests
 - no generation, upload, catalog mutation, or cleanup commands
 
-- [ ] **Step 1: Test query rendering.** Quoted `"mat_$current_url"` and
+- [x] **Step 1: Test query rendering.** Quoted `"mat_$current_url"` and
   `"mat_$lib"` survive; comparison queries have deterministic ordering.
-- [ ] **Step 2: Write failing end-to-end equivalence.** All queries/classes agree
+- [x] **Step 2: Write failing end-to-end equivalence.** All queries/classes agree
   between scoped Ukiel and raw DataFusion; count equals census; range-only
   false candidates are not read.
-- [ ] **Step 3: Implement runner/report.** Measure query time only; generation
+- [x] **Step 3: Implement runner/report.** Measure query time only; generation
   and loading are facts read from the manifest/load record, not actions this
   process may perform. Record failed queries and fail after attempting the rest.
-- [ ] **Step 4: Implement the catalog command for an existing load.** Use the
+- [x] **Step 4: Implement the catalog command for an existing load.** Use the
   same tenants/topology and issue-0014 before/after arms. Report rows/bytes and
   latency, but do not call 68 parts a saturation test.
-- [ ] **Step 5: Enforce read-only behavior.** Fail startup if the requested
+- [x] **Step 5: Enforce read-only behavior.** Fail startup if the requested
   command would require creating, loading, repairing, or cleaning a fixture.
-- [ ] **Step 6: Verify and commit.**
+- [x] **Step 6: Verify and commit.**
 
 ```bash
 cargo test -p ukiel-prod-bench
@@ -557,7 +600,7 @@ git commit -m "tools: benchmark a loaded prod-synth artifact"
 - Modify: `docs/superpowers/plans/2026-07-05-ukiel-v1-roadmap.md`
 - Modify: this plan
 
-- [ ] **Step 1: Full verification.**
+- [x] **Step 1: Full verification.**
 
 ```bash
 cargo fmt --check
@@ -567,24 +610,24 @@ cargo install --path tools/prod-synth --root /tmp/prod-synth-install
 /tmp/prod-synth-install/bin/prod-synth --help
 ```
 
-- [ ] **Step 2: From a clean checkout, generate and verify the one-shard
+- [x] **Step 2: From a clean checkout, generate and verify the one-shard
   baseline with no services running.** Record profile, topology, and file
   digests plus generation bytes/time. Copy or move the completed portable
   artifact to the benchmark host; do not regenerate it inside the loader.
-- [ ] **Step 3: On a clean disposable stack, load that exact manifest and run the
+- [x] **Step 3: On a clean disposable stack, load that exact manifest and run the
   baseline.** Record machine/SHA, load time, fidelity pairs, catalog A/B,
   scoped/raw results, and whether issue 0014 removes overfetch before SQLx.
-- [ ] **Step 4: Generate smoke with `--shards 10`, load its topology in
+- [x] **Step 4: Generate smoke with `--shards 10`, load its topology in
   catalog-only mode, and measure it.** Candidate counts add while
   density/overfetch distributions stay stable. Materializing 10x data is not an
   acceptance gate.
-- [ ] **Step 5: Write three runbooks.** The generator runbook covers installation,
+- [x] **Step 5: Write three runbooks.** The generator runbook covers installation,
   explicit inputs/outputs, determinism, portability, and offline verification.
   The loader runbook covers mutation scope and cleanup. The benchmark runbook
   covers read-only execution and result interpretation. Include
   properties-as-utf8, replica caveats, and why ClickHouse bytes/levels are not
   copied.
-- [ ] **Step 6: Mark row 45 executed with measured conclusions and commit.**
+- [x] **Step 6: Mark row 45 executed with measured conclusions and commit.**
 
 ```bash
 git add Cargo.toml tools/prod-synth-contract tools/prod-synth \

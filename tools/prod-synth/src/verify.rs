@@ -87,7 +87,7 @@ pub fn verify(manifest_path: &Path) -> Result<Verified> {
                     m.rows.len()
                 )));
             }
-            if m.rows.iter().any(|&r| r == 0) {
+            if m.rows.contains(&0) {
                 return Err(VerifyError::Mismatch(format!(
                     "part {}: a member has zero rows, so the graph the manifest claims is not the \
                      graph the files hold",

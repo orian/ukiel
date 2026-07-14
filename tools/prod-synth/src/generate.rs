@@ -373,7 +373,7 @@ fn write_part(
         stamps.sort_unstable();
 
         for &ts in &stamps {
-            let r = rows_gen.next();
+            let r = rows_gen.draw();
             ts_min = ts_min.min(ts);
             ts_max = ts_max.max(ts);
             buf.push(tenant, ts, &r);

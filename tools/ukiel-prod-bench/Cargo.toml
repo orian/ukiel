@@ -2,5 +2,46 @@
 name = "ukiel-prod-bench"
 version.workspace = true
 edition.workspace = true
+description = "Measure an existing prod-synth load: scoped Ukiel against raw DataFusion."
+
+# READ-ONLY. It measures a load that already exists. It cannot generate a fixture,
+# upload an object, create a table, mutate a catalog, or clean anything up — and
+# `require_read_only` fails startup rather than doing any of those on someone's
+# behalf. A benchmark runner that can repair its own inputs is a benchmark runner
+# whose numbers describe an input nobody chose.
 
 [dependencies]
+prod-synth-contract = { workspace = true }
+ukiel-core = { workspace = true }
+ukiel-catalog = { workspace = true }
+ukiel-query = { workspace = true }
+ukield = { workspace = true }
+datafusion = { workspace = true }
+object_store = { workspace = true, features = ["aws"] }
+arrow = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+url = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+testcontainers-modules = { workspace = true }
+sqlx = { workspace = true }
+# TEST ONLY, and deliberately not a normal dependency. The end-to-end test needs a
+# loaded fixture, and the loader and the runner must share one in-process object
+# store to have one. A dev-dependency gives the test that without giving the
+# *shipped binary* the ability to load anything: prod-synth's boundary test
+# inspects the normal dependency graph, so the read-only rule still holds where it
+# matters. The alternative was standing up MinIO to prove a property that has
+# nothing to do with S3.
+ukiel-prod-load = { path = "../ukiel-prod-load" }
+object_store = { workspace = true }
+
+[[bin]]
+name = "ukiel-prod-bench"
+path = "src/main.rs"
