@@ -265,13 +265,14 @@ impl TableProvider for UkielTableProvider {
         // opens the file to find nothing. The packing-key bitmap makes this
         // exact: drop a part only when it *proves* the key is absent.
         //
-        // Since issue 0014 the *catalog* has already asked that question — it
-        // indexes the key set and returns only the parts that hold the tenant, so
-        // for any part written after migration 0012 this filter now finds nothing
-        // to remove. It stays because it is still load-bearing for the parts the
-        // catalog cannot answer for: those written before 0012, and those whose key
-        // set is too dense to index. Both arrive here on their range, exactly as
-        // they always did, and this is what prunes them.
+        // Since issue 0014 the *catalog* has already asked that question — its
+        // per-part Bloom filter rejects parts that provably lack the tenant, so
+        // for most parts this filter now finds nothing to remove. It stays because
+        // it is still load-bearing for the parts the catalog cannot answer for:
+        // those carrying no filter (key set too large or too poisoned to record)
+        // and those the Bloom filter's false positives let through. Both arrive
+        // here on their range, exactly as they always did, and this is what prunes
+        // them.
         //
         // Exactness is the bitmap's job; safety is the keep-by-default rule —
         // a missing index, an undecodable one, or a negative key all yield

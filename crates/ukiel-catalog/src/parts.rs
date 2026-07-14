@@ -308,7 +308,7 @@ impl PostgresCatalog {
     /// The runs are counted as a `DISTINCT (partition, commit)` set rather than
     /// `count(DISTINCT created_by_commit)` per partition: same answer — the
     /// column is `NOT NULL` — but it aggregates in `parts_compaction_idx` order
-    /// (migration 0009) instead of sorting every live part row on disk.
+    /// instead of sorting every live part row on disk.
     pub async fn finalize_candidates(
         &self,
         hypertable_id: HypertableId,
@@ -359,11 +359,11 @@ impl PostgresCatalog {
     /// authority, this only stops the window being spent on work `owner_id`
     /// cannot take.
     ///
-    /// The run counts stream out of `parts_compaction_idx` (migration 0009) in
-    /// group order — an index-only scan, no sort. The 0007 index, which the old
-    /// docstring here credited, covers neither `created_by_commit` nor the
-    /// liveness predicate, so this aggregation was in fact a full sequential
-    /// scan of every live part with an external merge sort behind it.
+    /// The run counts stream out of `parts_compaction_idx` in group order — an
+    /// index-only scan, no sort. `parts_partition_idx` cannot serve this: it
+    /// covers neither `created_by_commit` nor the liveness predicate, so the
+    /// aggregation degrades to a full sequential scan of every live part with an
+    /// external merge sort behind it.
     pub async fn compaction_candidates(
         &self,
         hypertable_id: HypertableId,
@@ -416,8 +416,8 @@ impl PostgresCatalog {
 
     /// Count of `(partition, level)` groups at or over their merge trigger —
     /// the `compactor_backlog_groups` gauge (metrics P2). Same run counting as
-    /// the candidate sweeps, so `parts_compaction_idx` (migration 0009) serves
-    /// it as an index-only scan across every hypertable.
+    /// the candidate sweeps, so `parts_compaction_idx` serves it as an
+    /// index-only scan across every hypertable.
     pub async fn backlog_groups(&self, l0_fanout: i64, fanout: i64) -> Result<i64, CatalogError> {
         let count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM (

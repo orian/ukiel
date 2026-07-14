@@ -1697,37 +1697,6 @@ async fn lease_stats_separate_active_from_abandoned() {
     assert!(oldest >= 1.0, "expired ~1s ago, got {oldest}");
 }
 
-#[tokio::test]
-async fn lease_migration_applies_to_a_populated_pre_0008_catalog() {
-    let (_pg, catalog) = common::setup().await;
-    let ht = setup_hypertable(&catalog).await;
-    add_l0_part(&catalog, ht, &json!({ "day": "2026-07-01" })).await;
-
-    // Rewind to a pre-0008 catalog that already holds data, then upgrade — the
-    // path a running deployment takes, not the fresh bootstrap setup() covers.
-    let pool = catalog.pool_for_tests();
-    sqlx::query("DROP TABLE compaction_leases")
-        .execute(pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 8")
-        .execute(pool)
-        .await
-        .unwrap();
-
-    catalog.migrate().await.unwrap();
-
-    let day = json!({ "day": "2026-07-01" });
-    let lease = catalog
-        .try_acquire_compaction_lease(ht, &day, Uuid::new_v4(), TTL)
-        .await
-        .unwrap()
-        .expect("leases work after the upgrade");
-    assert!(lease.generation > 0);
-    // The pre-existing data is untouched by the upgrade.
-    assert_eq!(catalog.live_parts(ht, None).await.unwrap().len(), 1);
-}
-
 /// The identity an ingest flush would build for these ranges. Derived, never
 /// hand-assembled, so the offset tests exercise the real reconcilable path.
 fn offsets_op(ht: HypertableId, ranges: &[OffsetRange]) -> OperationIdentity {
@@ -2568,52 +2537,6 @@ async fn lease_generations_are_unique_across_partitions() {
     }
 }
 
-/// An upgrade, not a fresh install: a catalog already carrying generations must
-/// start the sequence *above* every one of them, or a live tenancy could be
-/// re-issued as a new one — the very bug, reintroduced by the fix.
-#[tokio::test]
-async fn generation_sequence_starts_above_existing_leases() {
-    let (_pg, catalog) = common::setup().await;
-    let ht = setup_hypertable(&catalog).await;
-    let pool = catalog.pool_for_tests();
-
-    // Rewind to a pre-0010 catalog that already holds a high-generation lease
-    // (plan 41's row counter could produce any value on a long-lived partition).
-    sqlx::query("DROP SEQUENCE compaction_lease_generation_seq")
-        .execute(pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 10")
-        .execute(pool)
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO compaction_leases
-             (hypertable_id, partition_values, owner_id, generation, expires_at)
-         VALUES ($1, $2, $3, 4242, clock_timestamp() - INTERVAL '1 second')",
-    )
-    .bind(ht.0)
-    .bind(json!({ "day": "legacy" }))
-    .bind(Uuid::new_v4())
-    .execute(pool)
-    .await
-    .unwrap();
-
-    catalog.migrate().await.unwrap();
-
-    // Reclaiming the legacy partition — the exact case that must not collide.
-    let reclaimed = catalog
-        .try_acquire_compaction_lease(ht, &json!({ "day": "legacy" }), Uuid::new_v4(), TTL)
-        .await
-        .unwrap()
-        .expect("the expired legacy lease is reclaimable");
-    assert!(
-        reclaimed.generation > 4242,
-        "the sequence must start above every generation the old counter handed out, got {}",
-        reclaimed.generation
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Plan 43: operation identity, fingerprint storage, authoritative lookup.
 // ---------------------------------------------------------------------------
@@ -2764,9 +2687,10 @@ async fn a_historical_key_without_a_fingerprint_collides_rather_than_guessing() 
     let ht = setup_hypertable(&catalog).await;
     let identity = op(ht, 0, 0, 99);
 
-    // A pre-plan-43 keyed commit: its intent is not recoverable, and migration
-    // 0011 deliberately does not invent one. "Probably the same thing" is not
-    // an answer a reconciliation protocol may give.
+    // A keyed commit with no fingerprint — direct SQL, or a caller that predates
+    // the digest. Its intent is not recoverable, and the catalog deliberately
+    // does not invent one: "probably the same thing" is not an answer a
+    // reconciliation protocol may give.
     sqlx::query(
         "INSERT INTO commits (hypertable_id, kind, idempotency_key) VALUES ($1, 'add', $2)",
     )
@@ -2987,72 +2911,6 @@ async fn the_fingerprint_column_rejects_a_wrong_width_digest() {
     );
 }
 
-/// Migration 0011 lands on a populated catalog: unkeyed and historical keyed
-/// commits both survive, and neither acquires an invented fingerprint.
-#[tokio::test]
-async fn fingerprint_migration_applies_to_a_populated_catalog() {
-    let (_pg, catalog) = common::setup().await;
-    let ht = setup_hypertable(&catalog).await;
-    catalog
-        .commit(
-            ht,
-            CommitOp::Add {
-                parts: vec![part_meta("unkeyed.parquet", 1, 10)],
-            },
-            None,
-        )
-        .await
-        .unwrap();
-
-    let pool = catalog.pool_for_tests();
-    sqlx::query("ALTER TABLE commits DROP COLUMN operation_fingerprint")
-        .execute(pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 11")
-        .execute(pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO commits (hypertable_id, kind, idempotency_key) VALUES ($1, 'add', 'legacy-key')")
-        .bind(ht.0)
-        .execute(pool)
-        .await
-        .unwrap();
-
-    catalog.migrate().await.unwrap();
-
-    let fingerprints: Vec<Option<Vec<u8>>> =
-        sqlx::query_scalar("SELECT operation_fingerprint FROM commits ORDER BY id")
-            .fetch_all(pool)
-            .await
-            .unwrap();
-    assert!(
-        fingerprints.iter().all(|f| f.is_none()),
-        "history is not backfilled: a made-up digest is false certainty"
-    );
-    assert_eq!(catalog.live_parts(ht, None).await.unwrap().len(), 1);
-
-    // And the catalog still works afterwards.
-    let identity = op(ht, 0, 0, 9);
-    assert!(matches!(
-        catalog
-            .commit(
-                ht,
-                CommitOp::Add {
-                    parts: vec![part_meta("after.parquet", 1, 10)],
-                },
-                Some(&identity),
-            )
-            .await
-            .unwrap(),
-        CommitResult::Committed(_)
-    ));
-    assert!(matches!(
-        catalog.lookup_operation(&identity).await.unwrap(),
-        OperationLookup::Committed(_)
-    ));
-}
-
 // ---------------------------------------------------------------------------
 // Plan 43, task 7: the commit-boundary fault seam (test builds only).
 // ---------------------------------------------------------------------------
@@ -3269,8 +3127,8 @@ async fn a_part_with_no_key_set_is_kept_on_its_range() {
     let ht = setup_hypertable(&catalog).await;
 
     let mut no_bitmap = part_meta("legacy.parquet", 100, 4500);
-    // Exactly what a pre-0012 part looks like, and what a part whose key set was
-    // too large or too poisoned to record looks like: stats, but no key set.
+    // What a part whose key set was too large or too poisoned to record looks
+    // like: stats, but no key set.
     no_bitmap.column_stats = Some(json!({"tenant_id": {"min": 100, "max": 4500}}));
 
     let mut undecodable = part_meta("garbage.parquet", 100, 4500);
@@ -3407,9 +3265,9 @@ async fn the_key_filter_agrees_between_rust_and_sql() {
     }
 
     // The states that must degrade to keep. A writer would never produce these, so
-    // they go in by hand — a pre-0012 part (NULL), a blob of some other size, and a
-    // full-size blob whose version this reader does not know. Each must be kept for
-    // *every* key, because none of them proves anything.
+    // they go in by hand — a part with no filter at all (NULL), a blob of some
+    // other size, and a full-size blob whose version this reader does not know.
+    // Each must be kept for *every* key, because none of them proves anything.
     let ok = ukiel_core::keyfilter::build(&[1, 2, 3]).unwrap();
     let mut unknown_version = ok.clone();
     unknown_version[0] = 99;

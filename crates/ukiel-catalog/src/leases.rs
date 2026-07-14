@@ -81,9 +81,9 @@ impl PostgresCatalog {
     /// Any other unexpired owner is `Ok(None)`: ordinary scheduling contention.
     ///
     /// Every new tenancy draws its generation from a catalog-owned sequence
-    /// (migration 0010), so a token is never reused — not even after a clean
-    /// release, which deletes the row and used to reset the counter to 1
-    /// (issue 0013). A contender that loses the `ON CONFLICT` still evaluates
+    /// (`compaction_lease_generation_seq`), so a token is never reused — not even
+    /// after a clean release, which deletes the row and would reset a per-row
+    /// counter to 1 (issue 0013). A contender that loses the `ON CONFLICT` still evaluates
     /// the VALUES list and burns a sequence value it never uses; the token needs
     /// uniqueness and ordering, not density.
     pub async fn try_acquire_compaction_lease(
