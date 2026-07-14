@@ -20,6 +20,10 @@ uuid = { workspace = true }
 metrics = { workspace = true }
 
 [dev-dependencies]
+# Issue 0014's tests build the same roaring key set the writers do, so the decode
+# path under test is the real one.
+roaring = { workspace = true }
+base64 = { workspace = true }
 # The boundary seam's own tests need it armed.
 ukiel-catalog = { path = ".", features = ["fault-injection"] }
 tokio = { workspace = true }

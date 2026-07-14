@@ -2,6 +2,7 @@
 
 pub mod commit;
 pub mod ids;
+pub mod keyfilter;
 pub mod operation;
 pub mod part;
 pub mod ready;

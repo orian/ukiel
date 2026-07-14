@@ -101,6 +101,11 @@ pub struct LoadConfig {
     /// taken; too large and every operation queues for a connection and the
     /// latency measured is the driver's, not Postgres's.
     pub max_inflight: usize,
+    /// Issue the **pre-0014** query — range containment only, no key filter — so the
+    /// before and the after are measured by the same harness on the same fixture,
+    /// one flag apart. Without this the "before" number is a memory, and a memory is
+    /// not a measurement.
+    pub range_only: bool,
 }
 
 /// Everything a run must record for its numbers to be challengeable.
@@ -554,22 +559,81 @@ pub fn print_report(r: &LoadReport) {
 // Workloads
 // ---------------------------------------------------------------------------
 
+/// The query the catalog issued **before** issue 0014: range containment, and
+/// nothing else.
+///
+/// It selects the same columns and builds the same `Part`s, so the only difference
+/// from the shipped path is the pruning — which is what is being measured. Kept
+/// here, in the benchmark, rather than behind a flag in the catalog: the product has
+/// exactly one query, and a second one that exists to be slower belongs where the
+/// measuring happens.
+async fn range_only_parts(
+    cat: &PostgresCatalog,
+    ht: ukiel_core::HypertableId,
+    key: i64,
+) -> anyhow::Result<Vec<ukiel_core::Part>> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        path: String,
+        column_stats: Option<serde_json::Value>,
+    }
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT path, column_stats FROM parts
+         WHERE hypertable_id = $1 AND deleted_by_commit IS NULL
+           AND packing_key_min <= $2 AND packing_key_max >= $2
+         ORDER BY id",
+    )
+    .bind(ht.0)
+    .bind(key)
+    .fetch_all(cat.pool_for_tests())
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| ukiel_core::Part {
+            id: ukiel_core::PartId(0),
+            hypertable_id: ht,
+            created_by_commit: ukiel_core::CommitId(0),
+            meta: ukiel_core::PartMeta {
+                path: r.path,
+                partition_values: serde_json::Value::Null,
+                packing_key_min: 0,
+                packing_key_max: 0,
+                row_count: 0,
+                size_bytes: 0,
+                level: 0,
+                column_stats: r.column_stats,
+            },
+        })
+        .collect())
+}
+
 /// `bench catalog read …` — the query-admission path.
 ///
 /// This is exactly what every product query does before a single byte of Parquet
 /// is read: `live_parts_pruned` on the tenant's key. If this saturates, query
 /// admission saturates, however fast the scan layer is.
+///
+/// `--range-only` issues the pre-0014 query instead, so the cost issue 0014 removed
+/// can be measured rather than remembered.
 pub async fn read(cfg: LoadConfig, ht_name: &str) -> anyhow::Result<()> {
     let pools = Arc::new(build_pools(cfg.pools, cfg.connections_per_pool).await?);
     let ht = pools[0].get_hypertable(ht_name).await?;
     let (ht_id, keys, dist) = (ht.id, cfg.packing_keys, cfg.key_dist);
+    let range_only = cfg.range_only;
+    if range_only {
+        println!("  [--range-only] issuing the PRE-0014 query: range containment, no key filter");
+    }
 
     let report = run_load("read", &cfg, pools, move |pools, seq| async move {
         // Spread across process-equivalent pools, as a fleet would.
         let cat = &pools[(seq as usize) % pools.len()];
         let n = (seq >> 11) as f64 / (u64::MAX >> 11) as f64;
         let key = dist.pick(n, keys);
-        let parts = cat.live_parts_pruned(ht_id, Some(key), &[]).await?;
+        let parts = if range_only {
+            range_only_parts(cat, ht_id, key).await?
+        } else {
+            cat.live_parts_pruned(ht_id, Some(key), &[]).await?
+        };
         // Result size travels with every latency claim: 3 ms returning 2 rows and
         // 3 ms returning 2,000 are not the same measurement.
         let bytes: u64 = parts
@@ -1403,10 +1467,34 @@ pub async fn explain(label: &str, namespaces: u64) -> anyhow::Result<()> {
     .await
     .context("the fixture must have logical tables — seed with --namespaces")?;
 
+    // Probe the **middle** of this hypertable's key slice, not `ns` itself.
+    //
+    // A hypertable owns a contiguous band of the key space, and `namespaces / 2`
+    // lands on a band's first key — where `packing_key_min <= k` admits only the
+    // parts whose minimum *is* that key, so range pruning looks perfect and the
+    // issue vanishes. That is a property of the boundary, not of the catalog. The
+    // median tenant sits mid-band, where a part's endpoints bracket nearly the whole
+    // band, and that is the tenant worth planning for.
+    let key: i64 = sqlx::query_scalar(
+        "SELECT (min(packing_key_min) + max(packing_key_max)) / 2
+         FROM parts WHERE hypertable_id = $1 AND deleted_by_commit IS NULL",
+    )
+    .bind(ht)
+    .fetch_one(&pool)
+    .await
+    .context("the fixture must have live parts — seed with --parts")?;
+
+    // The bit offsets and masks the key demands — computed once, here, exactly as
+    // `PostgresCatalog::live_parts_pruned` computes them. The database never hashes.
+    let probe_binds: Vec<i64> = ukiel_core::keyfilter::sql_binds(key)
+        .into_iter()
+        .map(i64::from)
+        .collect();
+
     let day_min = 1_767_225_600_000i64 + 15 * 86_400_000;
     let day_max = day_min + 86_399_999;
 
-    // The four statements, in the order a request issues them.
+    // The five statements, in the order a request issues them.
     let probes: Vec<(&str, String, Vec<i64>)> = vec![
         (
             "list_logical_tables",
@@ -1429,28 +1517,53 @@ pub async fn explain(label: &str, namespaces: u64) -> anyhow::Result<()> {
                 .to_string(),
             vec![ht],
         ),
+        // The *before*: range containment alone, which is what the catalog shipped
+        // until issue 0014. Kept as a probe so the two plans sit next to each other.
         (
-            "live_parts_pruned(key)",
+            "live_parts_pruned(key) — RANGE ONLY (pre-0014)",
             "SELECT id, hypertable_id, path, partition_values, packing_key_min, packing_key_max,
                     row_count, size_bytes, level, column_stats, created_by_commit
              FROM parts
              WHERE hypertable_id = $1 AND deleted_by_commit IS NULL
                AND packing_key_min <= $2 AND packing_key_max >= $2"
                 .to_string(),
-            vec![ht, ns],
+            vec![ht, key],
         ),
+        // The *after*: the query `PostgresCatalog::live_parts_pruned` actually
+        // issues. The inner pass is index-only — `id` and `key_filter` both ride in
+        // `parts_live_idx` — so a rejected part is never fetched from the heap.
         (
-            "live_parts_pruned(key+time)",
+            "live_parts_pruned(key) — RANGE + KEY FILTER (shipped)",
             format!(
                 "SELECT id, hypertable_id, path, partition_values, packing_key_min, packing_key_max,
                         row_count, size_bytes, level, column_stats, created_by_commit
-                 FROM parts
-                 WHERE hypertable_id = $1 AND deleted_by_commit IS NULL
-                   AND packing_key_min <= $2 AND packing_key_max >= $2
-                   AND (column_stats -> 'ts' ->> 'max')::bigint >= {day_min}
-                   AND (column_stats -> 'ts' ->> 'min')::bigint <= {day_max}"
+                 FROM parts WHERE id IN (
+                     SELECT id FROM parts
+                     WHERE hypertable_id = $1 AND deleted_by_commit IS NULL
+                       AND packing_key_min <= $2 AND packing_key_max >= $2
+                       AND {}
+                 ) ORDER BY id",
+                ukiel_core::keyfilter::sql_predicate("key_filter", 3)
             ),
-            vec![ht, ns],
+            [vec![ht, key], probe_binds.clone()].concat(),
+        ),
+        (
+            "live_parts_pruned(key+time) — shipped",
+            format!(
+                "SELECT id, hypertable_id, path, partition_values, packing_key_min, packing_key_max,
+                        row_count, size_bytes, level, column_stats, created_by_commit
+                 FROM parts WHERE id IN (
+                     SELECT id FROM parts
+                     WHERE hypertable_id = $1 AND deleted_by_commit IS NULL
+                       AND packing_key_min <= $2 AND packing_key_max >= $2
+                       AND {}
+                 )
+                   AND (column_stats -> 'ts' ->> 'max')::bigint >= {day_min}
+                   AND (column_stats -> 'ts' ->> 'min')::bigint <= {day_max}
+                 ORDER BY id",
+                ukiel_core::keyfilter::sql_predicate("key_filter", 3)
+            ),
+            [vec![ht, key], probe_binds.clone()].concat(),
         ),
     ];
 
@@ -1479,7 +1592,9 @@ pub async fn explain(label: &str, namespaces: u64) -> anyhow::Result<()> {
 
     crate::report::write_json(
         &format!("catalog-explain-{label}.json"),
-        &serde_json::json!({ "label": label, "namespace": ns, "hypertable": ht, "plans": out }),
+        &serde_json::json!({
+            "label": label, "namespace": ns, "hypertable": ht, "key": key, "plans": out,
+        }),
     )?;
     Ok(())
 }
@@ -1488,14 +1603,17 @@ pub async fn explain(label: &str, namespaces: u64) -> anyhow::Result<()> {
 /// space changes what its query costs.
 ///
 /// `live_parts_pruned` asks for range **containment**: `kmin <= k AND kmax >= k`.
-/// A btree on `(hypertable_id, packing_key_min, packing_key_max)` can only use the
-/// leading `kmin <= k` bound as an index condition — everything after it is a
-/// filter. So the scan visits every live part whose `kmin` is at or below the
-/// probed key, and the cost grows with the key's **rank**, not with how many parts
-/// actually contain it.
 ///
-/// The low-rank tenant and the high-rank tenant of the same hypertable return the
-/// same handful of parts. Only one of them pays for the whole table.
+/// This once claimed that only the leading `kmin <= k` bound reaches the index and
+/// that cost therefore tracks a key's *rank*. `EXPLAIN` refutes it: PostgreSQL puts
+/// **both** bounds in the `Index Cond`, and a tenant matching nothing is cheaper
+/// than one matching thousands of parts. Cost follows the rows a scan returns, not
+/// the rank of the key it probes (issue 0014).
+///
+/// What rank *does* change is how many parts the range test admits — a key at the
+/// edge of a hypertable's band is bracketed by almost no parts, a key in the middle
+/// by almost all of them. So this measures the shape of the over-fetch across the
+/// band, which is the thing the key filter has to flatten.
 pub async fn keyrank(label: &str, ht_name: &str, keys_per_table: i64) -> anyhow::Result<()> {
     use anyhow::Context as _;
     let cat = PostgresCatalog::connect(&crate::catalog::pg_url()).await?;

@@ -3181,3 +3181,435 @@ async fn an_unidentified_mutation_at_the_boundary_is_loud_and_permanent() {
     // It did commit — the point is that nobody can prove it from here.
     assert_eq!(catalog.live_parts(ht, None).await.unwrap().len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Issue 0014: the catalog answers "does this part hold this tenant?" itself.
+// ---------------------------------------------------------------------------
+
+/// A part whose key *range* brackets a tenant but whose key *set* does not hold
+/// it must not be returned. That is the whole gap: a packed file spanning keys
+/// 100..4500 contains tenant 3000's range and none of its rows, and plan 16
+/// measured the median tenant's candidate files falling 108 → 7 once the key set
+/// is consulted. Before this, all 108 rows crossed the wire so the *provider*
+/// could discard them.
+#[tokio::test]
+async fn live_parts_pruned_is_exact_when_the_key_set_is_known() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+
+    // Two packed parts with the *same* wide key range. One holds tenant 3000, the
+    // other does not — indistinguishable to a range predicate.
+    let packed = |path: &str, keys: &[i64]| PartMeta {
+        path: path.to_string(),
+        partition_values: json!({ "day": "2026-07-01" }),
+        packing_key_min: 100,
+        packing_key_max: 4500,
+        row_count: 10,
+        size_bytes: 10,
+        level: 1,
+        column_stats: ukiel_core::stats::with_key_index(
+            Some(json!({"tenant_id": {"min": 100, "max": 4500}})),
+            Some(bitmap_of(keys)),
+            None,
+        ),
+    };
+    catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![
+                    packed("holds-3000.parquet", &[120, 3000, 4400]),
+                    packed("holds-nothing.parquet", &[120, 2000, 4400]),
+                ],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let hits = catalog
+        .live_parts_pruned(ht, Some(3000), &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.iter()
+            .map(|p| p.meta.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["holds-3000.parquet"],
+        "the catalog must not ship a part whose key set proves the tenant absent"
+    );
+
+    // A tenant inside the range that neither part holds: nothing comes back at
+    // all. The range predicate alone would have returned both.
+    assert!(
+        catalog
+            .live_parts_pruned(ht, Some(2500), &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // And a tenant both hold is still returned twice — exactness cuts both ways.
+    assert_eq!(
+        catalog
+            .live_parts_pruned(ht, Some(120), &[])
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+/// Ambiguity degrades to **keep** — the rule plan 16 wrote and this must not
+/// weaken. A part with no recorded key set is a part whose contents we cannot
+/// prove anything about, so it is returned and read.
+#[tokio::test]
+async fn a_part_with_no_key_set_is_kept_on_its_range() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+
+    let mut no_bitmap = part_meta("legacy.parquet", 100, 4500);
+    // Exactly what a pre-0012 part looks like, and what a part whose key set was
+    // too large or too poisoned to record looks like: stats, but no key set.
+    no_bitmap.column_stats = Some(json!({"tenant_id": {"min": 100, "max": 4500}}));
+
+    let mut undecodable = part_meta("garbage.parquet", 100, 4500);
+    undecodable.column_stats = Some(json!({
+        "tenant_id": {"min": 100, "max": 4500},
+        "packing_keys": "not base64 roaring at all"
+    }));
+
+    // A single-key part carries no bitmap by design: min == max already answers
+    // exactly, so there is nothing for a key set to add.
+    let dedicated = part_meta("dedicated.parquet", 777, 777);
+
+    catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![no_bitmap, undecodable, dedicated],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut kept: Vec<String> = catalog
+        .live_parts_pruned(ht, Some(3000), &[])
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.meta.path)
+        .collect();
+    kept.sort();
+    assert_eq!(
+        kept,
+        vec!["garbage.parquet", "legacy.parquet"],
+        "a part we cannot prove irrelevant is kept — an undecodable key set is not an empty one"
+    );
+
+    // The single-key part is still answered exactly by its range — and the two
+    // unknowns are *also* returned, because 777 is inside their range too. Being
+    // kept is the whole point: an unknown key set licenses nothing.
+    let at_777: Vec<String> = catalog
+        .live_parts_pruned(ht, Some(777), &[])
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.meta.path)
+        .collect();
+    assert!(at_777.contains(&"dedicated.parquet".to_string()));
+    assert_eq!(at_777.len(), 3, "{at_777:?}");
+    assert_eq!(
+        catalog
+            .live_parts_pruned(ht, Some(778), &[])
+            .await
+            .unwrap()
+            .iter()
+            .filter(|p| p.meta.path == "dedicated.parquet")
+            .count(),
+        0
+    );
+}
+
+/// A roaring treemap of these keys, base64-encoded — exactly what the writers put
+/// in `column_stats`, so the test exercises the real decode path.
+fn bitmap_of(keys: &[i64]) -> String {
+    use base64::Engine as _;
+    let mut map = roaring::RoaringTreemap::new();
+    for k in keys {
+        map.insert(*k as u64);
+    }
+    let mut bytes = Vec::new();
+    map.serialize_into(&mut bytes).unwrap();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// The bits Rust sets and the bits SQL demands must be the **same bits**.
+///
+/// This is the sharpest failure mode in issue 0014's design. The filter is built in
+/// Rust, the probe positions are computed in Rust, and PostgreSQL is handed byte
+/// offsets and masks — so if the two ever drifted, SQL would say "proven absent"
+/// about a part that holds the tenant's rows and the query would silently return
+/// less data than it should. A false *positive* is harmless (the part is kept); a
+/// false *negative* is data loss.
+///
+/// So this drives the real query over real rows and demands that it agree, part for
+/// part and key for key, with `keyfilter::maybe_contains` — including every blob
+/// that must degrade to keep, which is why the malformed ones are written straight
+/// into the table rather than through a writer that would refuse them.
+#[tokio::test]
+async fn the_key_filter_agrees_between_rust_and_sql() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+    let pool = catalog.pool_for_tests();
+
+    // Every part spans the same wide range, so the range predicate can never
+    // separate them: what comes back is decided by the filter alone.
+    const LO: i64 = 1;
+    const HI: i64 = 40_000;
+
+    // Key sets at the sizes that matter: two (the smallest with a filter at all),
+    // the count the filter is sized for, and one well past it where it saturates
+    // toward keeping.
+    let sets: Vec<Vec<i64>> = [2usize, 40, ukiel_core::keyfilter::SUPPORTED_KEYS, 900]
+        .iter()
+        .map(|n| (0..*n as i64).map(|i| i * 13 + 5).collect())
+        .collect();
+
+    let mut expected: Vec<(String, Option<Vec<u8>>)> = Vec::new();
+    for (i, keys) in sets.iter().enumerate() {
+        let path = format!("packed-{i}.parquet");
+        catalog
+            .commit(
+                ht,
+                CommitOp::Add {
+                    parts: vec![PartMeta {
+                        path: path.clone(),
+                        partition_values: json!({ "day": "2026-07-01" }),
+                        packing_key_min: LO,
+                        packing_key_max: HI,
+                        row_count: 10,
+                        size_bytes: 10,
+                        level: 1,
+                        column_stats: ukiel_core::stats::with_key_index(
+                            Some(json!({"tenant_id": {"min": LO, "max": HI}})),
+                            Some(bitmap_of(keys)),
+                            None,
+                        ),
+                    }],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        expected.push((path, ukiel_core::keyfilter::build(keys)));
+    }
+
+    // The states that must degrade to keep. A writer would never produce these, so
+    // they go in by hand — a pre-0012 part (NULL), a blob of some other size, and a
+    // full-size blob whose version this reader does not know. Each must be kept for
+    // *every* key, because none of them proves anything.
+    let ok = ukiel_core::keyfilter::build(&[1, 2, 3]).unwrap();
+    let mut unknown_version = ok.clone();
+    unknown_version[0] = 99;
+    let degraded: Vec<(&str, Option<Vec<u8>>)> = vec![
+        ("legacy-null.parquet", None),
+        ("truncated.parquet", Some(ok[..64].to_vec())),
+        ("unknown-version.parquet", Some(unknown_version)),
+    ];
+    for (path, filter) in &degraded {
+        sqlx::query(
+            "INSERT INTO parts (hypertable_id, path, partition_values, packing_key_min,
+                                packing_key_max, row_count, size_bytes, level, key_filter,
+                                created_by_commit)
+             SELECT $1, $2, '{}'::jsonb, $3, $4, 10, 10, 1, $5, min(id) FROM commits",
+        )
+        .bind(ht.0)
+        .bind(*path)
+        .bind(LO)
+        .bind(HI)
+        .bind(filter.clone())
+        .execute(pool)
+        .await
+        .unwrap();
+        expected.push((path.to_string(), filter.clone()));
+    }
+
+    // Now the seam itself: for a spread of keys — present, absent, and the range's
+    // own boundaries — what the catalog returns must be exactly what Rust says it
+    // should, part by part.
+    let probes = [LO, HI, 5, 18, 512, 1_235, 7_777, 20_000, 39_999];
+    for key in probes {
+        let got: std::collections::BTreeSet<String> = catalog
+            .live_parts_pruned(ht, Some(key), &[])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| p.meta.path)
+            .collect();
+        let want: std::collections::BTreeSet<String> = expected
+            .iter()
+            .filter(|(_, f)| {
+                f.as_ref()
+                    .is_none_or(|f| ukiel_core::keyfilter::maybe_contains(f, key))
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert_eq!(
+            got, want,
+            "key {key}: SQL and Rust disagree about which parts the filter keeps — a \
+             part missing from `got` is a tenant losing rows"
+        );
+    }
+
+    // And the property the whole mechanism rests on, stated directly: no key that is
+    // *in* a part is ever pruned away from it.
+    for (keys, (path, _)) in sets.iter().zip(&expected) {
+        for key in keys {
+            let got = catalog.live_parts_pruned(ht, Some(*key), &[]).await.unwrap();
+            assert!(
+                got.iter().any(|p| p.meta.path == *path),
+                "{path} holds key {key} and the catalog did not return it"
+            );
+        }
+    }
+}
+
+/// Every writer's parts get a key filter, and a **compaction REPLACE** rebuilds it
+/// from the merged part's own keys (issue 0014).
+///
+/// Filters are derived in `insert_parts` from the roaring bitmap the writers
+/// already produce, so no writer had to change — which is exactly why this needs
+/// testing rather than assuming. A REPLACE that carried its *inputs'* filters
+/// forward, or dropped the filter entirely, would silently stop pruning (safe) or
+/// prune against the wrong key set (not safe).
+#[tokio::test]
+async fn every_writer_and_a_compaction_replace_carry_a_key_filter() {
+    let (_pg, catalog) = common::setup().await;
+    let ht = setup_hypertable(&catalog).await;
+
+    let packed = |path: &str, keys: &[i64]| PartMeta {
+        path: path.to_string(),
+        partition_values: json!({ "day": "2026-07-01" }),
+        packing_key_min: *keys.iter().min().unwrap(),
+        packing_key_max: *keys.iter().max().unwrap(),
+        row_count: 10,
+        size_bytes: 10,
+        level: 0,
+        column_stats: ukiel_core::stats::with_key_index(
+            Some(json!({"tenant_id": {"min": keys.iter().min(), "max": keys.iter().max()}})),
+            Some(bitmap_of(keys)),
+            None,
+        ),
+    };
+
+    // Ingest-shaped ADD: two L0 parts, disjoint tenants, both packed.
+    catalog
+        .commit(
+            ht,
+            CommitOp::Add {
+                parts: vec![
+                    packed("l0-a.parquet", &[10, 500, 4000]),
+                    packed("l0-b.parquet", &[20, 600, 4100]),
+                ],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Each tenant sees only the part that holds it — and a tenant inside both
+    // ranges but in neither key set sees nothing.
+    for (key, want) in [(500, vec!["l0-a.parquet"]), (600, vec!["l0-b.parquet"])] {
+        let got: Vec<String> = catalog
+            .live_parts_pruned(ht, Some(key), &[])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| p.meta.path)
+            .collect();
+        assert_eq!(got, want, "key {key}");
+    }
+    assert!(
+        catalog
+            .live_parts_pruned(ht, Some(3000), &[])
+            .await
+            .unwrap()
+            .is_empty(),
+        "3000 is inside both parts' ranges and in neither's key set"
+    );
+
+    // Compaction REPLACE: merge both L0s into one L1 whose key set is the union.
+    let old: Vec<_> = catalog
+        .live_parts(ht, None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|p| p.id)
+        .collect();
+    let mut merged = packed("l1-merged.parquet", &[10, 20, 500, 600, 4000, 4100]);
+    merged.level = 1;
+    catalog
+        .commit(
+            ht,
+            CommitOp::Replace {
+                old,
+                new: vec![merged],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The merged part is found for every tenant it now holds...
+    for key in [10, 20, 500, 600, 4000, 4100] {
+        let got = catalog.live_parts_pruned(ht, Some(key), &[]).await.unwrap();
+        assert_eq!(got.len(), 1, "key {key} must find the merged part");
+        assert_eq!(got[0].meta.path, "l1-merged.parquet");
+    }
+    // ...and for none it does not. The REPLACE rebuilt the filter from the merged
+    // key set rather than inheriting an input's.
+    assert!(
+        catalog
+            .live_parts_pruned(ht, Some(3000), &[])
+            .await
+            .unwrap()
+            .is_empty(),
+        "the merged part's range spans 3000 but its key set does not hold it"
+    );
+
+    // Deletion-shaped REPLACE: rewrite the merged part without tenant 500.
+    let old = vec![catalog.live_parts(ht, None).await.unwrap()[0].id];
+    let mut rewritten = packed("l1-rewritten.parquet", &[10, 20, 600, 4000, 4100]);
+    rewritten.level = 1;
+    catalog
+        .commit(
+            ht,
+            CommitOp::Replace {
+                old,
+                new: vec![rewritten],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        catalog
+            .live_parts_pruned(ht, Some(500), &[])
+            .await
+            .unwrap()
+            .is_empty(),
+        "the erased tenant must no longer resolve to any part — its key left the filter"
+    );
+    assert_eq!(
+        catalog
+            .live_parts_pruned(ht, Some(600), &[])
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "its neighbours in the same file are untouched"
+    );
+}

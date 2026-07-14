@@ -8,7 +8,14 @@ services:
     # here so the fleet-budget question can be measured rather than argued —
     # raising it is not free (each backend reserves memory), which is exactly
     # what UKIEL_PG_MAX_CONNECTIONS lets a run price.
+    # `shared_buffers` defaults to 128MB, which is nothing against a catalog whose
+    # `parts` table is measured in gigabytes — every read then misses cache and the
+    # benchmark prices the disk instead of the query. A knob, for the same reason
+    # `max_connections` is one: so the question is measured, not argued (issue 0014).
     command: postgres -c max_connections=${UKIEL_PG_MAX_CONNECTIONS:-100}
+      -c shared_buffers=${UKIEL_PG_SHARED_BUFFERS:-128MB}
+      -c effective_cache_size=${UKIEL_PG_EFFECTIVE_CACHE:-4GB}
+      -c random_page_cost=${UKIEL_PG_RANDOM_PAGE_COST:-4.0}
     environment:
       POSTGRES_PASSWORD: postgres
     ports:

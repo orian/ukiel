@@ -265,6 +265,14 @@ impl TableProvider for UkielTableProvider {
         // opens the file to find nothing. The packing-key bitmap makes this
         // exact: drop a part only when it *proves* the key is absent.
         //
+        // Since issue 0014 the *catalog* has already asked that question — it
+        // indexes the key set and returns only the parts that hold the tenant, so
+        // for any part written after migration 0012 this filter now finds nothing
+        // to remove. It stays because it is still load-bearing for the parts the
+        // catalog cannot answer for: those written before 0012, and those whose key
+        // set is too dense to index. Both arrive here on their range, exactly as
+        // they always did, and this is what prunes them.
+        //
         // Exactness is the bitmap's job; safety is the keep-by-default rule —
         // a missing index, an undecodable one, or a negative key all yield
         // `None` and keep the part — plus the isolation `FilterExec` below,
@@ -283,7 +291,16 @@ impl TableProvider for UkielTableProvider {
                 continue;
             };
             if part_excludes_key(p, key) {
-                continue; // the bitmap proves this part holds none of the key's rows
+                // The bitmap proves this part holds none of the key's rows.
+                //
+                // Since issue 0014 the catalog rejects these before they are ever
+                // fetched, so on a post-0012 part this is now a *no-op* — counted,
+                // so that "the catalog is doing the pruning" is an observation and
+                // not a hope. What still reaches here: parts written before 0012,
+                // and parts whose key filter said "maybe" (a Bloom false positive).
+                // Both are pruned exactly, here, as they always were.
+                metrics::counter!("query_parts_pruned_by_provider_total").increment(1);
+                continue;
             }
             match access_plan_for(p, key) {
                 // Every row group provably excludes the key: don't open the file

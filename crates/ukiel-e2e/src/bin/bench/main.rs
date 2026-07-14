@@ -61,7 +61,8 @@ USAGE:
         Cost vs the tenant's key RANK inside its hypertable (issue 0011)
         The WHOLE admission path (list_logical_tables + session + plan + live_parts_pruned),
         not just its last call — issue 0011.
-    bench catalog read|write|conflict|mixed --label L [--mode closed|open] [--workers N] [--rate R]
+    bench catalog read --range-only                       the PRE-0014 query, for before/after
+bench catalog read|write|conflict|mixed --label L [--mode closed|open] [--workers N] [--rate R]
         [--duration S] [--warmup S] [--timeout-ms N] [--pools N] [--connections-per-pool N]
         [--key-dist uniform|zipf] [--scenario S] [--parts-per-commit N] [--shape S]
         [--coordination optimistic|partition-lease]   (conflict only; plan 41)
@@ -174,6 +175,7 @@ async fn run(args: &[String]) -> anyhow::Result<()> {
                     .unwrap_or("7")
                     .parse()
                     .map_err(|_| anyhow::anyhow!("--target-fanout must be a float"))?,
+                hot_multiplier: opt_usize(args, "--hot-multiplier")?.unwrap_or(10) as u32,
                 // The namespace id *is* the packing key, so tenants and the key
                 // space are the same axis by default (issue 0011). They can still
                 // be split apart, which is how "a million keys" and "a million
@@ -343,5 +345,6 @@ fn load_config(args: &[String]) -> anyhow::Result<catalog_load::LoadConfig> {
         packing_keys: opt_usize(args, "--packing-keys")?.unwrap_or(1_000_000) as u64,
         scenario: opt_str(args, "--scenario").unwrap_or("steady").to_string(),
         max_inflight: opt_usize(args, "--max-inflight")?.unwrap_or(4096),
+        range_only: args.iter().any(|a| a == "--range-only"),
     })
 }

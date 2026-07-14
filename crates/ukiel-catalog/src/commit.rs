@@ -453,6 +453,30 @@ async fn fence_lease(
     Ok(())
 }
 
+/// The part's key filter — a bounded Bloom over its distinct packing keys, so the
+/// catalog can reject a part it can *prove* does not hold a tenant (issue 0014).
+///
+/// Derived here rather than threaded through `PartMeta`, because the writers
+/// already record the key set — as the plan-16 roaring bitmap in `column_stats` —
+/// and there is nothing for them to say twice. One decode at insert.
+///
+/// `None` is **unknown**, never empty: a part with no bitmap, a key set too dense
+/// to have one, a poisoned one. Those keep the conservative range answer, and are
+/// kept.
+fn key_filter(part: &PartMeta) -> Option<Vec<u8>> {
+    // A single-key part needs none: `packing_key_min == packing_key_max` already
+    // *is* its key set, so the range predicate is exact for it and `build` declines.
+    // Dedicated (unpacked) parts are all of that shape, so most parts in a
+    // dedicated-heavy table carry no filter at all.
+    let keys = part
+        .column_stats
+        .as_ref()?
+        .get(ukiel_core::stats::PACKING_KEYS_STAT)?
+        .as_str()
+        .and_then(ukiel_core::stats::bitmap_keys)?;
+    ukiel_core::keyfilter::build(&keys)
+}
+
 async fn insert_parts(
     tx: &mut Transaction<'_, Postgres>,
     hypertable_id: HypertableId,
@@ -462,8 +486,8 @@ async fn insert_parts(
     for p in parts {
         sqlx::query(
             "INSERT INTO parts (hypertable_id, path, partition_values, packing_key_min, packing_key_max,
-                                row_count, size_bytes, level, column_stats, created_by_commit)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                                row_count, size_bytes, level, column_stats, key_filter, created_by_commit)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(hypertable_id.0)
         .bind(&p.path)
@@ -474,6 +498,7 @@ async fn insert_parts(
         .bind(p.size_bytes)
         .bind(p.level)
         .bind(&p.column_stats)
+        .bind(key_filter(p))
         .bind(commit_id.0)
         .execute(&mut **tx)
         .await?;

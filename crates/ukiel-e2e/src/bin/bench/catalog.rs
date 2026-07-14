@@ -292,6 +292,22 @@ pub struct SeedSummary {
     /// 2 ms returning 7 parts and 2 ms returning 7,000 are not the same system.
     pub tenant_parts_p50: i64,
     pub tenant_parts_p99: i64,
+    /// Issue 0014: parts a tenant's query matches by **key range** (what the
+    /// catalog returned before 0012) versus by **key set** (what it returns now).
+    /// The ratio is the over-fetch — rows shipped so the provider could discard
+    /// them.
+    pub range_candidates_p50: i64,
+    pub exact_parts_p50: i64,
+    /// What the shipped catalog returns: range candidates the bounded key filter
+    /// cannot disprove. The gap up to `exact_parts_p50` is its false-positive rate,
+    /// in parts; the gap down from `range_candidates_p50` is what it removed.
+    pub filter_survivors_p50: i64,
+    pub filter_survivors_p99: i64,
+    /// Bytes the `packing_keys` column and its GIN index cost. The price of the
+    /// fix, recorded beside its benefit, because one without the other is a sales
+    /// pitch.
+    pub packing_keys_bytes: i64,
+    pub packing_keys_index_bytes: i64,
     /// Rows in `parts` that are NOT this fixture's — they share the table, its
     /// indexes and its vacuum budget, so they are recorded, not ignored.
     pub foreign_parts: i64,
@@ -339,6 +355,8 @@ pub struct SeedSpec {
     ///
     /// Default 7: plan 16's measured median-tenant file count.
     pub target_fanout: f64,
+    /// How many times the average table's live parts the *hot* table gets.
+    pub hot_multiplier: u32,
     /// Tenants. Each gets `tables_per_namespace` logical tables. The namespace id
     /// *is* the packing key (the v1 convention the provider encodes), so this is
     /// also how many distinct tenant slices the read path can ask for.
@@ -352,15 +370,27 @@ pub struct SeedSpec {
 
 impl SeedSpec {
     /// `(live, history, hot_live)` — the override wins, the state is the default.
+    ///
+    /// The hot table is `hot_multiplier` times the *average* table, not a fixed
+    /// fraction of the whole live set. `State::hot_fraction` was written for plan
+    /// 40's four hypertables, where 30% of the live parts in one table meant 750;
+    /// across two thousand it means 300,000 live parts for 500 tenants — six
+    /// hundred parts each — which is not a hot table, it is a state compaction
+    /// would never leave, and it made the fixture measure something that does not
+    /// exist.
     fn split(&self) -> (i64, i64, i64) {
         let live = self.live_parts.unwrap_or_else(|| {
             (self.total_parts as f64 * self.state.live_fraction()).round() as i64
         });
         let history = self.historical_parts.unwrap_or(self.total_parts - live);
+        let average = live / self.hypertables.max(1) as i64;
+        // Never more than half the live set: a "hot" table that swallowed every
+        // part would leave the others empty, and a fixture whose cold tables hold
+        // nothing cannot say anything about the tenants that live on them.
         let hot = self
             .hot_live_parts
-            .unwrap_or_else(|| (live as f64 * self.state.hot_fraction()).round() as i64);
-        (live, history, hot.min(live))
+            .unwrap_or_else(|| average.saturating_mul(self.hot_multiplier as i64));
+        (live, history, hot.clamp(average, (live / 2).max(average)))
     }
 }
 
@@ -389,6 +419,16 @@ pub async fn seed(spec: SeedSpec) -> anyhow::Result<()> {
     let cat = ukiel_catalog::PostgresCatalog::connect(&pg_url()).await?;
     cat.migrate().await?;
     let pool = cat.pool_for_tests().clone();
+
+    // A measurement column the *product* deliberately does not have. The product
+    // stores only the bounded filter (issue 0014: storing the exact key set is
+    // what collapsed writes); the fixture keeps the exact set beside it so it can
+    // measure what the filter is worth — range candidates against real membership.
+    // A fixture may know things the system under test does not; it may not *use*
+    // them to answer the system's questions.
+    sqlx::query("ALTER TABLE parts ADD COLUMN IF NOT EXISTS packing_keys BIGINT[]")
+        .execute(&pool)
+        .await?;
 
     reset_bench_objects(&pool).await?;
 
@@ -532,10 +572,18 @@ pub async fn seed(spec: SeedSpec) -> anyhow::Result<()> {
         };
         hist_left -= hist_here;
 
-        // The band this table needs for its tenants to see `target_fanout` parts.
-        let band = spec.key_band.unwrap_or_else(|| {
-            let packed = live_here.max(1) as f64 * (1.0 - dedicated_frac);
-            ((keys_per_table as f64 * spec.target_fanout) / packed.max(1.0))
+        // How many tenants one part holds, solved so a tenant sees `target_fanout`
+        // parts. The identity is `pairs = P·S = T·F`: with `P` live parts in a
+        // table of `T` tenants, a part holding `S` of them puts each tenant in
+        // `P·S/T` parts. Solve for S.
+        //
+        // The parts' keys are then *scattered* across the slice, so each part's
+        // min/max brackets nearly all `T` tenants while holding only `S` — and a
+        // tenant's range candidates are therefore ~`P` where its real parts are
+        // `F`. That ratio, `T/S`, is issue 0014.
+        let keys_per_part = spec.key_band.unwrap_or_else(|| {
+            let p = live_here.max(1) as f64;
+            ((spec.target_fanout * keys_per_table as f64) / p)
                 .round()
                 .clamp(1.0, keys_per_table as f64) as u64
         });
@@ -553,7 +601,7 @@ pub async fn seed(spec: SeedSpec) -> anyhow::Result<()> {
                 KeySpace {
                     lo: key_lo,
                     span: keys_per_table,
-                    band,
+                    keys_per_part,
                 },
             )
             .await?;
@@ -573,7 +621,7 @@ pub async fn seed(spec: SeedSpec) -> anyhow::Result<()> {
                 KeySpace {
                     lo: key_lo,
                     span: keys_per_table,
-                    band,
+                    keys_per_part,
                 },
             )
             .await?;
@@ -604,6 +652,19 @@ pub async fn seed(spec: SeedSpec) -> anyhow::Result<()> {
         "  per-tenant fan-out (through the tenant's own hypertable): p50 {} parts, p99 {} \
          — plan 16 measured the product's median tenant at 7 files",
         summary.tenant_parts_p50, summary.tenant_parts_p99
+    );
+    println!(
+        "  ISSUE 0014 — the median tenant's parts, at each stage of the query:\n\
+         \x20   by RANGE   {:>6}   (candidates the index brackets — what the catalog used to ship)\n\
+         \x20   by FILTER  {:>6}   (what the catalog returns now — {:.0}x fewer rows)\n\
+         \x20   by KEY SET {:>6}   (what the provider plans — the floor)\n\
+         \x20   the filter costs {:.1} MiB in the rows; the range index, now carrying it, is {:.1} MiB",
+        summary.range_candidates_p50,
+        summary.filter_survivors_p50,
+        summary.range_candidates_p50 as f64 / summary.filter_survivors_p50.max(1) as f64,
+        summary.exact_parts_p50,
+        summary.packing_keys_bytes as f64 / 1048576.0,
+        summary.packing_keys_index_bytes as f64 / 1048576.0,
     );
     verify_via_product_api(&cat, &summary).await?;
     crate::report::write_json(&format!("catalog-seed-{label}.json"), &summary)?;
@@ -711,6 +772,110 @@ async fn verify_via_product_api(
         pruned.len()
     );
 
+    // The fixture must prove it is TRUTHFUL, or it can lie again — and the first
+    // issue-0014 measurement was wrong precisely because it could. Every one of
+    // these would have caught it.
+    let bad: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM parts
+         WHERE deleted_by_commit IS NULL AND packing_keys IS NOT NULL
+           AND ( packing_key_min <> packing_keys[1]
+              OR packing_key_max <> packing_keys[array_length(packing_keys, 1)]
+              OR EXISTS (SELECT 1 FROM unnest(packing_keys) k
+                         WHERE k < packing_key_min OR k > packing_key_max) )",
+    )
+    .fetch_one(cat.pool_for_tests())
+    .await?;
+    if bad > 0 {
+        bail!(
+            "{bad} parts declare a key range that does not bracket their own key set — \
+             the fixture's ranges and keys have come apart, and every pruning number \
+             measured against it would be meaningless"
+        );
+    }
+
+    // The stored bitmap must decode back to the very keys the part declares. This
+    // is the one the old fixture failed: it wrote one constant blob, unrelated to
+    // anything, so the provider's exact filter was being tested against fiction.
+    let sample: Vec<(Vec<i64>, Option<serde_json::Value>, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT packing_keys, column_stats, key_filter FROM parts
+         WHERE deleted_by_commit IS NULL AND packing_keys IS NOT NULL
+           AND column_stats ? 'packing_keys'
+         LIMIT 200",
+    )
+    .fetch_all(cat.pool_for_tests())
+    .await?;
+    for (keys, stats, stored) in &sample {
+        let encoded = stats
+            .as_ref()
+            .and_then(|s| s.get(ukiel_core::stats::PACKING_KEYS_STAT))
+            .and_then(|v| v.as_str())
+            .context("a multi-key part must carry a bitmap")?;
+        let decoded = ukiel_core::stats::bitmap_keys(encoded)
+            .context("the stored bitmap must decode with the product's own reader")?;
+        if &decoded != keys {
+            bail!(
+                "a part's stored bitmap decodes to {} keys but it declares {} — the fixture's \
+                 bitmap is fiction, and anything measured through it (the provider's pruning, \
+                 the files finally planned) is fiction too",
+                decoded.len(),
+                keys.len()
+            );
+        }
+        // And the filter *in the row* — not one rebuilt here, which would only prove
+        // the builder agrees with itself — must be the one these keys build, and must
+        // never deny a key the part holds. A fixture that stored the wrong blob would
+        // make the catalog prune truthfully-held parts and the numbers would look
+        // wonderful.
+        let filter = ukiel_core::keyfilter::build(keys).context("filter builds")?;
+        if stored.as_deref() != Some(filter.as_slice()) {
+            bail!(
+                "a part's stored key_filter is not the filter its {} keys build — the \
+                 fixture is measuring a filter the product would never write",
+                keys.len()
+            );
+        }
+        for k in keys {
+            if !ukiel_core::keyfilter::maybe_contains(&filter, *k) {
+                bail!("the key filter denies key {k}, which the part holds — data would be lost");
+            }
+        }
+    }
+    println!(
+        "  fixture is truthful: {} sampled parts — ranges bracket their keys, bitmaps decode \
+         back to them, and the key filter never denies a key the part holds",
+        sample.len()
+    );
+
+    // Every hypertable must carry the *mix* that was asked for, not a coin flip.
+    //
+    // This is what caught `random()` being hoisted out of an uncorrelated LATERAL and
+    // evaluated once per batch: the hot hypertable came out 100% single-key parts and
+    // every other one 100% packed, which no `--dedicated-frac` can express. The
+    // fixture looked fine — 2M parts, the right totals, all the truthfulness checks
+    // green — and the one table every read probe lands on had no packed parts in it
+    // at all, so the issue it exists to measure could not occur there.
+    let extreme: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT h.name, count(*),
+                count(*) FILTER (WHERE p.packing_key_min = p.packing_key_max)
+         FROM parts p JOIN hypertables h ON h.id = p.hypertable_id
+         WHERE p.deleted_by_commit IS NULL AND h.name LIKE 'bench_cat_%'
+         GROUP BY h.name HAVING count(*) >= 100",
+    )
+    .fetch_all(cat.pool_for_tests())
+    .await?;
+    for (name, live, single) in &extreme {
+        let frac = *single as f64 / *live as f64;
+        if !(0.02..=0.98).contains(&frac) {
+            bail!(
+                "{name}: {:.0}% of its {live} live parts are single-key — a hypertable that is \
+                 all-packed or all-dedicated cannot exhibit the range/key-set gap this fixture \
+                 exists to measure, and no --dedicated-frac asks for that. The per-part draw has \
+                 collapsed to a per-batch one.",
+                frac * 100.0
+            );
+        }
+    }
+
     // The check that stops a silently *broken* fixture — as opposed to a
     // legitimately sparse one.
     //
@@ -741,15 +906,25 @@ async fn verify_via_product_api(
     Ok(())
 }
 
-/// The tenant slice one hypertable owns, and how wide its packed parts are.
+/// The tenant slice one hypertable owns, and how many of its tenants one part
+/// actually holds.
 #[derive(Debug, Clone, Copy)]
 struct KeySpace {
     /// First packing key belonging to this hypertable.
     lo: u64,
     /// How many keys it owns.
     span: u64,
-    /// How many of them one packed part covers.
-    band: u64,
+    /// Distinct tenants whose rows are **in** one packed part.
+    ///
+    /// This — not a key *band* — is what a real writer produces, and getting it
+    /// wrong is what made the first version of this fixture unable to show issue
+    /// 0014 at all. A part's keys are *scattered* across the tenants that were
+    /// active in the window it covers, so its `min`/`max` bracket almost the whole
+    /// slice while it holds only `keys_per_part` of them. That gap — range says
+    /// yes, the key set says no — is the entire subject of issue 0014, and a
+    /// fixture that invents `min`/`max` independently of the key set (as this one
+    /// did) cannot exhibit it.
+    keys_per_part: u64,
 }
 
 /// Bulk-insert one population with `generate_series` — one statement, not one
@@ -766,56 +941,121 @@ async fn insert_parts(
     table_idx: usize,
     keys: KeySpace,
 ) -> anyhow::Result<()> {
+    // Precomputed once per population: every part draws one of these, so its
+    // bitmap decodes back to exactly the keys it declares.
+    let (flat, blobs, filters) = key_set_shapes(
+        keys.lo,
+        keys.span,
+        keys.keys_per_part,
+        table_idx as u64 * 7919,
+    );
+    let n_shapes = blobs.len() as i64;
+
     // Chunked so one statement never builds a multi-GB result set.
     const CHUNK: i64 = 200_000;
     let mut done = 0i64;
     while done < n {
         let batch = CHUNK.min(n - done);
-        // The generated row is deliberately realistic:
-        //  * key ranges: `dedicated_frac` of parts are single-key (min == max),
-        //    the rest span a band — this is what range pruning actually sees;
-        //  * levels: `l0_fraction` at L0 (unpruned, the ones that hurt);
-        //  * column_stats: Int64 bounds always; a roaring-shaped base64 bitmap
-        //    and row-group spans on multi-key parts, matching plan 16 — the JSONB
-        //    width is part of the cost being measured, so a `NULL` here would
-        //    quietly make every read look cheaper than it is.
+        // The generated row is deliberately realistic, and the key set is the part
+        // that matters most (issue 0014):
+        //
+        //  * a part's keys are a **scattered subset** of its hypertable's tenants —
+        //    the tenants active in the window it covers — and `min`/`max` are
+        //    *derived from that set*, exactly as the real writers derive them. So a
+        //    part's range brackets nearly the whole slice while it holds only a few
+        //    of its tenants, which is precisely the gap the key bitmap exists to
+        //    close and the catalog cannot currently see;
+        //  * `dedicated_frac` of parts are single-key (min == max), which range
+        //    pruning already answers exactly and which therefore carry no key set,
+        //    exactly as the writers decide;
+        //  * levels: `l0_fraction` at L0;
+        //  * `column_stats` carries a roaring-shaped blob of the right *width* —
+        //    the JSONB cost is part of what is being measured, so a NULL would make
+        //    every read look cheaper than it is. Its contents are not the semantic
+        //    key set (roaring cannot be encoded in SQL); `packing_keys` is, and it
+        //    is what the catalog prunes on.
         sqlx::query(
             r#"
             INSERT INTO parts (
                 hypertable_id, path, partition_values, packing_key_min, packing_key_max,
-                row_count, size_bytes, level, column_stats, created_by_commit, deleted_by_commit
+                row_count, size_bytes, level, column_stats, packing_keys, key_filter,
+                created_by_commit, deleted_by_commit
             )
             SELECT
                 $1,
-                'ht/' || $1 || '/L' || (CASE WHEN random() < $6 THEN 0 ELSE 1 END) || '/' || gen_random_uuid() || '.parquet',
+                'ht/' || $1 || '/L' || lv.level || '/' || gen_random_uuid() || '.parquet',
                 jsonb_build_object('day', to_char(DATE '2026-01-01' + ((g % $9)::int), 'YYYY-MM-DD')),
-                k.kmin,
-                CASE WHEN random() < $7 THEN k.kmin ELSE k.kmin + $12 END,
+                k.keys[1],
+                k.keys[array_length(k.keys, 1)],
                 100000 + (random() * 900000)::bigint,
                 10000000 + (random() * 130000000)::bigint,
-                (CASE WHEN random() < $6 THEN 0 ELSE 1 END)::smallint,
+                lv.level::smallint,
                 CASE
-                  -- Dedicated (single-key) parts carry no bitmap: range pruning is
-                  -- already exact for them, exactly as the writers decide.
-                  WHEN random() < $7 THEN
-                    jsonb_build_object('tenant_id', jsonb_build_object('min', k.kmin, 'max', k.kmin),
+                  WHEN k.dedicated THEN
+                    jsonb_build_object('tenant_id', jsonb_build_object('min', k.keys[1], 'max', k.keys[1]),
                                        'ts', jsonb_build_object('min', d.ts_min, 'max', d.ts_max))
                   ELSE
                     jsonb_build_object(
-                      'tenant_id', jsonb_build_object('min', k.kmin, 'max', k.kmin + $12),
+                      'tenant_id', jsonb_build_object('min', k.keys[1],
+                                                      'max', k.keys[array_length(k.keys, 1)]),
                       'ts', jsonb_build_object('min', d.ts_min, 'max', d.ts_max),
-                      'packing_keys', $10::text,
+                      -- TRUTHFUL: this blob decodes back to exactly `k.keys`, the
+                      -- keys this part declares. It used to be one constant blob
+                      -- unrelated to anything, which made every number derived from
+                      -- it — including the provider's pruning — unbelievable.
+                      'packing_keys', $10[k.shape],
                       'key_row_groups', $11::jsonb)
                 END,
+                -- The exact set, for the fixture's own measurement only.
+                k.keys,
+                -- The bounded filter the product stores, in the product's bit layout,
+                -- built by the product's own builder (`ukiel_core::keyfilter`) and
+                -- carried in as a precomputed shape.
+                --
+                -- A dedicated part gets NULL, exactly as the writers give it NULL: its
+                -- min == max == its one key, so the range predicate is already exact
+                -- and a filter would prove what the two bigints beside it prove.
+                CASE WHEN k.dedicated THEN NULL ELSE $16[k.shape] END,
                 $2,
                 $3
+            -- `level` and `dedicated` are hashed from `g`, not drawn from random().
+            --
+            -- They were `LATERAL (SELECT random() < $6)`, which reads as a per-row
+            -- coin flip and is not one: the sublink does not mention `g`, so
+            -- PostgreSQL is free to evaluate it **once** and reuse the row. It did.
+            -- Every part in a batch came out the same, so `--dedicated-frac 0.2` was
+            -- a coin flip per *batch* — and it landed heads on the hot hypertable,
+            -- making it 100% single-key parts while every other table was 100%
+            -- packed. A fixture that silently quantises its own mix to all-or-nothing
+            -- is not a fixture.
+            --
+            -- Hashing `g` is per-row by construction (and reproducible, which random()
+            -- never was). The two constants are different primes, so the level and
+            -- dedicated draws stay independent of each other.
             FROM generate_series(1, $4) AS g,
-                 -- The key lands inside THIS hypertable's tenant slice.
-                 LATERAL (SELECT $13 + ((g * 2654435761 + $5) % $8)::bigint AS kmin) k,
+                 LATERAL (SELECT (((g * 2246822519 + $5) % 1000) < ($6 * 1000)::int)::int
+                          AS level) lv,
+                 LATERAL (SELECT ((g * 1000003 + $5) % 1000) < ($7 * 1000)::int
+                          AS dedicated) ded,
+                 LATERAL (SELECT (g % $14)::int + 1 AS shape) sh,
+                 LATERAL (
+                     SELECT ded.dedicated, sh.shape,
+                            CASE WHEN ded.dedicated THEN
+                                -- A single-key part: its own key, and min == max.
+                                ARRAY[$13 + ((g * 2654435761 + $5) % $8)::bigint]
+                            ELSE
+                                -- One of the precomputed shapes, sliced out of the
+                                -- flat key pool. Scattered across the slice, which is
+                                -- what makes min/max span far more tenants than the
+                                -- part holds — the subject of issue 0014.
+                                (SELECT array_agg(DISTINCT x ORDER BY x)
+                                 FROM unnest($15[((sh.shape - 1) * $12 + 1)
+                                                 : (sh.shape * $12)]) AS x)
+                            END AS keys
+                 ) k,
                  -- The ts bounds must track the part's *own* day, or a key+time
                  -- probe prunes all-or-nothing and the time predicate measures
-                 -- nothing. (They did not, before issue 0011: every part claimed
-                 -- the same 30-day span, which is not what a writer produces.)
+                 -- nothing.
                  LATERAL (SELECT 1767225600000::bigint + (g % $9) * 86400000 AS ts_min,
                                  1767225600000::bigint + (g % $9) * 86400000 + 86399999 AS ts_max) d
             "#,
@@ -829,10 +1069,13 @@ async fn insert_parts(
         .bind(dedicated_frac)
         .bind(keys.span as i64)
         .bind(DAY_PARTITIONS as i64)
-        .bind(fake_bitmap())
+        .bind(&blobs)
         .bind(fake_spans())
-        .bind(keys.band as i64)
+        .bind(keys.keys_per_part as i64)
         .bind(keys.lo as i64)
+        .bind(n_shapes)
+        .bind(&flat)
+        .bind(&filters)
         .execute(pool)
         .await
         .context("bulk part insert")?;
@@ -841,17 +1084,95 @@ async fn insert_parts(
     Ok(())
 }
 
-/// A real roaring treemap, base64-encoded — the same shape and roughly the same
-/// width the writers produce, so JSONB/TOAST cost is honest.
-fn fake_bitmap() -> String {
+/// A pool of **truthful** key-set shapes for one hypertable.
+///
+/// The fixture used to insert one constant roaring blob, unrelated to any part's
+/// actual keys or its declared min/max. That is not a small liberty: it makes
+/// `column_stats.packing_keys` fiction, so nothing downstream of it — the
+/// provider's exact filter, the count of files finally planned — can be believed.
+/// It is also how the first issue-0014 measurement came to be wrong.
+///
+/// Generating a roaring blob per part would mean a round trip per part (2M of
+/// them). So: a bounded pool of shapes, precomputed in Rust, chosen by `g % N` in
+/// the bulk insert. Every part's bitmap then decodes back to exactly the keys the
+/// part declares, and its min/max are those keys' bounds.
+///
+/// Returns `(flat_keys, blobs)`: the keys of all `n_shapes` shapes concatenated
+/// (each `keys_per_part` long, so SQL can slice shape `j` out of it), and the
+/// base64 roaring blob of each.
+fn key_set_shapes(
+    lo: u64,
+    span: u64,
+    keys_per_part: u64,
+    salt: u64,
+) -> (Vec<i64>, Vec<String>, Vec<Vec<u8>>) {
     use base64::Engine as _;
-    let mut map = roaring::RoaringTreemap::new();
-    for k in 0..512u64 {
-        map.insert(k * 7 + 1);
+
+    // The shapes must **partition the tenant space**, not sample it.
+    //
+    // A bounded pool of shapes drawn at random covers only `n_shapes *
+    // keys_per_part` distinct tenants — with 512 shapes of 35 keys that is 18k of
+    // 100k, so four tenants in five appear in *no part at all* and the fixture's
+    // median tenant resolves to nothing. (The seed's own guard caught exactly
+    // that, which is the entire reason it exists.)
+    //
+    // So: shuffle the slice's tenants and deal them into blocks of `keys_per_part`.
+    // Every tenant lands in exactly one shape, the shapes are disjoint, and their
+    // keys are scattered — which is what makes a part's min/max bracket almost the
+    // whole slice while it holds only a handful of tenants.
+    let n_shapes = (span / keys_per_part.max(1)).max(1);
+
+    // A deterministic shuffle: walk the slice with a stride coprime to it, so the
+    // walk is a permutation.
+    let stride = coprime_stride(span, salt);
+    let order: Vec<u64> = (0..span).map(|i| (salt + i * stride) % span).collect();
+
+    let (mut flat, mut blobs, mut filters) = (Vec::new(), Vec::new(), Vec::new());
+    for shape in 0..n_shapes {
+        let start = (shape * keys_per_part) as usize;
+        let end = ((shape + 1) * keys_per_part).min(span) as usize;
+        let mut keys: Vec<u64> = order[start..end].iter().map(|o| lo + o).collect();
+        keys.sort_unstable();
+        keys.dedup();
+
+        let mut map = roaring::RoaringTreemap::new();
+        for k in &keys {
+            map.insert(*k);
+        }
+        let mut bytes = Vec::new();
+        map.serialize_into(&mut bytes).expect("serialize treemap");
+        blobs.push(base64::engine::general_purpose::STANDARD.encode(bytes));
+
+        // The product's own filter, from the product's own builder. Built here and
+        // not in SQL because the plpgsql builder rewrites the whole blob on every
+        // `set_byte` — a hundred rewrites per part, two million parts. Production
+        // builds one filter per part, once, which is not that shape at all.
+        let exact: Vec<i64> = keys.iter().map(|k| *k as i64).collect();
+        filters.push(ukiel_core::keyfilter::build(&exact).expect("a non-empty key set"));
+
+        // Padded to a fixed width so SQL can slice shape `j` out by arithmetic.
+        // Duplicates in the flat array are harmless — the *set* is what is stored.
+        let mut padded = exact.clone();
+        while padded.len() < keys_per_part as usize {
+            padded.push(*exact.last().expect("at least one key"));
+        }
+        flat.extend(padded);
     }
-    let mut bytes = Vec::new();
-    map.serialize_into(&mut bytes).expect("serialize treemap");
-    base64::engine::general_purpose::STANDARD.encode(bytes)
+    (flat, blobs, filters)
+}
+
+/// A stride coprime to `span`, so `i -> (salt + i*stride) % span` walks every
+/// tenant exactly once.
+fn coprime_stride(span: u64, salt: u64) -> u64 {
+    let mut s = (span / 3).max(1) + salt % 97;
+    while gcd(s, span) != 1 {
+        s += 1;
+    }
+    s % span.max(1)
+}
+
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd(b, a % b) }
 }
 
 /// Row-group key spans, as plan 16 writes them.
@@ -871,28 +1192,83 @@ fn fake_spans() -> serde_json::Value {
 /// interacting, and the only trustworthy way to know it is to ask the question the
 /// product asks. Sampling the hot hypertable alone (the first version of this) is
 /// how a fixture reports a healthy 7 while 99.95% of its tenants resolve to zero.
-async fn tenant_fanout(pool: &PgPool, namespaces: i64) -> anyhow::Result<(i64, i64)> {
+async fn tenant_fanout(pool: &PgPool, namespaces: i64) -> anyhow::Result<Fanout> {
     if namespaces <= 0 {
-        return Ok((0, 0));
+        return Ok(Fanout::default());
     }
-    let mut counts: Vec<i64> = Vec::new();
+    let (mut exact, mut candidates, mut kept) = (Vec::new(), Vec::new(), Vec::new());
     for i in 0..200i64 {
         // Spread across the whole tenant space, so hot-table and cold-table
         // tenants appear in proportion to how many there are.
         let ns = (i * 9973 + 17) % namespaces + 1;
-        let n: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM parts p
-             JOIN logical_tables lt ON lt.hypertable_id = p.hypertable_id
-             WHERE lt.namespace_id = $1 AND p.deleted_by_commit IS NULL
-               AND p.packing_key_min <= $1 AND p.packing_key_max >= $1",
-        )
-        .bind(ns)
-        .fetch_one(pool)
-        .await?;
-        counts.push(n);
+        // The three counts issue 0014 asks for, side by side, for the same tenant:
+        //
+        //   RANGE  — what the catalog used to ship, and what it still fetches from
+        //            the index before deciding;
+        //   FILTER — what the shipped catalog actually returns: the range candidates
+        //            the bounded Bloom filter cannot disprove. The gap to EXACT is
+        //            the filter's false-positive rate, in parts;
+        //   EXACT  — the parts that truly hold the tenant, per the truthful bitmap.
+        //            This is what the provider plans, and the floor to aim at.
+        // The FILTER count uses the product's own predicate, generated by the
+        // product's own code — not a copy of it. A benchmark that reimplements the
+        // thing it measures is measuring its copy.
+        let (c, f, e): (i64, i64, i64) = {
+            let pred = ukiel_core::keyfilter::sql_predicate("p.key_filter", 2);
+            let mut q = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FILTER (WHERE p.packing_key_min <= $1 AND p.packing_key_max >= $1),
+                        count(*) FILTER (WHERE p.packing_key_min <= $1 AND p.packing_key_max >= $1
+                                           AND {pred}),
+                        count(*) FILTER (WHERE (p.packing_keys IS NOT NULL AND p.packing_keys @> ARRAY[$1])
+                                            OR (p.packing_keys IS NULL
+                                                AND p.packing_key_min <= $1 AND p.packing_key_max >= $1))
+                 FROM parts p
+                 JOIN logical_tables lt ON lt.hypertable_id = p.hypertable_id
+                 WHERE lt.namespace_id = $1 AND p.deleted_by_commit IS NULL"
+            )))
+            .bind(ns);
+            for b in ukiel_core::keyfilter::sql_binds(ns) {
+                q = q.bind(b);
+            }
+            q.fetch_one(pool).await?
+        };
+        candidates.push(c);
+        kept.push(f);
+        exact.push(e);
+        // The filter may never lose a part the key set holds. If it ever does, every
+        // latency below it is a lie told about a query that returns too little.
+        if f < e {
+            bail!(
+                "tenant {ns}: the key filter keeps {f} parts but the exact key set says {e} — \
+                 the filter is pruning parts that hold the tenant's rows"
+            );
+        }
     }
-    counts.sort_unstable();
-    Ok((counts[counts.len() / 2], counts[counts.len() * 99 / 100]))
+    candidates.sort_unstable();
+    kept.sort_unstable();
+    exact.sort_unstable();
+    let n = exact.len();
+    Ok(Fanout {
+        exact_p50: exact[n / 2],
+        exact_p99: exact[n * 99 / 100],
+        range_p50: candidates[n / 2],
+        filter_p50: kept[n / 2],
+        filter_p99: kept[n * 99 / 100],
+    })
+}
+
+/// What one tenant's query touches, at each of the three stages issue 0014 measures.
+#[derive(Default, Clone, Copy)]
+struct Fanout {
+    /// Parts whose exact key set holds the tenant — the floor.
+    exact_p50: i64,
+    exact_p99: i64,
+    /// Parts whose declared key *range* brackets the tenant — what the catalog used
+    /// to return.
+    range_p50: i64,
+    /// Parts the bounded key filter cannot disprove — what the catalog returns now.
+    filter_p50: i64,
+    filter_p99: i64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -958,15 +1334,31 @@ async fn summarize(
     .fetch_one(pool)
     .await?;
 
-    let (tenant_parts_p50, tenant_parts_p99) = tenant_fanout(pool, namespaces).await?;
+    let fanout = tenant_fanout(pool, namespaces).await?;
+    // What the fix actually costs: the filter bytes in the rows, and the index that
+    // now carries them in its INCLUDE payload. (The rejected GIN design's cost was
+    // an entry per key; this one's is a wider index tuple per part.)
+    let (packing_keys_bytes, packing_keys_index_bytes): (i64, i64) = sqlx::query_as(
+        "SELECT coalesce(sum(pg_column_size(key_filter)), 0)::bigint,
+                pg_relation_size('parts_live_idx')::bigint
+         FROM parts WHERE deleted_by_commit IS NULL",
+    )
+    .fetch_one(pool)
+    .await?;
 
     Ok(SeedSummary {
         label: label.to_string(),
         state: format!("{state:?}").to_lowercase(),
         logical_tables,
         namespaces,
-        tenant_parts_p50,
-        tenant_parts_p99,
+        tenant_parts_p50: fanout.exact_p50,
+        tenant_parts_p99: fanout.exact_p99,
+        range_candidates_p50: fanout.range_p50,
+        exact_parts_p50: fanout.exact_p50,
+        filter_survivors_p50: fanout.filter_p50,
+        filter_survivors_p99: fanout.filter_p99,
+        packing_keys_bytes,
+        packing_keys_index_bytes,
         tables,
         total_parts: row.get::<i64, _>("total"),
         live_parts: row.get::<i64, _>("live"),
@@ -1113,23 +1505,56 @@ mod tests {
         assert!(State::parse("nope").is_err());
     }
 
-    /// The seeded `column_stats` must be the real shape, or every read measured
-    /// against it is cheaper than the real thing — the JSONB width is part of
-    /// what is being measured.
+    /// The seeded key sets must be **truthful**: the bitmap a part carries has to
+    /// decode back to exactly the keys that part declares, and its min/max have to
+    /// bracket them.
+    ///
+    /// The fixture used to write one constant blob, unrelated to any part's keys.
+    /// That is how the first issue-0014 measurement came to be wrong, and nothing
+    /// downstream of a fictional bitmap — the provider's pruning, the files finally
+    /// planned — could be believed.
     #[test]
-    fn seeded_bitmap_is_a_real_decodable_treemap() {
-        let encoded = fake_bitmap();
-        assert_eq!(
-            ukiel_core::stats::bitmap_contains(&encoded, 1),
-            Some(true),
-            "seed bitmaps must decode with the same reader the provider uses"
-        );
-        assert_eq!(ukiel_core::stats::bitmap_contains(&encoded, 2), Some(false));
-        assert!(
-            encoded.len() > 100,
-            "a one-byte blob would understate TOAST cost"
-        );
+    fn seeded_key_sets_are_truthful() {
+        let (flat, blobs, filters) = key_set_shapes(1_000, 500, 7, 0);
+        // The shapes partition the slice: 500 tenants / 7 per part = 71 shapes.
+        assert_eq!(blobs.len(), 71);
+        assert_eq!(filters.len(), 71);
+        assert_eq!(flat.len(), 71 * 7);
 
+        for (shape, blob) in blobs.iter().enumerate() {
+            let mut keys: Vec<i64> = flat[shape * 7..(shape + 1) * 7].to_vec();
+            keys.sort_unstable();
+            keys.dedup();
+
+            // The bitmap decodes back to the part's own keys — with the reader the
+            // provider itself uses.
+            assert_eq!(
+                ukiel_core::stats::bitmap_keys(blob).as_deref(),
+                Some(keys.as_slice()),
+                "the stored bitmap must be the part's key set, not a stand-in"
+            );
+            // Every key is inside the slice the hypertable owns.
+            assert!(keys.iter().all(|k| (1_000..1_500).contains(k)), "{keys:?}");
+            // And the filter the shape *carries* — the one the fixture will store —
+            // never denies a key the part holds. Rebuilding it here would test the
+            // builder twice and the fixture not at all.
+            let filter = &filters[shape];
+            assert_eq!(
+                Some(filter.clone()),
+                ukiel_core::keyfilter::build(&keys),
+                "the shape's stored filter must be the one its keys build"
+            );
+            for k in &keys {
+                assert!(
+                    ukiel_core::keyfilter::maybe_contains(filter, *k),
+                    "the key filter denied key {k}, which the part holds — data would be lost"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn seeded_spans_are_the_real_shape() {
         let spans = fake_spans();
         assert_eq!(spans.as_array().unwrap().len(), 8);
     }

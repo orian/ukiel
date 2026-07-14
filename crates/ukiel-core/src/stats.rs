@@ -104,6 +104,29 @@ pub fn bitmap_contains(encoded: &str, key: i64) -> Option<bool> {
     Some(map.contains(key as u64))
 }
 
+/// The part's distinct packing keys, decoded from the treemap.
+///
+/// The catalog stores this as a `BIGINT[]` beside the part so PostgreSQL can
+/// answer "does this part hold this tenant?" from a GIN index, instead of
+/// returning the row so the *client* can answer it from the bitmap the row
+/// carried (issue 0014). Roaring is the denser wire form; an array is the one
+/// PostgreSQL can index without an extension, and no managed PostgreSQL offers a
+/// roaring one.
+///
+/// `None` means **undecidable — keep the part**, exactly as [`bitmap_contains`]
+/// does: an undecodable blob, or a key outside `i64`, proves nothing. A part with
+/// no recorded key set falls back to the conservative range predicate.
+pub fn bitmap_keys(encoded: &str) -> Option<Vec<i64>> {
+    let bytes = B64.decode(encoded).ok()?;
+    let map = RoaringTreemap::deserialize_from(&bytes[..]).ok()?;
+    // No cap here any more: the *filter* built from these keys is bounded by
+    // construction (a fixed 256 bytes at worst), so a dense part costs bounded
+    // catalog bytes no matter how many tenants it holds. The old cap existed to
+    // bound an exact key array, and that design was rejected — it wrote one index
+    // entry per key and took commits from 7,815/s to 2,254/s.
+    map.iter().map(|k| i64::try_from(k).ok()).collect()
+}
+
 /// Per-row-group `[min, max]` of the packing key, in file order, read from the
 /// writer's own row-group metadata (call before `close()` — see
 /// `ArrowWriter::flushed_row_groups`).
@@ -438,5 +461,47 @@ mod tests {
         acc.update(&utf8_only);
         assert_eq!(acc.finish(), None);
         assert_eq!(int64_column_stats(&utf8_only), None);
+    }
+}
+
+#[cfg(test)]
+mod issue_0014_tests {
+    use super::*;
+
+    fn encode(keys: impl Iterator<Item = u64>) -> String {
+        let mut map = RoaringTreemap::new();
+        for k in keys {
+            map.insert(k);
+        }
+        let mut bytes = Vec::new();
+        map.serialize_into(&mut bytes).unwrap();
+        B64.encode(bytes)
+    }
+
+    /// The keys come back exactly as written — the filter built from them is what
+    /// is bounded, not this. A dense part costs bounded catalog bytes because the
+    /// *filter* is 256 bytes at worst, never because we threw its keys away.
+    #[test]
+    fn the_key_set_round_trips() {
+        let sparse = encode([7u64, 900, 4_000].into_iter());
+        assert_eq!(bitmap_keys(&sparse), Some(vec![7, 900, 4_000]));
+
+        let dense = encode(0..5_000u64);
+        assert_eq!(
+            bitmap_keys(&dense).map(|k| k.len()),
+            Some(5_000),
+            "a dense part still yields its keys; the filter built from them is what bounds the cost"
+        );
+    }
+
+    /// Undecidable stays undecidable: the caller must keep the part, never assume
+    /// an empty key set.
+    #[test]
+    fn an_undecodable_bitmap_yields_no_key_set() {
+        assert_eq!(bitmap_keys("not base64 roaring"), None);
+        assert_eq!(bitmap_keys(""), None);
+        // An *empty* treemap is decodable and genuinely means "holds no keys" —
+        // distinct from "we could not tell", and it prunes everything.
+        assert_eq!(bitmap_keys(&encode(std::iter::empty())), Some(vec![]));
     }
 }

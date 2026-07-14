@@ -162,14 +162,55 @@ impl PostgresCatalog {
         key: Option<i64>,
         ranges: &[ukiel_core::ColumnRange],
     ) -> Result<Vec<Part>, CatalogError> {
+        // Range first, then a membership test the index can answer (issue 0014).
+        //
+        // The range predicate alone is a *superset*: a packed file whose keys span
+        // 100..4500 "contains" tenant 3000 even when it holds none of its rows,
+        // which is the ordinary case. The key filter rejects exactly those — and it
+        // rides in the range index's INCLUDE payload, so the candidate pass is an
+        // **index-only scan** that never touches the heap for a part it rejects.
+        // Only the survivors are fetched.
+        //
+        // Hence the two-phase shape: an inner pass over the index (`id` and the
+        // filter are both in it), then the surviving rows by primary key. Written as
+        // one flat query, PostgreSQL would have to fetch every candidate row just to
+        // reach the filter column, which is the entire cost this is removing.
+        //
+        // The filter is not *interpreted* here, and the database is not asked to
+        // hash. `keyfilter::sql_predicate` and `keyfilter::sql_binds` are the two
+        // halves of one handoff: the key becomes (byte, bit) pairs once per query,
+        // and SQL merely reads those bytes. The first cut did ask the database to
+        // hash, in plpgsql, and a call per candidate row made the query *slower* than
+        // the scan it replaced while reading a sixth of the buffers.
+        //
+        // Undecidable is keep — a NULL filter (a pre-0012 part, or a single-key part
+        // whose range is already exact), a blob of some size this reader does not
+        // know, an unknown version. Only a *proven* absence prunes, and the provider's
+        // exact bitmap still runs behind this as the backstop.
+        use ukiel_core::keyfilter;
+        // With no key there is no membership question, so the clause is not built and
+        // its binds do not exist. $3.. are the filter's when there is a key; the range
+        // binds follow whatever came before them.
+        let key_binds = key.map(keyfilter::sql_binds);
+        let key_clause = match &key_binds {
+            Some(_) => format!(
+                "AND packing_key_min <= $2 AND packing_key_max >= $2
+                   AND {}",
+                keyfilter::sql_predicate("key_filter", 3)
+            ),
+            None => String::new(),
+        };
+        let after_probes = 3 + key_binds.as_ref().map_or(0, |b| b.len());
         let mut sql = format!(
-            "SELECT {PART_COLUMNS} FROM parts
-             WHERE hypertable_id = $1 AND deleted_by_commit IS NULL
-               AND ($2::BIGINT IS NULL OR (packing_key_min <= $2 AND packing_key_max >= $2))"
+            "SELECT {PART_COLUMNS} FROM parts WHERE id IN (
+                 SELECT id FROM parts
+                 WHERE hypertable_id = $1 AND deleted_by_commit IS NULL
+                   {key_clause}
+             )"
         );
         // Three binds per range: column name, min, max. NULL bind = open bound.
         for i in 0..ranges.len() {
-            let col = 3 + i * 3; // column-name bind
+            let col = after_probes + i * 3; // column-name bind
             let min = col + 1;
             let max = col + 2;
             sql.push_str(&format!(
@@ -184,6 +225,9 @@ impl PostgresCatalog {
 
         let mut query = sqlx::query_as::<_, PartRow>(sqlx::AssertSqlSafe(sql));
         query = query.bind(hypertable_id.0).bind(key);
+        for b in key_binds.iter().flatten() {
+            query = query.bind(*b);
+        }
         for range in ranges {
             query = query.bind(&range.column).bind(range.min).bind(range.max);
         }
