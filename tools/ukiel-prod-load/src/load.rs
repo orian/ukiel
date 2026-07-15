@@ -138,20 +138,30 @@ pub async fn create_hypertable(
         .await
         .with_context(|| format!("creating hypertable '{name}'"))?;
 
-    for tenant in queryable_tenants(m) {
+    create_logical_tables(catalog, id, &queryable_tenants(&m.representatives)).await?;
+    Ok(id)
+}
+
+/// Create one `events` logical table per tenant, in its own namespace. Shared by the
+/// materialized and compaction-input loaders so both exercise the scoped query path the
+/// same way.
+pub async fn create_logical_tables(
+    catalog: &PostgresCatalog,
+    id: HypertableId,
+    tenants: &[i64],
+) -> Result<()> {
+    for &tenant in tenants {
         catalog
             .create_logical_table(ukiel_core::NamespaceId(tenant), "events", id)
             .await
             .with_context(|| format!("creating 'events' for tenant {tenant}"))?;
     }
-
-    Ok(id)
+    Ok(())
 }
 
 /// The tenants a benchmark may open a scoped session as: the five representative
 /// classes plus the deterministic sample, deduplicated.
-pub fn queryable_tenants(m: &Manifest) -> Vec<i64> {
-    let r = &m.representatives;
+pub fn queryable_tenants(r: &prod_synth_contract::Representatives) -> Vec<i64> {
     let mut all: Vec<i64> = vec![
         r.heavy,
         r.median,
@@ -260,23 +270,27 @@ pub async fn load_materialized(
 
 /// Build one part's catalog metadata from the file's own bytes, with the product's
 /// own stats builders.
-fn part_meta(
-    key: &str,
-    bytes: &[u8],
-    part: &prod_synth_contract::ManifestPart,
-    size_bytes: i64,
-    manifest: &Manifest,
-) -> Result<PartMeta> {
-    let packing_key = &manifest.table.packing_key;
+/// The catalog metadata read back from one Parquet object's actual bytes.
+pub struct PartFacts {
+    pub rows: i64,
+    pub key_min: i64,
+    pub key_max: i64,
+    pub column_stats: Option<serde_json::Value>,
+}
 
+/// Derive a part's stats and key index from the **file's own bytes**, through the
+/// product's own accumulators — the same ones the streaming compactor uses, so the JSON
+/// shape cannot drift between a loaded fixture and a real merge output.
+///
+/// Shared by both loaders. Neither trusts a precomputed key filter: the roaring bitmap,
+/// and therefore the catalog's issue-0014 Bloom filter, is always derived from the bytes
+/// that actually landed in the object store.
+pub fn read_part_facts(key: &str, bytes: &[u8], packing_key: &str) -> Result<PartFacts> {
     let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(bytes))
         .with_context(|| format!("opening {key}"))?;
     let parquet_meta = reader.metadata().clone();
     let reader = reader.build().with_context(|| format!("reading {key}"))?;
 
-    // Fold every batch through the product's accumulators — the same ones the
-    // streaming compactor uses, so the JSON shape cannot drift between a fixture and
-    // a real merge output.
     let mut stats = ukiel_core::stats::Int64StatsAccumulator::default();
     let mut keys = ukiel_core::stats::KeyBitmapAccumulator::default();
     let mut rows = 0i64;
@@ -306,27 +320,46 @@ fn part_meta(
         }
     }
 
-    if rows != part.rows as i64 {
+    // The key index, gated exactly as every product writer gates it: multi-key parts
+    // only. A single-key file's `packing_key_min == packing_key_max` already *is* its
+    // key set, so the range predicate is exact for it and a bitmap would be overhead.
+    let bitmap = (key_min != key_max).then(|| keys.finish()).flatten();
+    let spans = ukiel_core::stats::key_row_groups(parquet_meta.row_groups(), packing_key);
+    let column_stats = ukiel_core::stats::with_key_index(stats.finish(), bitmap, spans);
+
+    Ok(PartFacts {
+        rows,
+        key_min,
+        key_max,
+        column_stats,
+    })
+}
+
+fn part_meta(
+    key: &str,
+    bytes: &[u8],
+    part: &prod_synth_contract::ManifestPart,
+    size_bytes: i64,
+    manifest: &Manifest,
+) -> Result<PartMeta> {
+    let facts = read_part_facts(key, bytes, &manifest.table.packing_key)?;
+
+    if facts.rows != part.rows as i64 {
         bail!(
-            "{key}: the file holds {rows} rows, the manifest says {}",
+            "{key}: the file holds {} rows, the manifest says {}",
+            facts.rows,
             part.rows
         );
     }
-    if key_min != part.key_min || key_max != part.key_max {
+    if facts.key_min != part.key_min || facts.key_max != part.key_max {
         bail!(
-            "{key}: the file's key range is [{key_min}, {key_max}], the manifest says [{}, {}]",
+            "{key}: the file's key range is [{}, {}], the manifest says [{}, {}]",
+            facts.key_min,
+            facts.key_max,
             part.key_min,
             part.key_max
         );
     }
-
-    // The key index, gated exactly as every product writer gates it: multi-key parts
-    // only. A single-key file's `packing_key_min == packing_key_max` already *is* its
-    // key set, so the range predicate is exact for it and a bitmap would be overhead.
-    let multi_key = key_min != key_max;
-    let bitmap = multi_key.then(|| keys.finish()).flatten();
-    let spans = ukiel_core::stats::key_row_groups(parquet_meta.row_groups(), packing_key);
-    let column_stats = ukiel_core::stats::with_key_index(stats.finish(), bitmap, spans);
 
     Ok(PartMeta {
         path: key.to_string(),
@@ -334,16 +367,16 @@ fn part_meta(
         partition_values: serde_json::json!({
             "source_partition": part.provenance.source_partition_id.to_string()
         }),
-        packing_key_min: key_min,
-        packing_key_max: key_max,
-        row_count: rows,
+        packing_key_min: facts.key_min,
+        packing_key_max: facts.key_max,
+        row_count: facts.rows,
         // The object's real size, from the store's own HEAD.
         size_bytes,
         // A fixed non-L0 level, so an idle benchmark is stable. NOT the source's
         // ClickHouse merge level, which is provenance and is never mapped onto Ukiel's
         // compaction ladder.
         level: 1,
-        column_stats,
+        column_stats: facts.column_stats,
     })
 }
 

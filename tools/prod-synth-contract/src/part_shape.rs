@@ -103,6 +103,11 @@ pub struct L0Manifest {
     /// The Ukiel table spec, verbatim from the source manifest — schema, sort key,
     /// packing key, ts column.
     pub table: crate::TableSpec,
+    /// The source fixture's representative tenants, carried forward so the staged
+    /// artifact is self-sufficient for loading: the compaction-input loader creates one
+    /// scoped `events` table per queryable tenant from this, and never needs the source
+    /// artifact's path.
+    pub representatives: crate::Representatives,
     /// Rows read from the source artifact.
     pub input_rows: u64,
     /// Rows written across all L0 files. Must equal `input_rows`: staging regroups rows,

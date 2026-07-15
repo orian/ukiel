@@ -84,6 +84,51 @@ Pass `--keep` when a benchmark run intends to measure the seeded catalog —
 `ukiel-prod-bench catalog` needs it to still be there. You then own the cleanup, and the
 tool prints the command.
 
+## Compaction-input (plan 46)
+
+```bash
+ukiel-prod-load compaction-input \
+  --l0-manifest bench/datasets/prod-synth-l0/baseline/l0-manifest.json \
+  --label baseline-packed --config bench/config/prod-synth-compactor.toml \
+  --receipt out/baseline-packed/receipt.json \
+  --placement packed|separated|size-targeted [--target-file-mb 256] \
+  --ephemeral [--allow-hypertable NAME ...]
+```
+
+Loads a **staged L0 artifact** (`prod-synth-l0`) as real compaction input, so a live
+compactor can turn it into final parts. It differs from `materialized` in three ways
+that all matter:
+
+- **Level 0, one commit per file.** Each staged file becomes its own `created_by_commit`
+  — an independent L0 run. A single bulk commit would make the whole fixture one run and
+  the compactor would have nothing to merge. This is the load-bearing difference:
+  measuring the *compactor's* output requires feeding it the ladder's actual input.
+- **A real UTC-day partition.** Every part's `partition_values` carries
+  `{l0_manifest, utc_day}`. Compaction preserves partition values, so a final part still
+  carries the marker and the runner can prove it descends from this exact staged
+  artifact — even though REPLACE has destroyed every original path and count. (The
+  source's ClickHouse partition hash still chooses nothing.)
+- **The selected placement** is set on the hypertable, so the compactor's size cuts and
+  key handling are the ones under test.
+
+Metadata is derived from the uploaded bytes through the product's own accumulators — no
+precomputed key filter is trusted. Object HEAD, catalog, and manifest rows/bytes are
+each measured independently and must agree.
+
+### Safety
+
+`--ephemeral` is mandatory. The load also refuses a catalog holding any hypertable not
+named `prod_synth_events_*` unless you pass `--allow-hypertable NAME` for each — a
+stranger's table means this is probably not the disposable stack you meant. A **fresh
+label** is required; a partial pre-existing load is dropped deliberately, never resumed.
+
+The receipt is published **atomically, only after the final successful commit**. A
+failed load leaves no receipt and prints the exact reset SQL.
+
+One fixture per catalog: logical tables are keyed by `(namespace_id, name)` globally, so
+a tenant's `events` table can belong to only one fixture per catalog. Each placement arm
+gets its own disposable stack — which is exactly what the plan-46 matrix prescribes.
+
 ## Note on the schema
 
 The catalog schema is a single initial migration, applied to an empty database. A

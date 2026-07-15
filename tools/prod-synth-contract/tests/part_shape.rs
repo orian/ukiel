@@ -5,6 +5,17 @@ use prod_synth_contract::{
     PlacementSpec, RowFingerprint, SYNTHETIC_DISCLAIMER, TableSpec,
 };
 
+fn representatives() -> prod_synth_contract::Representatives {
+    prod_synth_contract::Representatives {
+        heavy: 900,
+        median: 450,
+        light: 1,
+        high_overfetch: 700,
+        low_overfetch: 44,
+        sample: vec![1, 100, 450, 900],
+    }
+}
+
 fn table() -> TableSpec {
     TableSpec {
         packing_key: "team_id".into(),
@@ -36,6 +47,7 @@ fn l0_manifest() -> L0Manifest {
             seed: 0,
         },
         table: table(),
+        representatives: representatives(),
         input_rows: 100,
         output_rows: 100,
         fingerprint: fingerprint(),

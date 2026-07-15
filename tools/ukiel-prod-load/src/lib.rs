@@ -28,9 +28,40 @@
 //! rather than quietly merging a file that was never there.
 
 pub mod catalog_only;
+pub mod compaction_input;
 pub mod load;
 
 pub use load::{LoadError, LoadReport, Loaded};
+
+use anyhow::{Result, bail};
+use ukiel_catalog::PostgresCatalog;
+
+/// Refuse to write into a catalog that holds hypertables this experiment did not create,
+/// unless the operator has explicitly named them as expected.
+///
+/// The part-shape experiment mutates a catalog and an object store, and it is only safe
+/// on a stack you are willing to throw away. This is the tripwire: a catalog with a
+/// stranger's `events` table in it is probably not that stack, and loading into it —
+/// then, worse, cleaning up after — could touch data nobody meant to expose to a
+/// benchmark. Every experiment hypertable is named `prod_synth_events_*`; anything else
+/// must be on the allow-list or the load stops.
+pub async fn require_disposable_catalog(catalog: &PostgresCatalog, allow: &[String]) -> Result<()> {
+    let unexpected: Vec<String> = catalog
+        .list_hypertables()
+        .await?
+        .into_iter()
+        .map(|h| h.name)
+        .filter(|n| !n.starts_with("prod_synth_events_") && !allow.contains(n))
+        .collect();
+    if !unexpected.is_empty() {
+        bail!(
+            "this catalog holds hypertables the part-shape experiment did not create: {unexpected:?}. \
+             It may not be a disposable stack. Point --config at a throwaway catalog, or pass \
+             --allow-hypertable for each one you have verified is safe to run alongside."
+        );
+    }
+    Ok(())
+}
 
 /// The hypertable a fixture is loaded as: `prod_synth_events_<label>`.
 ///

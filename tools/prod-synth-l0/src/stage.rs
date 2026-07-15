@@ -274,6 +274,7 @@ fn write_all(
             seed: manifest.config.seed,
         },
         table: manifest.table.clone(),
+        representatives: manifest.representatives.clone(),
         input_rows: w.input_rows,
         output_rows: w.output_rows,
         fingerprint,
