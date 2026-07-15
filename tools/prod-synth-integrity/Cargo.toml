@@ -1,0 +1,23 @@
+[package]
+name = "prod-synth-integrity"
+version.workspace = true
+edition.workspace = true
+description = "Order-independent row-multiset fingerprint shared by the prod-synth L0 stager and the part-shape runner."
+
+# A pure integrity guard for plan 46: it proves that the rows a fixture holds after
+# compaction are the *same multiset* of rows it held as staged L0 input, even though
+# compaction rewrites every file, every path, and every grouping. It is an
+# experiment guard, not a database checksum and not a public storage format.
+#
+# It depends on Arrow (to read the batches) and BLAKE3 (the hash), and on NO Ukiel
+# service or client crate — not even ukiel-core. The canonical row encoding lives
+# here, once, so the stager and the runner cannot drift; tests/boundary.rs enforces
+# the dependency floor.
+
+[dependencies]
+arrow = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

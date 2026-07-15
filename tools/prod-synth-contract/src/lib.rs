@@ -19,11 +19,16 @@
 use serde::{Deserialize, Serialize};
 
 pub mod manifest;
+pub mod part_shape;
 
 pub use manifest::{
     FidelityCheck, GeneratedSummary, GenerationConfig, Generator, Manifest, ManifestPart,
     Membership, PartProvenance, Quantiles, Representatives, SourceProfile, SourceSummary,
     TableSpec, Tenant, Tier, Topology, TopologyShard, ValueModel, WeightedValue,
+};
+pub use part_shape::{
+    ExpectedCompactorConfig, L0File, L0Manifest, L0StagingConfig, PART_SHAPE_RECEIPT_VERSION,
+    PROD_SYNTH_L0_VERSION, PartShapeReceipt, PlacementSpec, RowFingerprint,
 };
 
 /// The manifest/topology format both files declare and every reader checks.

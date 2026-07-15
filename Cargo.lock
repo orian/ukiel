@@ -3371,6 +3371,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "prod-synth-integrity"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "blake3",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "prod-synth-l0"
+version = "0.1.0"
+
+[[package]]
 name = "prost"
 version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

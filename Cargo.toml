@@ -17,6 +17,10 @@ members = [
     "tools/prod-synth",
     "tools/ukiel-prod-load",
     "tools/ukiel-prod-bench",
+    # Plan 46 (actual part shape). A pure row-multiset fingerprint shared by the L0
+    # stager and the part-shape runner, and the offline L0 stager itself.
+    "tools/prod-synth-integrity",
+    "tools/prod-synth-l0",
 ]
 
 [workspace.package]
@@ -79,6 +83,7 @@ ukiel-gc = { path = "crates/ukiel-gc" }
 ukiel-expr = { path = "crates/ukiel-expr" }
 ukield = { path = "crates/ukield" }
 prod-synth-contract = { path = "tools/prod-synth-contract" }
+prod-synth-integrity = { path = "tools/prod-synth-integrity" }
 # Plan 45: the generator must build without a service client in the graph, so it
 # takes its CLI from `clap` and nothing else new.
 clap = { version = "4", features = ["derive"] }
