@@ -1,0 +1,11 @@
+# Block E: Bloom filter on distinct_id at FPP 0.01.
+label = "blooms-distinct-id-01"
+row_group_rows = 131072
+compression = "zstd(3)"
+[[column]]
+name = "distinct_id"
+bloom_fpp = 0.01
+[[column]]
+name = "timestamp"
+encoding = "delta_binary_packed"
+dictionary = false

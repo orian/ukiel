@@ -1,0 +1,10 @@
+# Block A: data page target 256 KiB.
+label = "pages-page-256k"
+row_group_rows = 131072
+data_page_bytes = 262144
+compression = "zstd(3)"
+statistics = "page"
+[[column]]
+name = "timestamp"
+encoding = "delta_binary_packed"
+dictionary = false

@@ -1,0 +1,8 @@
+# Block D: store the millisecond timestamp as an Arrow Timestamp(Millisecond) while the
+# logical view still presents it as the declared millisecond epoch.
+label = "types-ts-timestamp"
+row_group_rows = 131072
+compression = "zstd(3)"
+[[column]]
+name = "timestamp"
+physical_type = "timestamp_ms"

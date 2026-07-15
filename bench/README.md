@@ -1405,3 +1405,32 @@ honest remainder — no longer a systematic tax, just per-query shape.
 ### 100M / 1B tiers — optional / stretch
 
 100M Bluesky is a documented long run; 1B needs `--wave-files` and hours.
+
+## Plan 47: parquet storage laboratory
+
+`bench/parquet-lab.sh` orchestrates ONE block of the storage matrix over an immutable
+snapshot and a compiled suite. It implements no snapshot, rewrite, index, or query logic —
+it invokes the tool CLIs in order (census + bench of the product-control original bytes,
+then for each variant spec: `parquet-rewrite` → `parquet-census` → `parquet-lab-bench`) and
+writes a run directory. Every block reruns the product control so machine drift stays
+visible.
+
+```bash
+# Prepare the control once: an immutable snapshot + a compiled suite.
+parquet-lab-snapshot from-ukiel --receipt R.json --config C.toml --output SNAP     # or from-files
+parquet-lab-bench compile --manifest SNAP/manifest.json --kind prod-synth \
+  --sql bench/queries/prod-synth/queries.sql --suite-out suite.json
+
+# Run one block (A–E live under bench/config/parquet-lab/{pages,encodings,compression,types,blooms}).
+bench/parquet-lab.sh --snapshot SNAP --suite suite.json \
+  --block bench/config/parquet-lab/pages --out runs/pages --mode object-store --warm 5 --replace
+
+# Classify the raw reports (noise band, dominated / Pareto / workload-specific).
+bench/parquet-lab-analyze.py --run runs/pages
+```
+
+Selection is analysis over the immutable raw JSON, never a mutation of a spec: the noise
+band is `max(5%, 3·MAD(control reps)/median)` per dimension, and the chosen candidate stays
+an explicit digest a human carries forward. `bench/config/parquet-lab/product-control.toml`
+documents the product's writer policy for comparison but is never rewritten — the original
+snapshot bytes are the control. Refusal behaviour is covered by `bench/tests/parquet-lab.sh`.

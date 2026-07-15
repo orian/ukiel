@@ -677,20 +677,20 @@ git commit -m "bench: compare parquet variants with exact query and io accountin
 - Create: `bench/tests/parquet-lab.bats` or the repository's shell-test convention
 - Modify: `bench/README.md`
 
-- [ ] **Step 1: Encode Blocks A–E as explicit specs.** Every spec changes one
+- [x] **Step 1: Encode Blocks A–E as explicit specs.** Every spec changes one
   axis from its block control and has a stable label. The script runs one block,
   never an implicit all-night matrix.
-- [ ] **Step 2: Test orchestration/refusal without large data.** Missing
+- [x] **Step 2: Test orchestration/refusal without large data.** Missing
   manifests, reused output, spec/parent mismatch, invalid stage order, absent
   control, and partial reports fail before a benchmark claim is emitted.
-- [ ] **Step 3: Run the complete smoke matrix.** Every variant fingerprints
+- [x] **Step 3: Run the complete smoke matrix.** Every variant fingerprints
   equal, every query answer matches, every requested property is confirmed by
   census, and local/object-store accounting balances.
-- [ ] **Step 4: Add selection/confirmation logic to reports, not the writer.**
+- [x] **Step 4: Add selection/confirmation logic to reports, not the writer.**
   Compute the registered noise band, dominated/Pareto/workload-specific labels,
   and carry-forward candidates. Do not mutate later TOML specs automatically;
   the chosen digest is explicit.
-- [ ] **Step 5: Verify shell, workspace, and commit.**
+- [x] **Step 5: Verify shell, workspace, and commit.**
 
 ```bash
 bash -n bench/parquet-lab.sh

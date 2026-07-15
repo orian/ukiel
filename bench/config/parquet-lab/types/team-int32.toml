@@ -1,0 +1,11 @@
+# Block D: pack the tenant key as Int32 (census must prove every value fits).
+label = "types-team-int32"
+row_group_rows = 131072
+compression = "zstd(3)"
+[[column]]
+name = "team_id"
+physical_type = "int32"
+[[column]]
+name = "timestamp"
+encoding = "delta_binary_packed"
+dictionary = false

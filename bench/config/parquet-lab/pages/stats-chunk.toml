@@ -1,0 +1,10 @@
+# Block A: chunk statistics only (control writes page statistics + offset index).
+label = "pages-stats-chunk"
+row_group_rows = 131072
+statistics = "chunk"
+offset_index = false
+compression = "zstd(3)"
+[[column]]
+name = "timestamp"
+encoding = "delta_binary_packed"
+dictionary = false

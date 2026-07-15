@@ -1,0 +1,8 @@
+# Block C: whole-file LZ4_RAW.
+label = "compression-lz4-raw"
+row_group_rows = 131072
+compression = "lz4_raw"
+[[column]]
+name = "timestamp"
+encoding = "delta_binary_packed"
+dictionary = false

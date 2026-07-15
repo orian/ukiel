@@ -1,0 +1,8 @@
+# Block C: whole-file SNAPPY.
+label = "compression-snappy"
+row_group_rows = 131072
+compression = "snappy"
+[[column]]
+name = "timestamp"
+encoding = "delta_binary_packed"
+dictionary = false

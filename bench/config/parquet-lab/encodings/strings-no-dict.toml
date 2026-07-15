@@ -1,0 +1,12 @@
+# Block B: promoted string columns with the dictionary disabled, delta-length fallback.
+label = "encodings-strings-no-dict"
+row_group_rows = 131072
+compression = "zstd(3)"
+[[column]]
+name = "mat_$current_url"
+encoding = "delta_length_byte_array"
+dictionary = false
+[[column]]
+name = "mat_$lib"
+encoding = "delta_length_byte_array"
+dictionary = false

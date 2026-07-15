@@ -1,0 +1,8 @@
+# Block C: whole-file ZSTD level 3.
+label = "compression-zstd-3"
+row_group_rows = 131072
+compression = "zstd(3)"
+[[column]]
+name = "timestamp"
+encoding = "delta_binary_packed"
+dictionary = false

@@ -1,0 +1,8 @@
+# Block B: timestamp PLAIN instead of DELTA_BINARY_PACKED, dictionary off.
+label = "encodings-ts-plain"
+row_group_rows = 131072
+compression = "zstd(3)"
+[[column]]
+name = "timestamp"
+encoding = "plain"
+dictionary = false

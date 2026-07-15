@@ -1,0 +1,9 @@
+# Block A: row-group cap 32k (control is 128k). One axis changed.
+label = "pages-rowgroup-32k"
+row_group_rows = 32768
+compression = "zstd(3)"
+statistics = "page"
+[[column]]
+name = "timestamp"
+encoding = "delta_binary_packed"
+dictionary = false

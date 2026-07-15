@@ -1,0 +1,9 @@
+# Block A: row-group cap 512k.
+label = "pages-rowgroup-512k"
+row_group_rows = 524288
+compression = "zstd(3)"
+statistics = "page"
+[[column]]
+name = "timestamp"
+encoding = "delta_binary_packed"
+dictionary = false
