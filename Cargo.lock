@@ -3216,6 +3216,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "parquet-lab-snapshot"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "bytes",
+ "clap",
+ "futures",
+ "object_store",
+ "parquet",
+ "parquet-lab-contract",
+ "parquet-lab-integrity",
+ "prod-synth-contract",
+ "prod-synth-integrity",
+ "prod-synth-l0",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "testcontainers-modules",
+ "tokio",
+ "ukiel-catalog",
+ "ukiel-compactor",
+ "ukiel-core",
+ "ukiel-prod-load",
+ "ukield",
+]
+
+[[package]]
 name = "parse-display"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

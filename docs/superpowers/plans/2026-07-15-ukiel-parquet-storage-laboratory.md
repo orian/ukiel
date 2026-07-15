@@ -471,21 +471,21 @@ welcome; a production configuration with dozens of per-column switches is not.
 - Test: `tools/parquet-lab-contract/tests/contracts.rs`
 - Test: `tools/parquet-lab-integrity/tests/{golden,types,boundary}.rs`
 
-- [ ] **Step 1: Write failing contract tests.** Cover every version, digest
+- [x] **Step 1: Write failing contract tests.** Cover every version, digest
   binding, relative-path rule, duplicate file/variant labels, incomplete
   resolved properties, unknown index kinds, and atomic-report identity fields.
-- [ ] **Step 2: Write logical fingerprint golden/property tests.** Cover
+- [x] **Step 2: Write logical fingerprint golden/property tests.** Cover
   `Int64`/lossless `Int32` equivalence under declared `int64`, timestamp
   normalization, null versus zero/empty, `Utf8` versus `Utf8View`, batch/file
   order independence, duplicate sensitivity, lossy narrowing refusal, and an
   unsupported type failing closed.
-- [ ] **Step 3: Implement the two pure libraries.** Contract has serde/BLAKE3
+- [x] **Step 3: Implement the two pure libraries.** Contract has serde/BLAKE3
   only; integrity adds Arrow but no Parquet reader, DataFusion, Ukiel, or
   service client. Reuse a canonical encoder once—snapshot and rewrite must not
   implement it independently.
-- [ ] **Step 4: Pin dependency boundaries via `cargo metadata`.** An executable
+- [x] **Step 4: Pin dependency boundaries via `cargo metadata`.** An executable
   is not added in this task.
-- [ ] **Step 5: Verify and commit.**
+- [x] **Step 5: Verify and commit.**
 
 ```bash
 cargo test -p parquet-lab-contract -p parquet-lab-integrity
@@ -514,21 +514,21 @@ parquet-lab-snapshot from-files \
 parquet-lab-snapshot verify --manifest FILE
 ```
 
-- [ ] **Step 1: Write failing local snapshot tests.** Explicit sorted inputs
+- [x] **Step 1: Write failing local snapshot tests.** Explicit sorted inputs
   produce byte-identical copied files and a deterministic manifest; altered,
   added, missing, duplicated, absolute/traversing, or implicitly discovered
   files fail verification.
-- [ ] **Step 2: Write the Plan 46 adapter integration test.** A smoke receipt
+- [x] **Step 2: Write the Plan 46 adapter integration test.** A smoke receipt
   must be converged and fully marked; catalog rows, object HEAD, downloaded
   bytes, row census, physical fingerprint, and logical fingerprint all agree.
   The command performs no SQL mutation and refuses an unconverged fixture.
-- [ ] **Step 3: Implement bounded streaming download/copy.** Never hold a full
+- [x] **Step 3: Implement bounded streaming download/copy.** Never hold a full
   part in memory; write to a temporary sibling and rename only after all
   digests/fingerprints close.
-- [ ] **Step 4: Enforce boundaries.** `from-files` and `verify` must not need a
+- [x] **Step 4: Enforce boundaries.** `from-files` and `verify` must not need a
   service. Keep Plan 46 parsing in the adapter; do not move snapshot behavior
   into `ukiel-prod-bench`.
-- [ ] **Step 5: Verify installability, help, and commit.**
+- [x] **Step 5: Verify installability, help, and commit.**
 
 ```bash
 cargo test -p parquet-lab-snapshot

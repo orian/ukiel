@@ -1,0 +1,45 @@
+[package]
+name = "parquet-lab-snapshot"
+version.workspace = true
+edition.workspace = true
+description = "Freeze an explicit set of Parquet files (or a plan-46 compacted load) into a verified, immutable laboratory snapshot."
+
+# The one laboratory tool that may be service-aware — and only through its
+# `from-ukiel` adapter. `from-files` and `verify` read local Parquet and touch no
+# catalog, object store, Kafka, or HTTP; the boundary test keeps that honest so the
+# offline tools stay usable on any explicit dataset (the ClickBench slice, or anyone
+# else's Parquet). It writes only its selected output directory.
+
+[dependencies]
+parquet-lab-contract = { workspace = true }
+parquet-lab-integrity = { workspace = true }
+prod-synth-contract = { workspace = true }
+prod-synth-integrity = { workspace = true }
+ukiel-core = { workspace = true }
+ukiel-catalog = { workspace = true }
+ukield = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true, features = ["async", "object_store"] }
+object_store = { workspace = true, features = ["aws"] }
+bytes = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+testcontainers-modules = { workspace = true }
+# TEST ONLY — the from-ukiel adapter test loads a smoke fixture and drives the real
+# compactor in-harness, exactly as the plan-46 part-shape test does. Not a normal
+# dependency: the shipped snapshot binary never loads or compacts anything.
+ukiel-prod-load = { path = "../ukiel-prod-load" }
+ukiel-compactor = { workspace = true }
+object_store = { workspace = true }
+prod-synth-l0 = { path = "../prod-synth-l0" }
+
+[[bin]]
+name = "parquet-lab-snapshot"
+path = "src/main.rs"

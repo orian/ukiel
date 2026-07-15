@@ -27,6 +27,7 @@ members = [
     # tools. No executable package depends on another executable package.
     "tools/parquet-lab-contract",
     "tools/parquet-lab-integrity",
+    "tools/parquet-lab-snapshot",
 ]
 
 [workspace.package]
@@ -90,6 +91,8 @@ ukiel-expr = { path = "crates/ukiel-expr" }
 ukield = { path = "crates/ukield" }
 prod-synth-contract = { path = "tools/prod-synth-contract" }
 prod-synth-integrity = { path = "tools/prod-synth-integrity" }
+parquet-lab-contract = { path = "tools/parquet-lab-contract" }
+parquet-lab-integrity = { path = "tools/parquet-lab-integrity" }
 # Plan 45: the generator must build without a service client in the graph, so it
 # takes its CLI from `clap` and nothing else new.
 clap = { version = "4", features = ["derive"] }
