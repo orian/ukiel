@@ -62,6 +62,28 @@ def suite_totals(report):
     return [sum(q["warm_ms"][i] for q in qs) for i in range(n)], None
 
 
+def per_query_stats(reps):
+    """Per-query warm median/MAD and result rows across all of a label's reports — so a
+    suite-total win that is actually workload-specific (broad vs selective classes moving
+    apart) is visible, not hidden."""
+    warm = {}   # name -> [samples...]
+    rows = {}   # name -> last observed result_rows
+    for _entry, rep in reps:
+        for q in rep["body"]["queries"]:
+            warm.setdefault(q["name"], []).extend(q.get("warm_ms", []))
+            if q.get("result_rows") is not None:
+                rows[q["name"]] = q["result_rows"]
+    out = []
+    for name in sorted(warm):
+        out.append({
+            "query": name,
+            "warm_median_ms": round(median(warm[name]), 3),
+            "warm_mad_ms": round(mad(warm[name]), 3),
+            "result_rows": rows.get(name),
+        })
+    return out
+
+
 def classify(size_delta, time_delta, size_band, time_band):
     size_better, size_worse = size_delta < -size_band, size_delta > size_band
     time_better, time_worse = time_delta < -time_band, time_delta > time_band
@@ -149,32 +171,59 @@ def analyze(run_set, rep_dirs):
 
     control_bytes = census_bytes(rep_dirs[0], CONTROL)
 
+    # Per-repetition control median, so a variant's delta is measured against the control of
+    # its own repetition (drift-robust).
+    control_rep_median = {}
+    for r in reps_seen:
+        pool_r = [per_control[(rr, o)] for (rr, o) in per_control if rr == r]
+        control_rep_median[r] = median(pool_r)
+
     variants = []
     for label, reps in sorted(by_label.items()):
         if label == CONTROL:
             continue
         pool = []
         matched = True
+        per_rep = {}
         for entry, rep in reps:
             ts, reason = suite_totals(rep)
             if reason:
                 exclusions.append({"label": label, "reason": reason})
             pool.extend(ts)
-            # Correctness gate: every query answer matched the control.
+            per_rep.setdefault(entry["repetition"], []).extend(ts)
             if not all(q.get("expected_match", False) for q in rep["body"]["queries"]):
                 matched = False
+
         v_median = median(pool)
         time_delta = (v_median - control_median) / control_median if control_median else 0.0
         v_bytes = census_bytes(rep_dirs[0], label)
         size_delta = ((v_bytes - control_bytes) / control_bytes) if (v_bytes and control_bytes) else 0.0
-        cls = "REJECTED-answer-changed" if not matched else classify(size_delta, time_delta, size_band, time_band)
+
+        # Per-repetition deltas vs that repetition's own control. Repetitions must agree in
+        # direction before an arm is a candidate; opposing signs beyond noise are `unstable`.
+        rep_deltas = {}
+        for r, ts in per_rep.items():
+            cm = control_rep_median.get(r, control_median)
+            rep_deltas[r] = ((median(ts) - cm) / cm) if cm else 0.0
+        signs = [1 if d > time_band else (-1 if d < -time_band else 0) for d in rep_deltas.values()]
+        opposing = (1 in signs) and (-1 in signs)
+
+        if not matched:
+            cls = "REJECTED-answer-changed"
+        elif opposing:
+            cls = "unstable"
+        else:
+            cls = classify(size_delta, time_delta, size_band, time_band)
+
         variants.append({
             "variant": label,
             "answers_match": matched,
             "reps": len(reps),
             "time_median_ms": round(v_median, 3),
             "time_delta_pct": round(time_delta * 100, 2),
+            "per_rep_time_delta_pct": {r: round(d * 100, 2) for r, d in sorted(rep_deltas.items())},
             "size_delta_pct": round(size_delta * 100, 2),
+            "per_query": per_query_stats(reps),
             "classification": cls,
         })
 
@@ -199,11 +248,39 @@ def analyze(run_set, rep_dirs):
     }
 
 
+def to_markdown(result):
+    lines = ["# Parquet storage screen — analysis\n"]
+    lines.append(f"- seed: `{result['seed']}`  repetitions: {result['repetitions']}")
+    lines.append(f"- control: {result['control_bytes']} compressed bytes, {result['control_median_ms']} ms warm median")
+    lines.append(f"- suite digest: `{result['suite_digest']}`  control digest: `{result['control_digest']}`")
+    lines.append(f"- noise bands: size {result['size_band']*100:.1f}% (threshold), time {result['time_band']*100:.1f}%")
+    lines.append("\n## Formulas\n")
+    for k, v in result["formulas"].items():
+        lines.append(f"- `{k}` = {v}")
+    lines.append("\n## Control drift\n\n| rep | start ms | end ms | drift % | exceeds |")
+    lines.append("|---|---|---|---|---|")
+    for d in result["control_drift"]:
+        lines.append(f"| {d['repetition']} | {d['start_ms']} | {d['end_ms']} | {d['drift_pct']} | {d['exceeds_noise']} |")
+    lines.append("\n## Variants\n\n| variant | size Δ% | time Δ% | per-rep time Δ% | classification |")
+    lines.append("|---|---|---|---|---|")
+    for v in result["variants"]:
+        lines.append(f"| {v['variant']} | {v['size_delta_pct']} | {v['time_delta_pct']} | "
+                     f"{v['per_rep_time_delta_pct']} | {v['classification']} |")
+    if result["exclusions"]:
+        lines.append("\n## Exclusions\n")
+        for e in result["exclusions"]:
+            lines.append(f"- {e}")
+    lines.append("\n## Scheduled order\n")
+    lines.append("`" + " → ".join(result["order"]) + "`")
+    return "\n".join(lines) + "\n"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-set", required=True)
     ap.add_argument("--reports", nargs="+", required=True)
     ap.add_argument("--json-out")
+    ap.add_argument("--md-out")
     args = ap.parse_args()
     run_set = read_json(args.run_set)
     result = analyze(run_set, args.reports)
@@ -220,7 +297,11 @@ def main():
         print(f"{v['variant']:32} {v['size_delta_pct']:>8} {v['time_delta_pct']:>8}  {v['classification']}")
 
     if args.json_out:
-        json.dump(result, open(args.json_out, "w"), indent=2)
+        with open(args.json_out, "w") as fh:
+            json.dump(result, fh, indent=2)
+    if args.md_out:
+        with open(args.md_out, "w") as fh:
+            fh.write(to_markdown(result))
     return 0
 
 

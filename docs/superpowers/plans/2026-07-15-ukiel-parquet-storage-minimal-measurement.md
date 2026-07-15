@@ -300,20 +300,20 @@ python3 bench/parquet-lab-run-set.py close \
 - Modify: `bench/parquet-lab-analyze.py`
 - Modify: `bench/tests/test_parquet_lab_analyze.py`
 
-- [ ] **Step 1: Require repetition agreement.** Report each repetition's warm
+- [x] **Step 1: Require repetition agreement.** Report each repetition's warm
   suite median and delta separately. An apparent pooled win whose repetitions
   have opposing signs is `unstable`, not a candidate.
-- [ ] **Step 2: Keep per-query evidence.** Report median/MAD and decoded-row/
+- [x] **Step 2: Keep per-query evidence.** Report median/MAD and decoded-row/
   row-group metrics for every base query and probe. A suite-total win may still
   be workload-specific when broad and selective classes move differently.
-- [ ] **Step 3: Classify only size and local reads.** Use exact compressed bytes
+- [x] **Step 3: Classify only size and local reads.** Use exact compressed bytes
   with a 5% decision threshold and the registered local-time noise band. Do not
   emit remote-I/O or production-default verdicts. If rewrite wall time was
   captured externally, display it as diagnostic only, outside classification.
-- [ ] **Step 4: Add golden tests.** Cover opposing repetitions, excessive
+- [x] **Step 4: Add golden tests.** Cover opposing repetitions, excessive
   start/end control drift, one query dominating the suite, answer rejection,
   missing census, and a stable Pareto candidate.
-- [ ] **Step 5: Produce immutable analysis.** Verify every report digest from
+- [x] **Step 5: Produce immutable analysis.** Verify every report digest from
   the complete run set and emit JSON plus Markdown containing formulas,
   exclusions, raw identities, seed/order, control drift, per-repetition results,
   and candidate labels.

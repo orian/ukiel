@@ -148,6 +148,42 @@ class AnalyzeTests(unittest.TestCase):
             self.assertEqual(drift["end_ms"], 12.0)
             self.assertTrue(drift["exceeds_noise"])
 
+    def test_opposing_repetitions_are_unstable(self):
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = (report([q("a", [10, 10])]), 1000)
+            faster = (report([q("a", [5, 5])], variant="v"), 1000)   # rep0: faster
+            slower = (report([q("a", [15, 15])], variant="v"), 1000)  # rep1: slower
+            reps = [
+                {"product-control": ctrl, "v": faster},
+                {"product-control": ctrl, "v": slower},
+            ]
+            run_set, rep_dirs = write_run(d, reps)
+            res = A.analyze(run_set, rep_dirs)
+            v = res["variants"][0]
+            self.assertEqual(v["classification"], "unstable")
+            self.assertIn(0, v["per_rep_time_delta_pct"])
+            self.assertLess(v["per_rep_time_delta_pct"][0], 0)   # rep0 faster
+            self.assertGreater(v["per_rep_time_delta_pct"][1], 0)  # rep1 slower
+
+    def test_missing_census_yields_zero_size_delta_not_a_crash(self):
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = (report([q("a", [10, 10])]), 1000)
+            v = (report([q("a", [10, 10])], variant="v"), 500)
+            run_set, rep_dirs = write_run(d, [{"product-control": ctrl, "v": v}])
+            os.remove(os.path.join(rep_dirs[0], "census", "v.json"))
+            res = A.analyze(run_set, rep_dirs)
+            self.assertEqual(res["variants"][0]["size_delta_pct"], 0.0)
+
+    def test_per_query_evidence_is_reported(self):
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = (report([q("fast", [1, 1]), q("slow", [100, 100])]), 1000)
+            v = (report([q("fast", [1, 1]), q("slow", [100, 100])], variant="v"), 1000)
+            run_set, rep_dirs = write_run(d, [{"product-control": ctrl, "v": v}])
+            res = A.analyze(run_set, rep_dirs)
+            pq = {p["query"]: p for p in res["variants"][0]["per_query"]}
+            self.assertEqual(set(pq), {"fast", "slow"})
+            self.assertEqual(pq["slow"]["warm_median_ms"], 100.0)
+
     def test_a_non_complete_run_set_is_rejected(self):
         with tempfile.TemporaryDirectory() as d:
             control = (report([q("a", [10, 10])]), 1000)
