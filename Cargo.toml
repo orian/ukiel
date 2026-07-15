@@ -33,6 +33,7 @@ members = [
     "tools/parquet-lab-bench",
     "tools/parquet-skip-index-core",
     "tools/parquet-skip-index",
+    "tools/parquet-lab-store",
 ]
 
 [workspace.package]

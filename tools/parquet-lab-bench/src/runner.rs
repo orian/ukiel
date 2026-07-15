@@ -42,16 +42,26 @@ impl Default for ReaderFlags {
     }
 }
 
-/// One artifact's files, loaded into memory for a session.
+/// One artifact's files, referenced by relative path under a base directory. Bytes are read
+/// lazily by the backing store — a publishable mode never preloads a whole part into RAM.
 pub struct Artifact {
-    /// (relative path, bytes) for every Parquet file.
-    pub files: Vec<(String, Vec<u8>)>,
+    pub base_dir: std::path::PathBuf,
+    /// Relative paths for every Parquet file.
+    pub files: Vec<String>,
 }
 
-/// Whether to instrument I/O.
+/// The storage backend a session reads through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
+    /// The decode-only micro mode: the files are preloaded into an in-memory store. Fast,
+    /// but not a storage measurement — no I/O is accounted.
+    Memory,
+    /// A real local-filesystem object store. Reads ranges from disk without preloading; no
+    /// I/O accounting (use object-store mode for that).
     Local,
+    /// A real object store (a local-filesystem-backed one here, or S3/MinIO via a receipt),
+    /// wrapped in the counting store so every request and byte range is accounted. Never
+    /// preloads a full file.
     ObjectStore,
 }
 
@@ -61,30 +71,66 @@ pub struct Session {
     pub counters: Option<Arc<Counters>>,
 }
 
-fn memory_url() -> url::Url {
-    url::Url::parse("memory://").expect("valid url")
+fn scheme_url(mode: Mode) -> url::Url {
+    match mode {
+        Mode::Memory => url::Url::parse("memory://").expect("url"),
+        Mode::Local | Mode::ObjectStore => url::Url::parse("file://").expect("url"),
+    }
 }
 
 impl Artifact {
-    /// Build a fresh session: load the files into an in-memory store (optionally counting),
-    /// register them as `events_physical`, and create the logical `events` view.
+    /// Build a fresh session over the artifact, register it as `events_physical`, and create
+    /// the logical `events` view.
     pub async fn session(&self, mode: Mode, flags: ReaderFlags, view_sql: &str) -> Result<Session> {
-        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        for (path, bytes) in &self.files {
-            inner
-                .put_opts(
-                    &ObjPath::from(path.as_str()),
-                    bytes.clone().into(),
-                    object_store::PutOptions::default(),
-                )
-                .await
-                .with_context(|| format!("loading {path} into the in-memory store"))?;
-        }
-        let (store, counters): (Arc<dyn ObjectStore>, Option<Arc<Counters>>) = match mode {
-            Mode::Local => (inner, None),
-            Mode::ObjectStore => {
-                let (counting, counters) = CountingObjectStore::new(inner);
-                (counting, Some(counters))
+        // Build the backing store and the listing URLs for the chosen mode.
+        let (store, counters, urls): (
+            Arc<dyn ObjectStore>,
+            Option<Arc<Counters>>,
+            Vec<ListingTableUrl>,
+        ) = match mode {
+            Mode::Memory => {
+                // Decode-only: preload into memory (the one mode that legitimately does).
+                let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+                for rel in &self.files {
+                    let bytes = std::fs::read(self.base_dir.join(rel))
+                        .with_context(|| format!("reading {rel}"))?;
+                    inner
+                        .put_opts(
+                            &ObjPath::from(rel.as_str()),
+                            bytes.into(),
+                            Default::default(),
+                        )
+                        .await?;
+                }
+                let urls = self
+                    .files
+                    .iter()
+                    .map(|p| ListingTableUrl::parse(format!("memory:///{p}")))
+                    .collect::<Result<_, _>>()?;
+                (inner, None, urls)
+            }
+            Mode::Local | Mode::ObjectStore => {
+                // A real filesystem object store: reads ranges from disk, no preload.
+                let abs = std::fs::canonicalize(&self.base_dir)
+                    .with_context(|| format!("resolving {}", self.base_dir.display()))?;
+                let local: Arc<dyn ObjectStore> =
+                    Arc::new(object_store::local::LocalFileSystem::new());
+                let (store, counters): (Arc<dyn ObjectStore>, Option<Arc<Counters>>) =
+                    if mode == Mode::ObjectStore {
+                        let (c, ctr) = CountingObjectStore::new(local);
+                        (c, Some(ctr))
+                    } else {
+                        (local, None)
+                    };
+                let urls = self
+                    .files
+                    .iter()
+                    .map(|p| {
+                        let full = abs.join(p);
+                        ListingTableUrl::parse(format!("file://{}", full.display()))
+                    })
+                    .collect::<Result<_, _>>()?;
+                (store, counters, urls)
             }
         };
 
@@ -98,17 +144,8 @@ impl Artifact {
             opts.execution.parquet.bloom_filter_on_read = flags.bloom_filter_on_read;
         }
         let ctx = SessionContext::new_with_config(config);
-        ctx.register_object_store(&memory_url(), store);
+        ctx.register_object_store(&scheme_url(mode), store);
 
-        let base = "memory://";
-        let urls: Vec<ListingTableUrl> = self
-            .files
-            .iter()
-            .map(|(p, _)| {
-                ListingTableUrl::parse(format!("{base}/{p}"))
-                    .with_context(|| format!("building a URL for {p}"))
-            })
-            .collect::<Result<_>>()?;
         let options =
             ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
         let schema = options

@@ -29,50 +29,56 @@ pub struct ArtifactIdentity {
     pub variant_digest: Option<String>,
 }
 
-/// Load an artifact's files from a snapshot *or* variant manifest.
+/// Load an artifact's file *paths* from a snapshot *or* variant manifest. Bytes are not read
+/// here — the session's backing store reads them lazily (no preload in publishable modes).
 pub fn load_artifact(manifest_path: &Path) -> Result<(Artifact, ArtifactIdentity)> {
-    let dir = manifest_path.parent().unwrap_or(Path::new("."));
+    let dir = manifest_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
     let bytes = std::fs::read(manifest_path)
         .with_context(|| format!("reading {}", manifest_path.display()))?;
     let digest = digest_bytes(&bytes);
     let name = manifest_path.display().to_string();
 
     // A snapshot manifest lists files by `path`; a variant by `output.path`.
-    if let Ok(snapshot) = SnapshotManifest::parse(&name, &bytes) {
-        let files = read_files(dir, snapshot.files.iter().map(|f| f.path.as_str()))?;
-        return Ok((
-            Artifact { files },
+    let (files, identity) = if let Ok(snapshot) = SnapshotManifest::parse(&name, &bytes) {
+        (
+            snapshot
+                .files
+                .iter()
+                .map(|f| f.path.clone())
+                .collect::<Vec<_>>(),
             ArtifactIdentity {
                 snapshot_digest: digest,
                 variant_digest: None,
             },
-        ));
-    }
-    let variant = VariantManifest::parse(&name, &bytes)
-        .context("manifest is neither a snapshot nor a variant")?;
-    let files = read_files(dir, variant.files.iter().map(|f| f.output.path.as_str()))?;
-    Ok((
-        Artifact { files },
-        ArtifactIdentity {
-            snapshot_digest: variant.parent_snapshot_digest,
-            variant_digest: Some(digest),
-        },
-    ))
-}
-
-fn read_files<'a>(
-    dir: &Path,
-    paths: impl Iterator<Item = &'a str>,
-) -> Result<Vec<(String, Vec<u8>)>> {
-    let mut files = Vec::new();
-    for p in paths {
-        let bytes = std::fs::read(dir.join(p)).with_context(|| format!("reading {p}"))?;
-        files.push((p.to_string(), bytes));
-    }
+        )
+    } else {
+        let variant = VariantManifest::parse(&name, &bytes)
+            .context("manifest is neither a snapshot nor a variant")?;
+        (
+            variant
+                .files
+                .iter()
+                .map(|f| f.output.path.clone())
+                .collect::<Vec<_>>(),
+            ArtifactIdentity {
+                snapshot_digest: variant.parent_snapshot_digest,
+                variant_digest: Some(digest),
+            },
+        )
+    };
     if files.is_empty() {
         bail!("the artifact lists no files");
     }
-    Ok(files)
+    Ok((
+        Artifact {
+            base_dir: dir,
+            files,
+        },
+        identity,
+    ))
 }
 
 /// Compile a suite from a snapshot control: bake the logical view and each query's expected
@@ -343,13 +349,14 @@ pub async fn run(
             seed: None,
             order_digest: None,
             backend: Some(match params.mode {
+                Mode::Memory => "memory".to_string(),
                 Mode::Local => "local".to_string(),
-                Mode::ObjectStore => "object-store(in-memory)".to_string(),
+                Mode::ObjectStore => "object-store".to_string(),
             }),
         },
         host: host_info(params.mode),
         body: serde_json::json!({
-            "mode": match params.mode { Mode::Local => "local", Mode::ObjectStore => "object-store" },
+            "mode": match params.mode { Mode::Memory => "memory", Mode::Local => "local", Mode::ObjectStore => "object-store" },
             "reader_flags": params.reader_flags,
             "cold_iters": params.cold_iters,
             "warm_iters": params.warm_iters,
@@ -386,8 +393,9 @@ fn host_info(mode: Mode) -> HostInfo {
         host_ram_bytes: None,
         kernel: None,
         storage_kind: match mode {
+            Mode::Memory => "memory".to_string(),
             Mode::Local => "local".to_string(),
-            Mode::ObjectStore => "object-store(in-memory)".to_string(),
+            Mode::ObjectStore => "object-store".to_string(),
         },
         // We do not drop the host page cache; do not claim we did.
         page_cache_dropped: None,

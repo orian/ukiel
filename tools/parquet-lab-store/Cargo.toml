@@ -1,0 +1,30 @@
+[package]
+name = "parquet-lab-store"
+version.workspace = true
+edition.workspace = true
+description = "Publish a laboratory artifact to a disposable object-store namespace and verify it read-only (plan 47)."
+
+# A single-purpose publisher: it uploads an artifact's exact files to an explicit disposable
+# prefix, verifies HEAD/size/digest, and writes a `ukiel-parquet-store/v1` receipt atomically.
+# Verification is read-only. There is NO delete command. Credentials come only from the
+# environment/config and never enter a receipt.
+
+[dependencies]
+parquet-lab-contract = { workspace = true }
+object_store = { workspace = true, features = ["aws"] }
+tokio = { workspace = true }
+bytes = { workspace = true }
+sha2 = "0.10"
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "parquet-lab-store"
+path = "src/main.rs"

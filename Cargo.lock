@@ -3285,6 +3285,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "parquet-lab-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "futures",
+ "object_store",
+ "parquet-lab-contract",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "parquet-rewrite"
 version = "0.1.0"
 dependencies = [

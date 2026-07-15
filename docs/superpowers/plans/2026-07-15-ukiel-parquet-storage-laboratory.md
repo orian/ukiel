@@ -986,12 +986,12 @@ an actual local-filesystem object store without copying complete files into RAM.
 `object-store` reads the immutable receipt namespace through the configured
 S3-compatible store. The read-only benchmark never uploads or deletes objects.
 
-- [ ] **Step 1: Implement the single-purpose publisher.** Upload with bounded
+- [x] **Step 1: Implement the single-purpose publisher.** Upload with bounded
   buffers to an explicit disposable prefix, verify HEAD/size/digest, and publish
   the receipt atomically. Refuse an existing prefix, root/empty prefix, path
   traversal, a mutable/unverified manifest, or overwrite. Verification is
   read-only. No delete command belongs in this tool.
-- [ ] **Step 2: Stop preloading files in publishable modes.** Retain `InMemory`
+- [x] **Step 2: Stop preloading files in publishable modes.** Retain `InMemory`
   only for `--mode memory`. Local and object-store sessions must reuse their
   backing store and preserve the declared cache posture across iterations.
 - [ ] **Step 3: Count requested and returned I/O.** Record HEAD, GET, range and
@@ -1011,7 +1011,7 @@ S3-compatible store. The read-only benchmark never uploads or deletes objects.
   range counters against known bytes, receipt/artifact mismatch refusal,
   read-only benchmark permissions, and equivalent answers across memory/local/
   object-store. Keep the MinIO test operator-gated if Docker is unavailable.
-- [ ] **Step 7: Verify standalone installation and commit.**
+- [x] **Step 7: Verify standalone installation and commit.**
 
 ```bash
 cargo test -p parquet-lab-store -p parquet-lab-bench

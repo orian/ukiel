@@ -11,7 +11,7 @@ parquet-lab-bench compile --manifest SNAPSHOT.json --kind prod-synth|click-bench
 
 # Run a suite over an artifact and write a result report.
 parquet-lab-bench run --manifest FILE --suite SUITE.json --result RESULT.json \
-  --mode local|object-store --cold-iters 1 --warm-iters 5 [--skip-manifest DIR/skip.json] \
+  --mode memory|local|object-store --cold-iters 1 --warm-iters 5 [--skip-manifest DIR/skip.json] \
   [--no-page-index] [--no-pruning] [--no-pushdown-filters] [--no-reorder-filters] \
   [--no-bloom-filter-on-read]
 ```

@@ -25,7 +25,11 @@ enum SuiteKindArg {
 
 #[derive(Copy, Clone, ValueEnum)]
 enum ModeArg {
+    /// Decode-only micro mode: files preloaded into memory, no I/O accounting.
+    Memory,
+    /// Real local-filesystem object store; reads ranges from disk, no I/O accounting.
     Local,
+    /// Real object store with per-request/byte I/O accounting; never preloads a full file.
     ObjectStore,
 }
 
@@ -189,6 +193,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             let params = parquet_lab_bench::RunParams {
                 mode: match mode {
+                    ModeArg::Memory => Mode::Memory,
                     ModeArg::Local => Mode::Local,
                     ModeArg::ObjectStore => Mode::ObjectStore,
                 },
