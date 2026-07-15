@@ -6,11 +6,20 @@
 > plan: it may produce evidence and follow-up issues, but it must not silently
 > turn laboratory controls into production table settings.
 
-**Status:** Written. Plan 46 is executed and its tooling, receipts, compacted
-objects, and geometry interpretation are available. Its reduced 3M-row baseline
-did not trigger the 64/256 MiB size cuts, so Plan 47 uses those outputs for tool
-development but prepares a full 30M-row packed/64 MiB pair before publishing
-storage conclusions.
+**Status:** Tooling executed (2026-07-15). Tasks 1–7 are implemented, test-driven, and
+committed; the offline tools install standalone and the `from-ukiel` snapshot adapter is
+validated against a real Postgres + the in-harness compactor. All five blocks (17 variants)
+run through the full rewrite→census→bench pipeline on a real prod-synth smoke fixture, with
+fingerprints preserved, answers matched, and I/O accounted. The **publishable measurement
+phase** — Task 8's 30M event baseline (packed + 64 MiB) and 10M ClickBench, twice
+interleaved — remains an operator run against live infrastructure and is documented in
+`docs/notes/2026-07-15-ukiel-parquet-storage-laboratory.md`; smoke carries no storage
+conclusion, per this plan's own rule.
+
+Plan 46 is executed and its tooling, receipts, compacted objects, and geometry
+interpretation are available. Its reduced 3M-row baseline did not trigger the 64/256 MiB
+size cuts, so Plan 47 uses those outputs for tool development but prepares a full 30M-row
+packed/64 MiB pair before publishing storage conclusions.
 
 **Goal:** Build a reproducible laboratory around Parquet files written by
 Ukiel's real compactor. Freeze those exact files into a verified snapshot,
@@ -771,9 +780,12 @@ git commit -m "bench: prototype conservative parquet skip-index sidecars"
 - [ ] **Step 5: Run the combined candidate and leave-one-out checks.** Confirm
   interactions and cap the published candidates at balanced, scan-heavy, and
   selective.
-- [ ] **Step 6: Write the interpretation.** Answer all ten questions; separate
+- [x] **Step 6: Write the interpretation.** Answer all ten questions; separate
   size, write, local read, and object-store results; report noise and raw digests;
   distinguish a storage ceiling from an end-to-end Ukiel claim.
+  *(Done as `docs/notes/2026-07-15-ukiel-parquet-storage-laboratory.md`, scoped to the
+  tooling-complete state: it answers each question with tooling-readiness and the smoke
+  validation, and marks the publishable numbers as pending the operator-run baseline.)*
 - [ ] **Step 7: File focused follow-up issues only for demonstrated residuals.**
   Each issue names exact artifact/query/spec digests, benefit, regressions,
   production placement options, backward compatibility, fallback semantics,
@@ -787,12 +799,25 @@ git commit -m "bench: prototype conservative parquet skip-index sidecars"
 - Modify: this plan
 - Modify: `docs/issues/README.md` only if Task 8 created issues
 
-- [ ] **Step 1: Update roadmap row 47 with measured outcomes.** Update row 36
+- [x] **Step 1: Update roadmap row 47 with measured outcomes.** Update row 36
   with the narrow-type verdict; do not mark row 36 executed because an
   experiment is not a product type-system implementation.
-- [ ] **Step 2: Mark every task truthfully.** Record deviations and failed
+  *(Row 47 status set to "Tooling executed"; row 36 records the proven lossless-projection
+  mechanism and that the byte-savings magnitude still needs the 30M baseline.)*
+- [x] **Step 2: Mark every task truthfully.** Record deviations and failed
   hypotheses in this plan; do not rewrite the original matrix after seeing data.
-- [ ] **Step 3: Full verification.**
+  *(Tasks 1–7 executed and committed. Task 8 Steps 1–5, 7 are the operator-run measurement
+  phase and are NOT executed here — they need a live catalog/object-store/compactor and a
+  30M-row compaction to convergence. The smoke matrix validated the whole pipeline; two bugs
+  it exposed were fixed. No custom skip index is justified yet — the residual only exists
+  after Blocks A–E on the real data, so Step 3's "no custom index justified" is deferred to
+  the real run rather than asserted from smoke.)*
+- [x] **Step 3: Full verification.** `cargo fmt --check` and `cargo clippy --all-targets -- -D
+  warnings` are clean across all seven laboratory crates; `git diff --check` is clean; the
+  whole workspace builds; the offline laboratory test suite (72 tests) and the shell refusal
+  tests (12) pass. `make test`'s Docker-gated integration suite (Postgres/MinIO/Kafka) is the
+  operator gate — the `from-ukiel` adapter's own testcontainers integration test was run here
+  against a real Postgres + the in-harness compactor and passed.
 
 ```bash
 cargo fmt --check
@@ -801,7 +826,7 @@ make test
 git diff --check
 ```
 
-- [ ] **Step 4: Commit documentation/results metadata.**
+- [x] **Step 4: Commit documentation/results metadata.**
 
 ```bash
 git commit -m "bench: record parquet storage laboratory results"
