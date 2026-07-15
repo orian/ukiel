@@ -723,20 +723,20 @@ parquet-lab-bench run \
   --result FILE --mode local|object-store
 ```
 
-- [ ] **Step 1: Write no-false-negative property tests.** For every supported
+- [x] **Step 1: Write no-false-negative property tests.** For every supported
   predicate and random row group, `NoMatch` implies a full scan finds zero
   matches. Nulls, empty values, Unicode byte prefixes, truncated values, `IN`,
   and unsupported expressions degrade to `Unknown`.
-- [ ] **Step 2: Pin binding/corruption behavior.** Wrong file/schema/variant
+- [x] **Step 2: Pin binding/corruption behavior.** Wrong file/schema/variant
   digest, unknown version, missing payload, corrupt checksum, or row-group
   mismatch keeps every affected group and increments a reasoned fallback metric.
-- [ ] **Step 3: Implement the three bounded prototypes.** Payload budgets and
+- [x] **Step 3: Implement the three bounded prototypes.** Payload budgets and
   prefix lengths are explicit in the spec. No index is built for a column/query
   family absent from the compiled suite.
-- [ ] **Step 4: Translate only `NoMatch` into `ParquetAccessPlan`.** Preserve
+- [x] **Step 4: Translate only `NoMatch` into `ParquetAccessPlan`.** Preserve
   native DataFusion pruning underneath. Report custom-skipped, native-skipped,
   decoded, sidecar request/byte, build-time, and storage costs separately.
-- [ ] **Step 5: Compare against native controls on smoke and commit.** A native
+- [x] **Step 5: Compare against native controls on smoke and commit.** A native
   feature matching the result makes the custom candidate fail the simplicity
   gate, as intended.
 
