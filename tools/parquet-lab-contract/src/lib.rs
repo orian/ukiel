@@ -27,16 +27,23 @@ use serde::{Deserialize, Serialize};
 
 pub mod index;
 pub mod report;
+pub mod run_set;
 pub mod snapshot;
+pub mod store;
 pub mod suite;
 pub mod variant;
 
 pub use index::{IndexKind, IndexedColumn, RowGroupIndex, SKIP_MANIFEST_VERSION, SkipManifest};
 pub use report::{HostInfo, REPORT_VERSION, ReportIdentity, RunReport, ToolVersions};
+pub use run_set::{RUN_SET_VERSION, RunSet, RunSetEntry, RunSetState};
 pub use snapshot::{
     LogicalProjection, SNAPSHOT_MANIFEST_VERSION, SnapshotFile, SnapshotManifest, SourceKind,
 };
-pub use suite::{Probe, Query, SUITE_VERSION, Suite, SuiteKind};
+pub use store::{STORE_RECEIPT_VERSION, StoreObject, StoreReceipt};
+pub use suite::{
+    PROBES_VERSION, Probe, ProbeFamily, Query, ResultSemantics, SUITE_VERSION, Suite, SuiteKind,
+    TypedLiteral,
+};
 pub use variant::{
     ColumnProperties, VARIANT_MANIFEST_VERSION, VariantFileMap, VariantManifest, WriterProperties,
 };
@@ -117,6 +124,14 @@ pub enum ContractError {
         expected: String,
         actual: String,
     },
+    #[error("{context}: object '{offending}' is out of sorted order; a store receipt is sorted")]
+    UnsortedObjects { context: String, offending: String },
+    #[error("{context}: a run set must schedule at least one measurement")]
+    EmptySchedule { context: String },
+    #[error("{context}: a complete run set is missing the report for scheduled entry '{expected}'")]
+    MissingReport { context: String, expected: String },
+    #[error("{context}: report digest '{digest}' is bound to more than one scheduled entry")]
+    DuplicateReport { context: String, digest: String },
 }
 
 /// BLAKE3 of raw bytes, lowercase hex. Deliberately over the bytes on disk, not a

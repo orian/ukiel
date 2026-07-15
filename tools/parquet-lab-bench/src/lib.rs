@@ -185,7 +185,7 @@ pub async fn run(
         runnables.push(Runnable {
             name: p.name.clone(),
             sql: p.sql.clone(),
-            expected: p.expected_result_digest.clone().unwrap_or_default(),
+            expected: p.expected_result_digest.clone(),
         });
     }
 
@@ -252,6 +252,16 @@ pub async fn run(
             suite_digest: Some(suite_digest),
             skip_digest: skip_cost.as_ref().map(|c| c.skip_digest.clone()),
             run_order: params.run_order,
+            // Run-set fields (repetition/seed/order digest) are populated when a run set
+            // drives the run (Task 47E); an ad-hoc single run leaves them null. The backend
+            // identity is always known from the mode.
+            repetition: None,
+            seed: None,
+            order_digest: None,
+            backend: Some(match params.mode {
+                Mode::Local => "local".to_string(),
+                Mode::ObjectStore => "object-store(in-memory)".to_string(),
+            }),
         },
         host: host_info(params.mode),
         body: serde_json::json!({

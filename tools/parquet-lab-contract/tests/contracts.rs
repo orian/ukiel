@@ -4,9 +4,11 @@
 
 use parquet_lab_contract::{
     ColumnProperties, ContractError, FileDigest, Fingerprint, HostInfo, IndexKind, IndexedColumn,
-    LOGICAL_ROW_MULTISET_VERSION, LogicalProjection, Probe, Query, REPORT_VERSION, ReportIdentity,
-    RowGroupIndex, RunReport, SKIP_MANIFEST_VERSION, SNAPSHOT_MANIFEST_VERSION, SUITE_VERSION,
-    SkipManifest, SnapshotFile, SnapshotManifest, SourceKind, Suite, SuiteKind, ToolVersions,
+    LOGICAL_ROW_MULTISET_VERSION, LogicalProjection, Probe, ProbeFamily, Query, REPORT_VERSION,
+    RUN_SET_VERSION, ReportIdentity, ResultSemantics, RowGroupIndex, RunReport, RunSet,
+    RunSetEntry, RunSetState, SKIP_MANIFEST_VERSION, SNAPSHOT_MANIFEST_VERSION,
+    STORE_RECEIPT_VERSION, SUITE_VERSION, SkipManifest, SnapshotFile, SnapshotManifest, SourceKind,
+    StoreObject, StoreReceipt, Suite, SuiteKind, ToolVersions, TypedLiteral,
     VARIANT_MANIFEST_VERSION, VariantFileMap, VariantManifest, WriterProperties,
 };
 
@@ -135,15 +137,19 @@ fn suite() -> Suite {
             name: "q_heavy_tenant".into(),
             sql: "SELECT count(*) FROM events WHERE team_id = 900".into(),
             expected_result_digest: "ab".repeat(32),
+            result_semantics: ResultSemantics::Ordered,
         }],
         probes: vec![Probe {
             name: "eq_0.001".into(),
-            family: "equality".into(),
+            family: ProbeFamily::Equality,
             column: "team_id".into(),
+            literals: vec![TypedLiteral::Int(5)],
             sql: "SELECT * FROM events WHERE team_id = 5".into(),
-            target_selectivity: 0.001,
-            observed_count: Some(42),
-            expected_result_digest: Some("cd".repeat(32)),
+            expected_result_digest: "cd".repeat(32),
+            result_semantics: ResultSemantics::Multiset,
+            control_row_count: 8000,
+            match_count: 42,
+            observed_selectivity: 42.0 / 8000.0,
         }],
     }
 }
@@ -158,6 +164,10 @@ fn report() -> RunReport {
             suite_digest: Some("su1t".repeat(16)),
             skip_digest: None,
             run_order: 3,
+            repetition: Some(0),
+            seed: Some(7),
+            order_digest: Some("0rd".repeat(16) + "0"),
+            backend: Some("local".into()),
         },
         host: HostInfo {
             target_cpu: Some("x86-64-v3".into()),
@@ -393,4 +403,220 @@ fn fingerprints_agree_only_within_a_version() {
     let mut ver = a.clone();
     ver.version = "logical-row-multiset/v2".into();
     assert!(!a.agrees_with(&ver));
+}
+
+// -- Task 47A: store receipt, run set, credentials, extended report identity ----------
+
+fn store_receipt() -> StoreReceipt {
+    StoreReceipt {
+        receipt_version: STORE_RECEIPT_VERSION.into(),
+        artifact_digest: "5nap".repeat(16),
+        store_kind: "minio".into(),
+        endpoint_identity: "http://127.0.0.1:9000".into(),
+        bucket: "parquet-lab".into(),
+        prefix: "disposable/run-1".into(),
+        objects: vec![
+            StoreObject {
+                path: "parquet/part-0.parquet".into(),
+                size: 100,
+                sha256: "aa".repeat(32),
+            },
+            StoreObject {
+                path: "parquet/part-1.parquet".into(),
+                size: 200,
+                sha256: "bb".repeat(32),
+            },
+        ],
+    }
+}
+
+fn run_set(state: RunSetState, with_reports: bool) -> RunSet {
+    let entry = |rep: u32, ord: u32, id: &str, rep_digest: Option<String>| RunSetEntry {
+        repetition: rep,
+        order_index: ord,
+        artifact_kind: if id.contains("control") {
+            "control"
+        } else {
+            "variant"
+        }
+        .into(),
+        label: id.into(),
+        artifact_digest: "5nap".repeat(16),
+        expected_report_id: id.into(),
+        report_digest: rep_digest,
+    };
+    let d = |s: &str| {
+        if with_reports {
+            Some(format!("{s:0<64}"))
+        } else {
+            None
+        }
+    };
+    RunSet {
+        run_set_version: RUN_SET_VERSION.into(),
+        state,
+        suite_digest: "su1t".repeat(16),
+        control_digest: "5nap".repeat(16),
+        block: "pages".into(),
+        backend: "local".into(),
+        reader_config: serde_json::json!({"pruning": true}),
+        host: serde_json::json!({"cpu": "x86-64"}),
+        repetitions: 2,
+        seed: 7,
+        schedule: vec![
+            entry(0, 0, "rep0/order0/control", d("r0c0")),
+            entry(0, 1, "rep0/order1/pages-32k", d("r0v1")),
+            entry(1, 0, "rep1/order0/control", d("r1c0")),
+        ],
+    }
+}
+
+#[test]
+fn a_store_receipt_round_trips_and_refuses_bad_keys() {
+    let r = store_receipt();
+    assert_eq!(
+        r,
+        StoreReceipt::parse("s", &serde_json::to_vec_pretty(&r).unwrap()).unwrap()
+    );
+
+    // Absolute / traversing object keys are refused.
+    let mut bad = store_receipt();
+    bad.objects[0].path = "/etc/passwd".into();
+    assert!(matches!(
+        bad.validate("s").unwrap_err(),
+        ContractError::NonRelativePath { .. }
+    ));
+
+    // Duplicate objects are refused.
+    let mut dup = store_receipt();
+    dup.objects[1].path = dup.objects[0].path.clone();
+    assert!(matches!(
+        dup.validate("s").unwrap_err(),
+        ContractError::DuplicateFile { .. }
+    ));
+
+    // Out-of-order objects are refused (the receipt must be sorted for a stable digest).
+    let mut unsorted = store_receipt();
+    unsorted.objects.reverse();
+    assert!(matches!(
+        unsorted.validate("s").unwrap_err(),
+        ContractError::UnsortedObjects { .. }
+    ));
+}
+
+#[test]
+fn a_store_receipt_cannot_serialize_a_credential() {
+    // The receipt has no field for a secret; prove a serialized one contains none of the
+    // words a leaked credential would carry.
+    let json = serde_json::to_string(&store_receipt())
+        .unwrap()
+        .to_lowercase();
+    for forbidden in [
+        "access_key",
+        "secret",
+        "session_token",
+        "password",
+        "aws_secret",
+    ] {
+        assert!(
+            !json.contains(forbidden),
+            "a store receipt must never carry '{forbidden}'"
+        );
+    }
+}
+
+#[test]
+fn a_report_cannot_serialize_a_credential() {
+    let json = serde_json::to_string(&report()).unwrap().to_lowercase();
+    for forbidden in ["access_key", "secret_key", "session_token", "aws_secret"] {
+        assert!(
+            !json.contains(forbidden),
+            "a report must never carry '{forbidden}'"
+        );
+    }
+}
+
+#[test]
+fn a_run_set_round_trips_and_only_complete_is_analyzable() {
+    let planned = run_set(RunSetState::Planned, false);
+    assert_eq!(
+        planned,
+        RunSet::parse("rs", &serde_json::to_vec_pretty(&planned).unwrap()).unwrap()
+    );
+    assert!(
+        !planned.is_analyzable(),
+        "a planned run set is not analyzable"
+    );
+
+    let complete = run_set(RunSetState::Complete, true);
+    assert!(complete.is_analyzable());
+    assert_eq!(
+        complete,
+        RunSet::parse("rs", &serde_json::to_vec_pretty(&complete).unwrap()).unwrap()
+    );
+}
+
+#[test]
+fn a_complete_run_set_missing_a_report_is_refused() {
+    let mut rs = run_set(RunSetState::Complete, true);
+    rs.schedule[1].report_digest = None;
+    assert!(matches!(
+        rs.validate("rs").unwrap_err(),
+        ContractError::MissingReport { .. }
+    ));
+}
+
+#[test]
+fn a_run_set_with_a_duplicate_slot_or_report_is_refused() {
+    // Duplicate (repetition, order_index).
+    let mut dup_slot = run_set(RunSetState::Planned, false);
+    dup_slot.schedule[1].order_index = 0;
+    dup_slot.schedule[1].repetition = 0;
+    assert!(matches!(
+        dup_slot.validate("rs").unwrap_err(),
+        ContractError::DuplicateLabel { .. }
+    ));
+
+    // Same report digest bound to two entries.
+    let mut dup_report = run_set(RunSetState::Complete, true);
+    dup_report.schedule[1].report_digest = dup_report.schedule[0].report_digest.clone();
+    assert!(matches!(
+        dup_report.validate("rs").unwrap_err(),
+        ContractError::DuplicateReport { .. }
+    ));
+}
+
+#[test]
+fn an_empty_run_set_schedule_is_refused() {
+    let mut rs = run_set(RunSetState::Planned, false);
+    rs.schedule.clear();
+    assert!(matches!(
+        rs.validate("rs").unwrap_err(),
+        ContractError::EmptySchedule { .. }
+    ));
+}
+
+#[test]
+fn unknown_store_and_run_set_versions_fail_closed() {
+    let mut v = serde_json::to_value(store_receipt()).unwrap();
+    v["receipt_version"] = serde_json::json!("x");
+    assert!(matches!(
+        StoreReceipt::parse("s", &serde_json::to_vec(&v).unwrap()).unwrap_err(),
+        ContractError::Version { .. }
+    ));
+    let mut v = serde_json::to_value(run_set(RunSetState::Planned, false)).unwrap();
+    v["run_set_version"] = serde_json::json!("x");
+    assert!(matches!(
+        RunSet::parse("rs", &serde_json::to_vec(&v).unwrap()).unwrap_err(),
+        ContractError::Version { .. }
+    ));
+}
+
+#[test]
+fn the_extended_report_identity_round_trips() {
+    let r = report();
+    let back = RunReport::parse("r", &serde_json::to_vec_pretty(&r).unwrap()).unwrap();
+    assert_eq!(back.identity.repetition, Some(0));
+    assert_eq!(back.identity.seed, Some(7));
+    assert_eq!(back.identity.backend.as_deref(), Some("local"));
 }

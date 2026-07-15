@@ -837,21 +837,21 @@ checkboxes, record any deviation inline, and leave Task 8 untouched.
   identity, result semantics, and optional returned-byte/error/retry fields.
   Unknown or unobservable values are `null`, never zero.
 
-- [ ] **Step 1: Write failing serde and binding tests.** Reject unknown versions,
+- [x] **Step 1: Write failing serde and binding tests.** Reject unknown versions,
   duplicate probe/query/repetition IDs, absolute/traversing object keys,
   duplicate objects, missing repetitions, inconsistent suite/artifact/backend
   digests, and a `complete` run set with a missing or duplicate report.
-- [ ] **Step 2: Implement canonical digests and validation.** Stable ordering is
+- [x] **Step 2: Implement canonical digests and validation.** Stable ordering is
   part of each digest. A report must bind to exactly one scheduled run-set entry;
   changing seed, order, backend, reader flags, or artifact invalidates it.
-- [ ] **Step 3: Keep credentials out of artifacts.** Add golden tests proving
+- [x] **Step 3: Keep credentials out of artifacts.** Add golden tests proving
   store receipts and reports cannot serialize access keys, secret keys, session
   tokens, or raw environment values.
-- [ ] **Step 4: Add CLI parsing but no behavior change yet.** The benchmark may
+- [x] **Step 4: Add CLI parsing but no behavior change yet.** The benchmark may
   accept `--probes`, `--rep`, `--seed`, and `--store-receipt`; until Tasks 47B
   and 47D implement them, requesting those paths must fail with a clear
   “unsupported until remediation” error rather than silently ignoring them.
-- [ ] **Step 5: Verify and commit.**
+- [x] **Step 5: Verify and commit.**
 
 ```bash
 cargo test -p parquet-lab-contract -p parquet-lab-bench

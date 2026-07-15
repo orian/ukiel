@@ -1,29 +1,38 @@
 //! Declarative probes: parameterized equality/range/prefix/substring/is-null/projection
-//! queries at measured selectivity bands. A probe is compiled only when the column
-//! actually holds enough values to realize its declared band; the compiler records the
-//! observed count before timing. Probes run through the same path as named queries.
+//! queries at measured selectivity bands. Task 47B owns the real compiler (typed literals,
+//! observed selectivity, and answer semantics compiled against the immutable control); this
+//! module holds the structured-probe constructor those parts assemble into.
 
-use parquet_lab_contract::Probe;
+use parquet_lab_contract::{Probe, ProbeFamily, ResultSemantics, TypedLiteral};
 
-/// Build a probe from its parts. `observed_count` and `expected_result_digest` are filled
-/// by the compiler after running the probe against the control.
+/// Assemble a compiled probe from its resolved parts.
 #[allow(clippy::too_many_arguments)]
 pub fn probe(
     name: &str,
-    family: &str,
+    family: ProbeFamily,
     column: &str,
+    literals: Vec<TypedLiteral>,
     sql: &str,
-    target_selectivity: f64,
-    observed_count: Option<u64>,
-    expected_result_digest: Option<String>,
+    expected_result_digest: String,
+    result_semantics: ResultSemantics,
+    control_row_count: u64,
+    match_count: u64,
 ) -> Probe {
+    let observed_selectivity = if control_row_count == 0 {
+        0.0
+    } else {
+        match_count as f64 / control_row_count as f64
+    };
     Probe {
         name: name.to_string(),
-        family: family.to_string(),
+        family,
         column: column.to_string(),
+        literals,
         sql: sql.to_string(),
-        target_selectivity,
-        observed_count,
         expected_result_digest,
+        result_semantics,
+        control_row_count,
+        match_count,
+        observed_selectivity,
     }
 }

@@ -106,5 +106,6 @@ pub fn to_query(name: String, sql: String, expected_result_digest: String) -> Qu
         name,
         sql,
         expected_result_digest,
+        result_semantics: parquet_lab_contract::ResultSemantics::Ordered,
     }
 }

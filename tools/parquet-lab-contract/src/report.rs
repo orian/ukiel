@@ -56,6 +56,20 @@ pub struct ReportIdentity {
     pub skip_digest: Option<crate::Digest>,
     /// Position in the interleaved run order, so machine drift stays visible.
     pub run_order: u32,
+    /// The repetition this report belongs to, when run under a run set. `None` for an
+    /// ad-hoc single run.
+    #[serde(default)]
+    pub repetition: Option<u32>,
+    /// The run set's seed, so the interleaved order is reproducible.
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// A digest of the scheduled order this report was produced under.
+    #[serde(default)]
+    pub order_digest: Option<crate::Digest>,
+    /// The backend identity (`memory`, `local`, or an object-store endpoint identity). A
+    /// timing is meaningless without knowing what it read from.
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
 /// A raw report: identity envelope plus a command-specific body.

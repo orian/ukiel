@@ -76,6 +76,16 @@ enum Command {
         /// An experimental skip-index sidecar (`skip.json`) to price against native pruning.
         #[arg(long)]
         skip_manifest: Option<PathBuf>,
+        /// Repetition number, when driven by a run set (Task 47E). Unsupported until then.
+        #[arg(long)]
+        rep: Option<u32>,
+        /// Run-set seed for the reproducible interleaved order (Task 47E). Unsupported until then.
+        #[arg(long)]
+        seed: Option<u64>,
+        /// A published `ukiel-parquet-store/v1` receipt for object-store reads (Task 47D).
+        /// Unsupported until then.
+        #[arg(long)]
+        store_receipt: Option<PathBuf>,
         #[arg(long)]
         replace: bool,
     },
@@ -128,8 +138,23 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             no_reorder_filters,
             no_bloom_filter_on_read,
             skip_manifest,
+            rep,
+            seed,
+            store_receipt,
             replace,
         } => {
+            // These paths are contracted (Task 47A) but not yet implemented; refuse them
+            // loudly rather than silently ignoring a flag the operator meant to take effect.
+            if rep.is_some() || seed.is_some() {
+                anyhow::bail!(
+                    "--rep/--seed are unsupported until the run-set remediation (Task 47E) lands"
+                );
+            }
+            if store_receipt.is_some() {
+                anyhow::bail!(
+                    "--store-receipt is unsupported until the storage-backend remediation (Task 47D) lands"
+                );
+            }
             let params = parquet_lab_bench::RunParams {
                 mode: match mode {
                     ModeArg::Local => Mode::Local,

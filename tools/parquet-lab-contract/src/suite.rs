@@ -14,6 +14,46 @@ use crate::{ContractError, check_version};
 /// The suite format. A reader that does not recognise it fails closed.
 pub const SUITE_VERSION: &str = "ukiel-parquet-suite/v1";
 
+/// The structured-probe contract version. Probes declare predicates independently of their
+/// SQL rendering so the runner and a sidecar reason about the same typed predicate.
+pub const PROBES_VERSION: &str = "ukiel-parquet-probes/v1";
+
+/// How a query/probe result is compared. A scalar aggregate is `Ordered`; a multi-row
+/// answer without a deterministic total order is a `Multiset` (compared independent of batch
+/// and row order, preserving duplicate counts).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultSemantics {
+    #[default]
+    Ordered,
+    Multiset,
+}
+
+/// A probe's predicate family — declared, not inferred from SQL text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeFamily {
+    Equality,
+    Range,
+    Prefix,
+    Substring,
+    IsNull,
+    NarrowProjection,
+    WideProjection,
+}
+
+/// A typed literal in a probe predicate. Kept typed (not a rendered SQL string) so a sidecar
+/// can evaluate the predicate without parsing SQL.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type", content = "value")]
+pub enum TypedLiteral {
+    Int(i64),
+    Float(f64),
+    Str(String),
+    Bool(bool),
+    Null,
+}
+
 /// Which workload a suite belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -33,23 +73,29 @@ pub struct Query {
     /// The expected result digest (a canonical fingerprint of the normalized answer),
     /// checked before timing. A changed answer rejects the variant, never a rewrite.
     pub expected_result_digest: crate::Digest,
+    /// How the answer is compared. Defaults to `Ordered` (a scalar aggregate).
+    #[serde(default)]
+    pub result_semantics: ResultSemantics,
 }
 
-/// A parameterized probe at a measured selectivity band.
+/// A compiled probe: a structured predicate at a measured selectivity band, with its
+/// materialized typed literals, exact control answer, and observed counts frozen in.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Probe {
     pub name: String,
-    /// The probe family: `equality`, `range`, `prefix`, `substring`, `is_null`,
-    /// `narrow_projection`, `wide_projection`.
-    pub family: String,
+    pub family: ProbeFamily,
     pub column: String,
+    /// The typed literals the predicate binds (e.g. the equality value, the range bounds).
+    pub literals: Vec<TypedLiteral>,
     pub sql: String,
-    /// The selectivity band this probe targets, e.g. `0.001`.
-    pub target_selectivity: f64,
-    /// The count the compiler actually observed for the column. A probe is included
-    /// only if the column can realize its band; this records what was seen.
-    pub observed_count: Option<u64>,
-    pub expected_result_digest: Option<crate::Digest>,
+    /// The exact result digest computed against the immutable control.
+    pub expected_result_digest: crate::Digest,
+    pub result_semantics: ResultSemantics,
+    /// The control's total row count, and how many rows this probe matched — the observed
+    /// selectivity is `match_count / control_row_count`.
+    pub control_row_count: u64,
+    pub match_count: u64,
+    pub observed_selectivity: f64,
 }
 
 /// The compiled suite.
