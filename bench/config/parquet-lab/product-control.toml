@@ -1,0 +1,29 @@
+# Plan 14 product writer policy, documented for comparison ONLY.
+#
+# This file is NOT a variant the runner rewrites. The product control is the
+# *original snapshot bytes* the compactor actually wrote — re-encoding with
+# "the same" settings can change defaults, page boundaries, or library
+# behaviour, so the only honest control is the file the product produced.
+# `parquet-rewrite` never substitutes freshly encoded bytes for the control arm;
+# this spec exists so a reader can see what the product's policy was next to the
+# variants that change one axis of it.
+
+label = "product-control-DOCUMENTATION-ONLY"
+
+# 128k-row caps, packing-key-aligned row groups (plan 14).
+row_group_rows = 131072
+key_boundary_flush = true
+write_batch_rows = 1024
+data_page_bytes = 1048576
+dictionary_page_bytes = 1048576
+statistics = "page"
+offset_index = true
+
+# L1+ parts are ZSTD; L0 is LZ4_RAW. A snapshot of final read-many parts is L1+.
+compression = "zstd(3)"
+
+# Timestamps are DELTA_BINARY_PACKED with the dictionary off (plan 14).
+[[column]]
+name = "timestamp"
+encoding = "delta_binary_packed"
+dictionary = false

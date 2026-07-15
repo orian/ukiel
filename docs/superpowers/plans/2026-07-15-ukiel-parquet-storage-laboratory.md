@@ -604,21 +604,21 @@ Bloom FPP/NDV, and declared lossless physical-type projection. It records both
 requested and resolved properties. Invalid type/encoding/codec combinations are
 validation errors before any output is written.
 
-- [ ] **Step 1: Write failing property round-trip tests.** Read every output
+- [x] **Step 1: Write failing property round-trip tests.** Read every output
   footer and assert resolved compression, actual encodings, dictionary use,
   row-group/page metadata, Blooms, sorting columns, and row counts. Cover
   dictionary fallback explicitly.
-- [ ] **Step 2: Write type safety tests.** Lossless integer/timestamp variants
+- [x] **Step 2: Write type safety tests.** Lossless integer/timestamp variants
   preserve logical fingerprint and normalized query schema; overflow, rounding,
   timezone/unit ambiguity, float loss, and a semantic date guess are refused.
-- [ ] **Step 3: Implement bounded rewrite.** Preserve file membership and sort
+- [x] **Step 3: Implement bounded rewrite.** Preserve file membership and sort
   order; stream batches, flush row groups deterministically, and publish the
   variant manifest only after census and logical equality pass.
-- [ ] **Step 4: Make the product control unrewritable.** The original snapshot
+- [x] **Step 4: Make the product control unrewritable.** The original snapshot
   is the control. `product-control.toml` documents current properties for
   comparison but the runner must never substitute freshly encoded bytes for
   the control arm.
-- [ ] **Step 5: Verify standalone installation and commit.**
+- [x] **Step 5: Verify standalone installation and commit.**
 
 ```bash
 cargo test -p parquet-rewrite

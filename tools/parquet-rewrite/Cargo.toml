@@ -1,0 +1,29 @@
+[package]
+name = "parquet-rewrite"
+version.workspace = true
+edition.workspace = true
+description = "Rewrite a laboratory snapshot under one explicit variant spec into a verified storage variant (plan 47)."
+
+# Standalone and offline: Arrow + Parquet only, plus the two pure laboratory libraries.
+# It rewrites the same logical rows under different physical writer properties, reads back
+# what the writer actually did from the output footers, and refuses to publish unless the
+# logical fingerprint is unchanged. No DataFusion, no Ukiel service, no object store.
+
+[dependencies]
+parquet-lab-contract = { workspace = true }
+parquet-lab-integrity = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "parquet-rewrite"
+path = "src/main.rs"

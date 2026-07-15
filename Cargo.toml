@@ -29,6 +29,7 @@ members = [
     "tools/parquet-lab-integrity",
     "tools/parquet-lab-snapshot",
     "tools/parquet-census",
+    "tools/parquet-rewrite",
 ]
 
 [workspace.package]
