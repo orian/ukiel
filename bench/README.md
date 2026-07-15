@@ -1476,3 +1476,14 @@ closer resolves each entry's exact recorded path, verifies its digest, requires 
 control brackets to be two distinct reports over the same snapshot, and requires the same
 variant label to resolve to the same variant digest across repetitions. The analyzer reports
 per-repetition start-to-end control drift.
+
+
+#### The minimal screen (`--specs-from`)
+
+`bench/parquet-lab-run-set.py plan --specs-from bench/config/parquet-lab/minimal-screen.txt`
+plans over an ordered, comment-capable *list* of existing spec paths (never a new spec
+directory, never duplicated TOML). The planner records the list's SHA-256 and every
+referenced spec digest, and refuses a missing, duplicate, absolute, traversing, non-TOML, or
+outside-`bench/config/parquet-lab` path, or a duplicate embedded label. A golden test pins
+`minimal-screen.txt` to exactly the 11 registered Plan 48 specs — changing the screen is a
+plan change, not a runtime convenience.

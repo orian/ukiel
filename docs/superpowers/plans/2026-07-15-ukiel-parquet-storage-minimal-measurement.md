@@ -176,16 +176,16 @@ paths above. It is not another writer-spec directory and must not duplicate TOML
 contents. The planned seeded order records the SHA-256 of the list plus every
 referenced spec digest.
 
-- [ ] **Step 1: Write list validation tests.** Refuse missing, duplicate,
+- [x] **Step 1: Write list validation tests.** Refuse missing, duplicate,
   absolute, traversing, non-TOML, outside-`bench/config/parquet-lab` paths and a
   spec whose embedded label is duplicated.
-- [ ] **Step 2: Implement `--specs-from`.** Preserve the explicit list identity,
+- [x] **Step 2: Implement `--specs-from`.** Preserve the explicit list identity,
   then seed-shuffle its entries independently for each repetition. Reusing the
   seed produces a byte-identical schedule.
-- [ ] **Step 3: Pin the intended set.** A golden test asserts the list contains
+- [x] **Step 3: Pin the intended set.** A golden test asserts the list contains
   exactly the 11 registered paths in this plan. Changing the screen is a plan
   change, not a runtime convenience.
-- [ ] **Step 4: Verify and commit.**
+- [x] **Step 4: Verify and commit.**
 
 ```bash
 bash bench/tests/parquet-lab.sh

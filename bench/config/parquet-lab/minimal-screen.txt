@@ -1,0 +1,20 @@
+# Plan 48: the minimal parquet storage screen — exactly 11 existing writer specs that
+# BRACKET the product control on each axis. This is an ordered reference list, NOT another
+# spec directory: it must never duplicate TOML contents. Changing this set is a plan change.
+#
+# geometry: bracket current 128k row groups + one materially smaller page target
+bench/config/parquet-lab/pages/rowgroup-32k.toml
+bench/config/parquet-lab/pages/rowgroup-512k.toml
+bench/config/parquet-lab/pages/page-64k.toml
+# encoding: the two likely policy questions (ts delta is the product bytes already)
+bench/config/parquet-lab/encodings/strings-no-dict.toml
+bench/config/parquet-lab/encodings/ts-plain.toml
+# compression: bracket decode-fast and stronger around the current ZSTD policy
+bench/config/parquet-lab/compression/lz4-raw.toml
+bench/config/parquet-lab/compression/zstd-1.toml
+bench/config/parquet-lab/compression/zstd-6.toml
+# physical types: the two already-proven lossless projections
+bench/config/parquet-lab/types/team-int32.toml
+bench/config/parquet-lab/types/ts-timestamp.toml
+# native Bloom: one strong equality point (FPP 0.05 is a follow-up only if 0.01 helps)
+bench/config/parquet-lab/blooms/distinct-id-01.toml

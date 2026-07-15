@@ -184,6 +184,44 @@ if [[ "$ACTUAL" != *"order-001-alpha"* || "$(echo "$ACTUAL" | sed -n 2p)" != "or
 else echo "FAIL: order looks lexical"; fail=$((fail+1)); fi
 
 
+# --- Task 48/2: the minimal-screen spec list is validated and pinned.
+PLANNER="bench/parquet-lab-run-set.py"
+refuses_list() { # refuses_list <desc> <pattern> <list-contents>
+  local desc="$1" pattern="$2" contents="$3"
+  local lf="$TMP/badlist.txt"; printf '%s\n' "$contents" > "$lf"
+  local out; out="$(python3 "$PLANNER" plan --specs-from "$lf" --backend local --repetitions 1 --seed 1 --out "$TMP/x.json" 2>&1)"
+  if [[ $? -eq 0 ]]; then echo "FAIL: $desc — expected refusal"; fail=$((fail+1)); return; fi
+  if ! grep -qE "$pattern" <<<"$out"; then echo "FAIL: $desc — /$pattern/ not in: $out"; fail=$((fail+1)); return; fi
+  echo "ok: $desc"; pass=$((pass+1))
+}
+refuses_list "missing spec" "does not exist"       "bench/config/parquet-lab/pages/nope.toml"
+refuses_list "duplicate spec" "duplicate spec path" "$(printf 'bench/config/parquet-lab/pages/page-64k.toml\nbench/config/parquet-lab/pages/page-64k.toml')"
+refuses_list "absolute spec" "absolute spec path"   "/etc/passwd.toml"
+refuses_list "traversing spec" "traversing spec path" "bench/config/parquet-lab/../../../etc/x.toml"
+refuses_list "non-TOML spec" "non-TOML spec path"   "bench/config/parquet-lab/pages/page-64k.json"
+refuses_list "outside spec" "outside bench/config/parquet-lab" "Cargo.toml"
+
+# Golden: the committed minimal-screen.txt is EXACTLY the 11 registered paths, in order.
+EXPECTED_SCREEN="$(cat <<'LIST'
+bench/config/parquet-lab/pages/rowgroup-32k.toml
+bench/config/parquet-lab/pages/rowgroup-512k.toml
+bench/config/parquet-lab/pages/page-64k.toml
+bench/config/parquet-lab/encodings/strings-no-dict.toml
+bench/config/parquet-lab/encodings/ts-plain.toml
+bench/config/parquet-lab/compression/lz4-raw.toml
+bench/config/parquet-lab/compression/zstd-1.toml
+bench/config/parquet-lab/compression/zstd-6.toml
+bench/config/parquet-lab/types/team-int32.toml
+bench/config/parquet-lab/types/ts-timestamp.toml
+bench/config/parquet-lab/blooms/distinct-id-01.toml
+LIST
+)"
+ACTUAL_SCREEN="$(grep -vE '^\s*(#|$)' bench/config/parquet-lab/minimal-screen.txt)"
+if [[ "$EXPECTED_SCREEN" == "$ACTUAL_SCREEN" ]]; then
+  echo "ok: minimal-screen.txt pins exactly the 11 registered specs"; pass=$((pass+1))
+else echo "FAIL: minimal-screen.txt drifted from the registered 11"; fail=$((fail+1)); fi
+
+
 echo
 echo "parquet-lab.sh tests: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]
