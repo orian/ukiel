@@ -57,6 +57,12 @@ pub struct Probe {
 pub struct Suite {
     pub suite_version: String,
     pub kind: SuiteKind,
+    /// The `CREATE VIEW events AS ...` body that casts each physical column back to the
+    /// snapshot's declared logical type. Baked from the snapshot at compile time so every
+    /// variant — whatever physical types it stores — presents the identical logical
+    /// schema, and query answers are comparable across variants by construction.
+    #[serde(default)]
+    pub view_sql: String,
     pub queries: Vec<Query>,
     pub probes: Vec<Probe>,
 }

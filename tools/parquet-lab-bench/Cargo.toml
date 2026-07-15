@@ -1,0 +1,35 @@
+[package]
+name = "parquet-lab-bench"
+version.workspace = true
+edition.workspace = true
+description = "Run declared queries read-only over one laboratory artifact with exact result equivalence and truthful I/O accounting (plan 47)."
+
+# READ-ONLY. It measures an artifact that already exists — it cannot generate, rewrite,
+# index, or compact one. It has no catalog mutator, writer, generator, or compactor
+# dependency; the boundary test keeps that honest. It uses DataFusion to read, an
+# instrumented ObjectStore to account for I/O, and the two pure laboratory libraries.
+
+[dependencies]
+parquet-lab-contract = { workspace = true }
+parquet-lab-integrity = { workspace = true }
+datafusion = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true, features = ["async", "object_store"] }
+object_store = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+url = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "parquet-lab-bench"
+path = "src/main.rs"

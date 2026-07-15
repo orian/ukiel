@@ -130,6 +130,7 @@ fn suite() -> Suite {
     Suite {
         suite_version: SUITE_VERSION.into(),
         kind: SuiteKind::ProdSynth,
+        view_sql: "CREATE VIEW events AS SELECT * FROM events_physical".into(),
         queries: vec![Query {
             name: "q_heavy_tenant".into(),
             sql: "SELECT count(*) FROM events WHERE team_id = 900".into(),

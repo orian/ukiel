@@ -646,20 +646,20 @@ parquet-lab-bench run \
   [--skip-manifest FILE]
 ```
 
-- [ ] **Step 1: Define versioned suites.** Import the six prod-synth query
+- [x] **Step 1: Define versioned suites.** Import the six prod-synth query
   classes and existing adapted ClickBench SQL without calling their executable
   handlers. Add parameterized probes with expected selectivity/result digests.
-- [ ] **Step 2: Write accounting tests.** `CountingObjectStore` attributes
+- [x] **Step 2: Write accounting tests.** `CountingObjectStore` attributes
   HEAD/get/range requests and requested/returned bytes by metadata, index, and
   data phase. No coordinated omission; every scheduled query is completed or
   failed and counted.
-- [ ] **Step 3: Implement schema/result equivalence before timing.** Physical
+- [x] **Step 3: Implement schema/result equivalence before timing.** Physical
   variants are exposed through the declared logical projection; normalized
   batches must equal the snapshot control exactly.
-- [ ] **Step 4: Capture plans and DataFusion metrics.** Pin reader flags, cache
+- [x] **Step 4: Capture plans and DataFusion metrics.** Pin reader flags, cache
   posture, cold/warm phases, run order, host metadata, and missing metrics as
   `null`. Refuse report overwrite.
-- [ ] **Step 5: Prove read-only boundaries and commit.** The package has no
+- [x] **Step 5: Prove read-only boundaries and commit.** The package has no
   catalog mutator, writer, generator, or compactor dependency.
 
 ```bash

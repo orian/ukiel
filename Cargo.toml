@@ -30,6 +30,7 @@ members = [
     "tools/parquet-lab-snapshot",
     "tools/parquet-census",
     "tools/parquet-rewrite",
+    "tools/parquet-lab-bench",
 ]
 
 [workspace.package]
