@@ -3196,6 +3196,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "parquet-lab-contract"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "parquet-lab-integrity"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "blake3",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "parse-display"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

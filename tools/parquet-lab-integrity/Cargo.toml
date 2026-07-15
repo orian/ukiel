@@ -1,0 +1,23 @@
+[package]
+name = "parquet-lab-integrity"
+version.workspace = true
+edition.workspace = true
+description = "Canonical logical-row fingerprint (logical-row-multiset/v1) shared by the plan-47 snapshot and rewrite tools."
+
+# The plan-46 physical `row-multiset/v1` must *disagree* when `Int64` becomes
+# `Int32` — that is correct for compaction integrity but wrong for a type
+# experiment, where the whole point is to prove two different physical
+# representations carry the same declared logical values. So plan 47 adds a second,
+# narrowly-scoped fingerprint keyed off the manifest's declared *logical* types.
+#
+# It depends on Arrow (to read the batches) and BLAKE3 (the hash), and on NO Parquet
+# reader, DataFusion, Ukiel, or service client. The canonical encoder lives here,
+# once, so snapshot and rewrite cannot drift; tests/boundary.rs enforces the floor.
+
+[dependencies]
+arrow = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

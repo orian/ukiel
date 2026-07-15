@@ -21,6 +21,12 @@ members = [
     # stager and the part-shape runner, and the offline L0 stager itself.
     "tools/prod-synth-integrity",
     "tools/prod-synth-l0",
+    # Plan 47 (parquet storage laboratory). Small single-purpose executables joined
+    # only by the versioned files in `parquet-lab-contract`; a canonical logical-row
+    # fingerprint in `parquet-lab-integrity` is shared by the snapshot and rewrite
+    # tools. No executable package depends on another executable package.
+    "tools/parquet-lab-contract",
+    "tools/parquet-lab-integrity",
 ]
 
 [workspace.package]

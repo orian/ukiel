@@ -1,0 +1,17 @@
+[package]
+name = "parquet-lab-contract"
+version.workspace = true
+edition.workspace = true
+description = "Versioned serde contracts for the plan-47 parquet storage laboratory: snapshots, variants, skip-index sidecars, suites, and reports."
+
+# The public artifact contract shared by every plan-47 laboratory executable. It
+# parses no Parquet, reads no Arrow, contacts no service, and benchmarks nothing —
+# it is serde types, version gates, and BLAKE3 digests. Keeping it that small is
+# what lets snapshot, census, rewrite, skip-index, and bench all depend on it
+# without any of them depending on each other.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }
