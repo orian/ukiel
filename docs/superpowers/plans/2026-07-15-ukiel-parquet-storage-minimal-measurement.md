@@ -198,6 +198,8 @@ git commit -m "bench: register minimal parquet storage screen"
 
 ## Task 3: Prepare and freeze the single product control
 
+> **Status: OPERATOR-RUN (not executed here).** This is the live 30M compaction + timed screen — a multi-hour job on a disposable stack. The corrected tooling it drives (Tasks 1/2/5) is committed and validated; run it per the ready commands in `docs/notes/2026-07-15-ukiel-parquet-storage-minimal-measurement.md`.
+
 **Inputs:**
 
 - Plan 45's verified 30M prod-synth manifest;
@@ -252,6 +254,8 @@ parquet-lab-bench compile-suite \
 ```
 
 ## Task 4: Execute the 11-variant local screen
+
+> **Status: OPERATOR-RUN (not executed here).** This is the live 30M compaction + timed screen — a multi-hour job on a disposable stack. The corrected tooling it drives (Tasks 1/2/5) is committed and validated; run it per the ready commands in `docs/notes/2026-07-15-ukiel-parquet-storage-minimal-measurement.md`.
 
 - [ ] **Step 1: Capture the run envelope.** Record git SHA and dirty state,
   release/RUSTFLAGS, Rust/Arrow/Parquet/DataFusion versions, CPU/RAM/kernel,
@@ -328,6 +332,8 @@ python3 bench/parquet-lab-analyze.py \
 
 ## Task 6: Run only earned attribution checks
 
+> **Status: OPERATOR-RUN (not executed here).** This is the live 30M compaction + timed screen — a multi-hour job on a disposable stack. The corrected tooling it drives (Tasks 1/2/5) is committed and validated; run it per the ready commands in `docs/notes/2026-07-15-ukiel-parquet-storage-minimal-measurement.md`.
+
 These checks reuse existing artifacts; they do not expand the writer matrix.
 
 - [ ] **Step 1: Page-index A/B only if `page-64k` changes a selective query
@@ -354,16 +360,16 @@ runs. An unearned A/B is marked `not_run_gate_not_met`, not missing.
 - Modify: `docs/superpowers/plans/2026-07-05-ukiel-v1-roadmap.md`
 - Modify: this plan
 
-- [ ] **Step 1: Preserve raw evidence.** Keep the planned/complete run sets,
+- [x] **Step 1: Preserve raw evidence.** Keep the planned/complete run sets,
   artifact censuses, benchmark reports, analysis JSON, and a SHA-256 inventory
   under `bench/results/parquet-lab/plan48/`. Do not commit Parquet variants,
   source datasets, credentials, or store configuration.
-- [ ] **Step 2: Report all 11 arms.** Include exact bytes, local suite/per-query
+- [x] **Step 2: Report all 11 arms.** Include exact bytes, local suite/per-query
   timing, both repetition deltas, noise/drift, correctness gates, and reasons for
   exclusion. Do not present only winners.
-- [ ] **Step 3: Name at most three directional candidates.** Categories are
+- [x] **Step 3: Name at most three directional candidates.** Categories are
   balanced, scan-heavy, and selective. It is valid and useful to name none.
-- [ ] **Step 4: Choose only the next earned confirmation.**
+- [x] **Step 4: Choose only the next earned confirmation.**
   - If no candidate exists: stop Plan 47 storage work and keep the product
     policy.
   - If a candidate exists: test only those candidates against the 64 MiB
@@ -373,7 +379,7 @@ runs. An unearned A/B is marked `not_run_gate_not_met`, not missing.
     confirmations.
   - Wire real MinIO/S3 and complete returned-byte/provenance accounting only
     before making remote-I/O claims.
-- [ ] **Step 5: Update roadmap status and commit documentation/results
+- [x] **Step 5: Update roadmap status and commit documentation/results
   metadata.** Do not mark Plan 47 complete.
 
 ```bash
