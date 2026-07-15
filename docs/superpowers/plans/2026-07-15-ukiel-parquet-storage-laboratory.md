@@ -1020,6 +1020,17 @@ cargo clippy -p parquet-lab-store -p parquet-lab-bench --all-targets -- -D warni
 git commit -m "bench: measure parquet on real storage backends"
 ```
 
+**Deviation (partial):** The `parquet-lab-store` publisher/verifier is complete and tested
+(local round-trip, tamper detection, prefix/overwrite/mutation refusals, credentials-never-
+serialized, boundary). The bench now has three real modes — `memory` (decode micro),
+`local` (real `LocalFileSystem`, no preload), `object-store` (`LocalFileSystem` +
+`CountingObjectStore`, no preload, per-request/range I/O accounting) — fixing the preload
+finding. **Still open for a follow-up pass:** returned-bytes-from-stream accounting (only
+requested bytes + ranges are counted; returned is `null`), footer/page-index/data range
+*classification*, fully additive per-repetition I/O (query timings are additive; the I/O
+delta keeps the last warm sample), the S3/MinIO integration test (operator-gated), and the
+`--publishable` provenance gate. These are recorded here rather than silently skipped.
+
 ### Task 47E: Make matrix execution fail-fast, safe, and reproducible
 
 **Files:**
@@ -1033,25 +1044,26 @@ Keep responsibilities narrow: `parquet-lab.sh` executes one declared
 block/repetition; `parquet-lab-run-set.py` plans, validates, and closes a run set.
 Neither script implements rewrite, census, query, upload, or analysis logic.
 
-- [ ] **Step 1: Make one-block execution fail-fast.** Use `set -euo pipefail`,
+- [x] **Step 1: Make one-block execution fail-fast.** Use `set -euo pipefail`,
   traps, a fresh temporary sibling, and atomic final publication. Any child
   failure writes a failed run-set state and returns nonzero; “block complete” is
   impossible until all expected JSON reports parse and bind.
-- [ ] **Step 2: Remove unsafe replacement.** Prefer refusing an existing output.
+- [x] **Step 2: Remove unsafe replacement.** Prefer refusing an existing output.
   If `--replace` remains, it may replace only a non-symlink directory containing
   the laboratory marker with the exact expected run-set/snapshot/suite/block
   digest and approved parent; it must refuse `/`, `.`, the repository root,
   empty paths, parent traversal, symlinks, and an unmarked directory.
-- [ ] **Step 3: Register deterministic interleaving.** The run-set planner takes
+- [x] **Step 3: Register deterministic interleaving.** The run-set planner takes
   `--repetitions 2 --seed N`, emits a seeded order with the product control at
   the beginning and end of each repetition, and records the complete schedule
   before execution. Reusing the seed reproduces byte-identical order; a report
   outside the schedule is rejected.
-- [ ] **Step 4: Add adversarial shell tests.** Cover child exit/non-JSON/partial
+- [x] **Step 4: Add adversarial shell tests.** Cover child exit/non-JSON/partial
   output, interrupted execution, duplicate reports, missing control, unsafe
   replace paths, symlinks, stale marker, different seed/order, and successful
   atomic close. Assert failed runs cannot be analyzed.
-- [ ] **Step 5: Verify and commit.**
+*(Deviation: bats is not installed in this repo, so the adversarial suite is `bench/tests/parquet-lab.sh` in the repository's plain-bash convention, not `.bats`.)*
+- [x] **Step 5: Verify and commit.**
 
 ```bash
 bash -n bench/parquet-lab.sh

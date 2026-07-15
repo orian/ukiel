@@ -1438,3 +1438,29 @@ snapshot bytes are the control. Refusal behaviour is covered by `bench/tests/par
 A `--skip-manifest DIR/skip.json` argument prices an experimental sidecar (built by
 `parquet-skip-index`) against native pruning; the sidecar must be provably bound to the
 variant being measured or the run is refused.
+
+### Reproducible run sets (Task 47E)
+
+`bench/parquet-lab.sh` is fail-fast (`set -euo pipefail`, a trap): it builds into a fresh
+temp sibling and **publishes into `--out` only by an atomic rename**, after every expected
+report has been produced and parses as JSON. "block complete" is impossible otherwise, and a
+child failure leaves no published output and a `state=failed` marker. `--replace` removes an
+existing output only when it is a real directory carrying the `.parquet-lab-marker` — never a
+symlink, `/`, `.`, the repo root, an unmarked directory, or a traversing path.
+
+`bench/parquet-lab-run-set.py` owns the schedule (the script runs one block/repetition):
+
+```bash
+bench/parquet-lab-run-set.py plan --block bench/config/parquet-lab/pages \
+  --backend object-store --repetitions 2 --seed 7 --out runs/pages.runset.json
+# ... run each rep with bench/parquet-lab.sh --rep 0/1 into runs/rep0, runs/rep1 ...
+bench/parquet-lab-run-set.py close --run-set runs/pages.runset.json \
+  --reports runs/rep0 runs/rep1 --out runs/pages.complete.json
+```
+
+`plan` emits a `ukiel-parquet-run-set/v1` with a **seeded interleaved order** — the product
+control at the start and end of each repetition — so the same seed reproduces a byte-
+identical schedule. `close` binds every produced report; only a `complete` run set is
+analyzable (a missing report yields `failed`). Adversarial behaviour is covered by
+`bench/tests/parquet-lab.sh` (bats is not installed in this repo, so the suite follows the
+repository's plain-bash test convention).
