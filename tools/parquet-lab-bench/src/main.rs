@@ -45,6 +45,21 @@ enum Command {
         #[arg(long)]
         replace: bool,
     },
+    /// Compile a suite with queries AND structured selectivity probes against the control.
+    CompileSuite {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long, value_enum)]
+        kind: SuiteKindArg,
+        #[arg(long)]
+        queries: PathBuf,
+        #[arg(long)]
+        probes: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        replace: bool,
+    },
     /// Run a suite over an artifact (snapshot or variant) and write a result report.
     Run {
         #[arg(long)]
@@ -122,6 +137,23 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             };
             parquet_lab_bench::compile(&manifest, kind, &sql, &suite_out, replace).await?;
             println!("wrote suite {}", suite_out.display());
+            Ok(())
+        }
+        Command::CompileSuite {
+            manifest,
+            kind,
+            queries,
+            probes,
+            output,
+            replace,
+        } => {
+            let kind = match kind {
+                SuiteKindArg::ProdSynth => parquet_lab_contract::SuiteKind::ProdSynth,
+                SuiteKindArg::ClickBench => parquet_lab_contract::SuiteKind::ClickBench,
+            };
+            parquet_lab_bench::compile_suite(&manifest, kind, &queries, &probes, &output, replace)
+                .await?;
+            println!("wrote suite {}", output.display());
             Ok(())
         }
         Command::Run {

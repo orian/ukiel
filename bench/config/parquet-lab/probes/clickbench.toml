@@ -1,0 +1,27 @@
+# Structured probes for the ClickBench OLAP confirmation slice. Column names follow the
+# adapted 25-column ClickBench schema; a probe whose column is absent is recorded skipped
+# with `column_missing` rather than dropped.
+
+[[probe]]
+name = "eq_userid"
+family = "equality"
+column = "UserID"
+target_selectivity = 0.001
+
+[[probe]]
+name = "range_eventtime"
+family = "range"
+column = "EventTime"
+target_selectivity = 0.1
+
+[[probe]]
+name = "prefix_url"
+family = "prefix"
+column = "URL"
+prefix_len = 12
+
+[[probe]]
+name = "wide_proj_userid"
+family = "wide_projection"
+column = "UserID"
+target_selectivity = 0.01

@@ -151,6 +151,12 @@ fn suite() -> Suite {
             match_count: 42,
             observed_selectivity: 42.0 / 8000.0,
         }],
+        skipped_probes: vec![parquet_lab_contract::SkippedProbe {
+            name: "eq_missing".into(),
+            family: ProbeFamily::Equality,
+            column: "does_not_exist".into(),
+            reason: parquet_lab_contract::ProbeSkipReason::ColumnMissing,
+        }],
     }
 }
 

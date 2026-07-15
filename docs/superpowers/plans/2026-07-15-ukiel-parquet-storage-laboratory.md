@@ -869,7 +869,7 @@ git commit -m "bench: bind parquet laboratory run contracts"
 - Create: `bench/config/parquet-lab/probes/{prod-synth,clickbench}.toml`
 - Modify: `tools/parquet-lab-bench/README.md`
 
-- [ ] **Step 1: Expose an explicit compiler interface.**
+- [x] **Step 1: Expose an explicit compiler interface.**
 
 ```text
 parquet-lab-bench compile-suite \
@@ -881,21 +881,21 @@ parquet-lab-bench compile-suite \
   exact result digest, total rows, match rows, and observed selectivity, then
   freeze those values in the suite. Refuse an empty probe set for Blocks A, D,
   E, or F; Block E specifically requires a non-packing-key equality probe.
-- [ ] **Step 2: Make unsupported probes explicit.** A requested probe is either
+- [x] **Step 2: Make unsupported probes explicit.** A requested probe is either
   compiled or recorded with one stable reason (`column_missing`,
   `no_literal_in_band`, `unsupported_type`, or `empty_control`). Never replace
   it with `Vec::new()` or silently drop it. The matrix preflight refuses a block
   whose required probe family did not compile.
-- [ ] **Step 3: Make answer semantics correct.** `ordered` digests canonical
+- [x] **Step 3: Make answer semantics correct.** `ordered` digests canonical
   Arrow values in result order. `multiset` digests canonical rows independent of
   batch and row order while preserving duplicate counts. Audit ClickBench SQL:
   every potentially multi-row query must either have deterministic total
   ordering or use `multiset`; scalar aggregates remain `ordered`.
-- [ ] **Step 4: Test the compiled workload.** Golden fixtures cover every probe
+- [x] **Step 4: Test the compiled workload.** Golden fixtures cover every probe
   kind and selectivity band, missing literals, nulls, Unicode prefixes, duplicate
   result rows, changed answers, reordered batches, and deterministic recompiles.
   Assert that at least one equality probe reaches the benchmark runner.
-- [ ] **Step 5: Verify and commit.**
+- [x] **Step 5: Verify and commit.**
 
 ```bash
 cargo test -p parquet-lab-bench --test probes

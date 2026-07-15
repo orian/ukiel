@@ -98,6 +98,30 @@ pub struct Probe {
     pub observed_selectivity: f64,
 }
 
+/// Why a requested probe could not be compiled. Recorded, never silently dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeSkipReason {
+    /// The probe's column is not in the control schema.
+    ColumnMissing,
+    /// No literal realized a usable selectivity band (e.g. the column is constant, or the
+    /// requested predicate matched everything or nothing where that is meaningless).
+    NoLiteralInBand,
+    /// The column's type does not support the requested predicate family.
+    UnsupportedType,
+    /// The control had no rows to compile against.
+    EmptyControl,
+}
+
+/// A requested probe that could not be compiled, with its stable reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedProbe {
+    pub name: String,
+    pub family: ProbeFamily,
+    pub column: String,
+    pub reason: ProbeSkipReason,
+}
+
 /// The compiled suite.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Suite {
@@ -111,6 +135,10 @@ pub struct Suite {
     pub view_sql: String,
     pub queries: Vec<Query>,
     pub probes: Vec<Probe>,
+    /// Requested probes that did not compile, each with a stable reason. A probe is either
+    /// here or in `probes` — never silently dropped.
+    #[serde(default)]
+    pub skipped_probes: Vec<SkippedProbe>,
 }
 
 impl Suite {

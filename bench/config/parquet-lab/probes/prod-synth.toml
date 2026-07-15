@@ -1,0 +1,45 @@
+# Structured selectivity probes for the prod-synth event suite. Compiled against the
+# immutable control by `parquet-lab-bench compile-suite`, which materializes a typed literal
+# realizing each band and freezes the observed selectivity. `event` is a non-packing-key
+# equality probe — Block E's requirement (the packing key `team_id` is excluded on purpose).
+
+[[probe]]
+name = "eq_event"
+family = "equality"
+column = "event"
+target_selectivity = 0.05
+
+[[probe]]
+name = "eq_distinct_id"
+family = "equality"
+column = "distinct_id"
+target_selectivity = 0.001
+
+[[probe]]
+name = "range_timestamp"
+family = "range"
+column = "timestamp"
+target_selectivity = 0.1
+
+[[probe]]
+name = "prefix_url"
+family = "prefix"
+column = "mat_$current_url"
+prefix_len = 8
+
+[[probe]]
+name = "isnull_url"
+family = "is_null"
+column = "mat_$current_url"
+
+[[probe]]
+name = "narrow_proj_team"
+family = "narrow_projection"
+column = "team_id"
+target_selectivity = 0.05
+
+[[probe]]
+name = "wide_proj_team"
+family = "wide_projection"
+column = "team_id"
+target_selectivity = 0.05

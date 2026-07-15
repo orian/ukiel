@@ -39,3 +39,22 @@ control's before any warm timing; a changed answer rejects the variant.
 
 Object-store I/O is measured, never inferred from output file size. Reports are written
 atomically and refuse to overwrite without `--replace`.
+
+## Selectivity probes (Task 47B)
+
+```text
+parquet-lab-bench compile-suite \
+  --manifest CONTROL.json --queries QUERIES.sql --probes PROBES.toml --output SUITE.json
+```
+
+Probes are declared by family + column + target band and *compiled* against the immutable
+control: the compiler materializes a typed literal that realizes a usable band, renders the
+predicate SQL, and freezes the exact answer digest, control row count, match count, and the
+**observed** selectivity. A requested probe that cannot be compiled is recorded with one
+stable reason (`column_missing`, `no_literal_in_band`, `unsupported_type`, `empty_control`)
+— never silently dropped — and a non-empty request that compiles nothing is refused (Blocks
+A/D/E/F require a probe set; Block E requires a non-packing-key equality probe like
+`eq_event`). Probe/query answers are compared under declared **result semantics**:
+`ordered` (scalar aggregates, deterministic `ORDER BY`) or `multiset` (a multi-row answer
+whose row order is not part of the result, compared order-independently but preserving
+duplicate counts). Probe request files live under `bench/config/parquet-lab/probes/`.

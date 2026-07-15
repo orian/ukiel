@@ -105,7 +105,11 @@ pub async fn compile(
     let mut queries = Vec::with_capacity(statements.len());
     for (name, sql) in statements {
         let run = run_query(&session, &sql).await?;
-        let digest = compare::result_digest(&run.schema, &run.batches)?;
+        let digest = compare::result_digest(
+            &run.schema,
+            &run.batches,
+            parquet_lab_contract::ResultSemantics::Ordered,
+        )?;
         queries.push(suites::to_query(name, sql, digest));
     }
 
@@ -115,6 +119,82 @@ pub async fn compile(
         view_sql,
         queries,
         probes: Vec::new(),
+        skipped_probes: Vec::new(),
+    };
+    suite.validate(&suite_out.display().to_string())?;
+    write_atomic(suite_out, &serde_json::to_vec_pretty(&suite)?)?;
+    Ok(())
+}
+
+/// Compile a suite with queries *and* structured selectivity probes against the control.
+/// Each probe is compiled (typed literals, exact digest, observed selectivity) or recorded
+/// with a stable skip reason; a non-empty probe request that compiles nothing is refused.
+pub async fn compile_suite(
+    control_manifest_path: &Path,
+    kind: SuiteKind,
+    queries_path: &Path,
+    probes_path: &Path,
+    suite_out: &Path,
+    replace: bool,
+) -> Result<()> {
+    if suite_out.exists() && !replace {
+        bail!("{} already exists; pass --replace", suite_out.display());
+    }
+    let snap_bytes = std::fs::read(control_manifest_path)
+        .with_context(|| format!("reading {}", control_manifest_path.display()))?;
+    let snapshot =
+        SnapshotManifest::parse(&control_manifest_path.display().to_string(), &snap_bytes)?;
+    let view_sql = suites::build_view_sql(&snapshot)?;
+    let control_rows = snapshot.total_rows;
+
+    let (artifact, _) = load_artifact(control_manifest_path)?;
+    let session = artifact
+        .session(Mode::Local, ReaderFlags::default(), &view_sql)
+        .await?;
+
+    // Queries.
+    let sql_text = std::fs::read_to_string(queries_path)
+        .with_context(|| format!("reading {}", queries_path.display()))?;
+    let mut queries = Vec::new();
+    for (name, sql) in suites::parse_sql_queries(&sql_text)? {
+        let run = run_query(&session, &sql).await?;
+        let digest = compare::result_digest(
+            &run.schema,
+            &run.batches,
+            parquet_lab_contract::ResultSemantics::Ordered,
+        )?;
+        queries.push(suites::to_query(name, sql, digest));
+    }
+
+    // Probes.
+    let probe_bytes =
+        std::fs::read(probes_path).with_context(|| format!("reading {}", probes_path.display()))?;
+    let requests =
+        suites::probes::parse_requests(&probe_bytes, &probes_path.display().to_string())?;
+    let mut probes = Vec::new();
+    let mut skipped = Vec::new();
+    for req in &requests {
+        match suites::probes::compile_probe(&session, req, control_rows).await? {
+            suites::probes::Compiled::Probe(p) => probes.push(*p),
+            suites::probes::Compiled::Skipped(s) => skipped.push(s),
+        }
+    }
+    if !requests.is_empty() && probes.is_empty() {
+        bail!(
+            "no requested probe compiled ({} skipped). Blocks A/D/E/F require a non-empty probe \
+             set; check the probe columns exist and can realize a band. Skips: {:?}",
+            skipped.len(),
+            skipped
+        );
+    }
+
+    let suite = Suite {
+        suite_version: parquet_lab_contract::SUITE_VERSION.to_string(),
+        kind,
+        view_sql,
+        queries,
+        probes,
+        skipped_probes: skipped,
     };
     suite.validate(&suite_out.display().to_string())?;
     write_atomic(suite_out, &serde_json::to_vec_pretty(&suite)?)?;
@@ -171,6 +251,7 @@ pub async fn run(
         name: String,
         sql: String,
         expected: String,
+        semantics: parquet_lab_contract::ResultSemantics,
     }
     let mut runnables: Vec<Runnable> = suite
         .queries
@@ -179,6 +260,7 @@ pub async fn run(
             name: q.name.clone(),
             sql: q.sql.clone(),
             expected: q.expected_result_digest.clone(),
+            semantics: q.result_semantics,
         })
         .collect();
     for p in &suite.probes {
@@ -186,6 +268,7 @@ pub async fn run(
             name: p.name.clone(),
             sql: p.sql.clone(),
             expected: p.expected_result_digest.clone(),
+            semantics: p.result_semantics,
         });
     }
 
@@ -200,7 +283,7 @@ pub async fn run(
                 .session(params.mode, params.reader_flags, &suite.view_sql)
                 .await?;
             let run = run_query(&session, &q.sql).await?;
-            result_digest = compare::result_digest(&run.schema, &run.batches)?;
+            result_digest = compare::result_digest(&run.schema, &run.batches, q.semantics)?;
             result_rows = compare::row_count(&run.batches);
             cold_ms.push(run.elapsed_ms);
         }

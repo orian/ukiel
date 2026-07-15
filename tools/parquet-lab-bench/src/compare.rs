@@ -51,16 +51,31 @@ fn canonicalize(batch: &RecordBatch) -> Result<(Arc<Schema>, RecordBatch)> {
     Ok((schema, batch))
 }
 
-/// A canonical digest of a query result: the canonical schema plus every row, in result
-/// order. BLAKE3 over the canonicalized Arrow IPC stream.
-pub fn result_digest(_schema: &Schema, batches: &[RecordBatch]) -> Result<String> {
+pub use parquet_lab_contract::ResultSemantics;
+
+/// A canonical digest of a query result under the declared answer semantics.
+///
+/// `Ordered` hashes the canonicalized Arrow rows *in result order* — for a scalar aggregate
+/// or a query with a deterministic total `ORDER BY`. `Multiset` hashes the canonical rows
+/// independent of batch and row order while preserving duplicate counts — for a multi-row
+/// answer whose row order is not itself part of the declared result.
+pub fn result_digest(
+    schema: &Schema,
+    batches: &[RecordBatch],
+    semantics: ResultSemantics,
+) -> Result<String> {
+    match semantics {
+        ResultSemantics::Ordered => ordered_digest(schema, batches),
+        ResultSemantics::Multiset => multiset_digest(batches),
+    }
+}
+
+fn ordered_digest(_schema: &Schema, batches: &[RecordBatch]) -> Result<String> {
     if batches.is_empty() {
-        // An empty result still has an identity: hash the marker.
         return Ok(blake3::hash(b"parquet-lab-empty-result")
             .to_hex()
             .to_string());
     }
-    // Canonicalize the first batch to fix the schema, then all batches under it.
     let (schema, first) = canonicalize(&batches[0])?;
     let mut buf: Vec<u8> = Vec::new();
     {
@@ -78,6 +93,112 @@ pub fn result_digest(_schema: &Schema, batches: &[RecordBatch]) -> Result<String
         writer.finish().context("finishing IPC stream")?;
     }
     Ok(blake3::hash(&buf).to_hex().to_string())
+}
+
+/// Hash the canonical rows independent of order: encode each row to canonical bytes, sort
+/// the row-byte vector (duplicates preserved), and hash the schema + sorted rows.
+fn multiset_digest(batches: &[RecordBatch]) -> Result<String> {
+    if batches.is_empty() {
+        return Ok(blake3::hash(b"parquet-lab-empty-result")
+            .to_hex()
+            .to_string());
+    }
+    // Fix the canonical schema from the first batch; every batch canonicalizes to it.
+    let (schema, _first) = canonicalize(&batches[0])?;
+    let mut rows: Vec<Vec<u8>> = Vec::new();
+    for b in batches {
+        let (_s, canon) = canonicalize(b)?;
+        encode_rows(&canon, &mut rows)?;
+    }
+    rows.sort_unstable();
+    let mut h = blake3::Hasher::new();
+    // Bind the schema (names + canonical types) so two different shapes never collide.
+    for f in schema.fields() {
+        h.update(f.name().as_bytes());
+        h.update(format!("{:?}", f.data_type()).as_bytes());
+    }
+    h.update(&(rows.len() as u64).to_le_bytes());
+    for r in &rows {
+        h.update(&(r.len() as u64).to_le_bytes());
+        h.update(r);
+    }
+    Ok(h.finalize().to_hex().to_string())
+}
+
+/// Encode each row of a canonicalized batch to type-tagged bytes.
+fn encode_rows(batch: &RecordBatch, out: &mut Vec<Vec<u8>>) -> Result<()> {
+    use arrow::array::*;
+    for row in 0..batch.num_rows() {
+        let mut buf = Vec::with_capacity(64);
+        for col in batch.columns() {
+            if col.is_null(row) {
+                buf.push(0u8);
+                continue;
+            }
+            match col.data_type() {
+                DataType::Int64 => {
+                    buf.push(1);
+                    buf.extend_from_slice(
+                        &col.as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap()
+                            .value(row)
+                            .to_le_bytes(),
+                    );
+                }
+                DataType::Int32 => {
+                    buf.push(2);
+                    buf.extend_from_slice(
+                        &col.as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap()
+                            .value(row)
+                            .to_le_bytes(),
+                    );
+                }
+                DataType::Float64 => {
+                    buf.push(3);
+                    let v = col
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .unwrap()
+                        .value(row);
+                    let v = if v == 0.0 { 0.0 } else { v };
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+                DataType::Boolean => {
+                    buf.push(4);
+                    buf.push(
+                        col.as_any()
+                            .downcast_ref::<BooleanArray>()
+                            .unwrap()
+                            .value(row) as u8,
+                    );
+                }
+                DataType::Utf8 => {
+                    buf.push(5);
+                    let s = col
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .value(row);
+                    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(s.as_bytes());
+                }
+                other => {
+                    // Fall back to the debug form of a one-row slice for any type the canonical
+                    // coercion left (rare in these suites); still deterministic.
+                    buf.push(6);
+                    let s = format!("{:?}", col.slice(row, 1));
+                    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(s.as_bytes());
+                    let _ = other;
+                }
+            }
+        }
+        out.push(buf);
+    }
+    Ok(())
 }
 
 /// The row count across all batches.
@@ -123,9 +244,14 @@ mod tests {
         )
         .unwrap();
 
-        let a = result_digest(&plain.schema(), std::slice::from_ref(&plain)).unwrap();
-        let b = result_digest(&view.schema(), &[view]).unwrap();
-        let c = result_digest(&dict.schema(), &[dict]).unwrap();
+        let a = result_digest(
+            &plain.schema(),
+            std::slice::from_ref(&plain),
+            ResultSemantics::Ordered,
+        )
+        .unwrap();
+        let b = result_digest(&view.schema(), &[view], ResultSemantics::Ordered).unwrap();
+        let c = result_digest(&dict.schema(), &[dict], ResultSemantics::Ordered).unwrap();
         assert_eq!(a, b, "Utf8 and Utf8View must digest equal");
         assert_eq!(a, c, "Utf8 and Dictionary must digest equal");
 
@@ -137,6 +263,9 @@ mod tests {
             ]))],
         )
         .unwrap();
-        assert_ne!(a, result_digest(&other.schema(), &[other]).unwrap());
+        assert_ne!(
+            a,
+            result_digest(&other.schema(), &[other], ResultSemantics::Ordered).unwrap()
+        );
     }
 }
