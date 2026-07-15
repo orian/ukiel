@@ -136,6 +136,40 @@ comparisons; plan 40 remains the catalog capacity proof. prod-synth answers a qu
 neither of them can: what the catalog's key filter and the scoped query path do when the
 tenant/part geometry is the one production actually has.
 
+### prod-synth part shape (plan 46) — Ukiel's own compacted output
+
+Plan 45 measures the fixture as loaded. Plan 46 asks a different question: what part
+shapes does the **real compactor** create from it, and are those parts in the regime the
+issue-0014 key filter is built for? Two more binaries stage the rows as Ukiel L0 and drive
+the measurement, and an orchestration script runs one placement arm end to end:
+
+```bash
+# 1. Stage the generated rows as UTC-day-partitioned L0 (offline).
+prod-synth-l0 stage --manifest .../manifest.json --output bench/datasets/prod-synth-l0/baseline --flush-rows 100000
+
+# 2. Run one placement arm against a DISPOSABLE stack: load L0, compact, measure.
+cp bench/config/prod-synth-compactor.toml.example bench/config/arm.toml   # then edit catalog/store
+bench/prod-synth-part-shape.sh \
+  --l0-manifest bench/datasets/prod-synth-l0/baseline/l0-manifest.json \
+  --placement packed --label baseline-packed \
+  --config bench/config/arm.toml --out bench/results/prod-synth-part-shape/baseline-packed --ephemeral
+```
+
+The script loads the staged L0 through `ukiel-prod-load compaction-input`, launches a
+compactor-only `ukield`, waits for convergence, stops it, scans the final part shape, runs
+the unvacuumed admission A/B, **pauses for an operator `VACUUM (ANALYZE) parts`**, runs the
+vacuumed A/B, and runs the compacted query equivalence. It stops only the compactor it
+started and preserves every report on failure. The whole matrix is one invocation per
+`(tier, placement)` arm, each against its own reset stack.
+
+Refusal behaviour is checked by `bench/tests/prod-synth-part-shape.sh` (no services
+needed). The example compactor config is `bench/config/prod-synth-compactor.toml.example`.
+
+First smoke result: the real compactor merged 70 L0 runs into 14 final parts (one per UTC
+day) holding 181–329 distinct keys each — squarely in the 1024-byte filter tier, every part
+filtered, fingerprint matching the staged input. Ukiel's day-partitioned merge writes far
+smaller key sets than the source ClickHouse shape (49,300 keys/part).
+
 ---
 
 ## 3. Commands

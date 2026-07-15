@@ -1,0 +1,37 @@
+# Compactor-only ukield config for the plan-46 part-shape experiment.
+#
+# Copy this, point [catalog] and [object_store] at a DISPOSABLE stack, and run
+# bench/prod-synth-part-shape.sh against it. It bootstraps no tables — the fixture is
+# loaded by `ukiel-prod-load compaction-input`, and this process only compacts.
+#
+# The one non-default choice is finalize_after_secs = 0: the experiment wants the
+# compactor to fold every UTC-day partition into ONE final run as soon as it goes quiet,
+# rather than the hour a production deployment waits. Everything else is the production
+# shape (l0_fanout = 4, fanout = 10) so the ladder the experiment measures is the ladder
+# production climbs.
+
+roles = ["compactor"]
+
+[catalog]
+# A throwaway database. The load refuses a catalog holding non-experiment hypertables.
+url = "postgres://postgres:postgres@127.0.0.1:5432/prod_synth_part_shape"
+
+[object_store]
+kind = "s3"
+endpoint = "http://127.0.0.1:19000"
+bucket = "ukiel"
+access_key_id = "minioadmin"
+secret_access_key = "minioadmin"
+allow_http = true
+
+[compactor]
+poll_interval_ms = 100
+l0_fanout = 4
+fanout = 10
+# 0: fold a quiet partition immediately, so the bounded experiment reaches one final run
+# per UTC-day partition instead of waiting an hour.
+finalize_after_secs = 0
+finalize_poll_interval_ms = 100
+lease_ttl_secs = 60
+lease_renew_interval_secs = 20
+candidate_limit = 64
