@@ -74,8 +74,16 @@ def classify(size_delta, time_delta, size_band, time_band):
     return "no-demonstrated-change"
 
 
+def report_path(rep_dir, entry):
+    # Prefer the scheduled report_id (Plan 48); fall back to the label for older run sets.
+    name = entry.get("report_id") or entry["label"]
+    return os.path.join(rep_dir, "bench", f"{name}.json")
+
+
 def load_reports(run_set, rep_dirs):
-    """Load exactly the bound reports, verifying each digest. Returns {label: [reports...]}."""
+    """Load exactly the bound reports, verifying each digest. Returns {label: [(entry, report)]}.
+    Each entry is a distinct scheduled measurement — the two control brackets of a repetition
+    are two separate reports, never the same file loaded twice."""
     if run_set.get("state") != "complete":
         raise SystemExit("error: only a COMPLETE run set is analyzable")
     if len(rep_dirs) != run_set["repetitions"]:
@@ -83,7 +91,7 @@ def load_reports(run_set, rep_dirs):
     by_label = {}
     exclusions = []
     for entry in run_set["schedule"]:
-        path = os.path.join(rep_dirs[entry["repetition"]], "bench", f"{entry['label']}.json")
+        path = report_path(rep_dirs[entry["repetition"]], entry)
         if not os.path.isfile(path):
             raise SystemExit(f"error: bound report missing: {entry['expected_report_id']}")
         if entry.get("report_digest") and sha256_file(path) != entry["report_digest"]:
@@ -104,16 +112,40 @@ def analyze(run_set, rep_dirs):
     if CONTROL not in by_label:
         raise SystemExit("error: the run set has no product control")
 
-    # The control T_i pool across all its repetitions -> the noise band.
+    # The control T_i pool across all its repetitions -> the noise band. Each control report
+    # is a distinct measurement (the start and end brackets are separate files).
     control_pool = []
-    for _entry, rep in by_label[CONTROL]:
+    per_control = {}  # (repetition, order_index) -> suite median
+    for entry, rep in by_label[CONTROL]:
         ts, reason = suite_totals(rep)
         if reason:
             exclusions.append({"label": CONTROL, "reason": reason})
         control_pool.extend(ts)
+        per_control[(entry["repetition"], entry["order_index"])] = median(ts)
     control_median = median(control_pool)
     time_band = (3.0 * mad(control_pool) / control_median) if control_median else 0.0
     size_band = 0.05
+
+    # Start-to-end control drift per repetition: the first and last scheduled control.
+    control_drift = []
+    reps_seen = sorted({k[0] for k in per_control})
+    for r in reps_seen:
+        orders = sorted(o for (rr, o) in per_control if rr == r)
+        if len(orders) >= 2:
+            start = per_control[(r, orders[0])]
+            end = per_control[(r, orders[-1])]
+            drift = abs(end - start) / control_median if control_median else 0.0
+            # A control that moves more than 5% start-to-end signals machine drift within the
+            # repetition. (Comparing to the pooled `time_band` cannot work: two equal control
+            # clusters make the pool's MAD exactly inflate the band past the drift, so the
+            # drift can never "exceed" it — a fixed threshold is the honest flag here.)
+            control_drift.append({
+                "repetition": r,
+                "start_ms": round(start, 3),
+                "end_ms": round(end, 3),
+                "drift_pct": round(drift * 100, 2),
+                "exceeds_noise": drift > 0.05,
+            })
 
     control_bytes = census_bytes(rep_dirs[0], CONTROL)
 
@@ -159,6 +191,7 @@ def analyze(run_set, rep_dirs):
         "control_digest": run_set.get("control_digest", ""),
         "control_median_ms": round(control_median, 3),
         "control_bytes": control_bytes,
+        "control_drift": control_drift,
         "time_band": time_band,
         "size_band": size_band,
         "exclusions": exclusions,
@@ -177,6 +210,9 @@ def main():
 
     print(f"control: {result['control_bytes']} compressed bytes, {result['control_median_ms']} ms warm median")
     print(f"noise bands: size {result['size_band']*100:.1f}% (threshold), time {result['time_band']*100:.1f}%")
+    for d in result["control_drift"]:
+        flag = " EXCEEDS NOISE" if d["exceeds_noise"] else ""
+        print(f"control drift rep {d['repetition']}: {d['start_ms']} -> {d['end_ms']} ms ({d['drift_pct']}%){flag}")
     if result["exclusions"]:
         print(f"exclusions: {result['exclusions']}")
     print(f"\n{'variant':32} {'size Δ%':>8} {'time Δ%':>8}  classification")

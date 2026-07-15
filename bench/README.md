@@ -1464,3 +1464,15 @@ identical schedule. `close` binds every produced report; only a `complete` run s
 analyzable (a missing report yields `failed`). Adversarial behaviour is covered by
 `bench/tests/parquet-lab.sh` (bats is not installed in this repo, so the suite follows the
 repository's plain-bash test convention).
+
+
+#### Executing the registered schedule (Plan 48)
+
+`bench/parquet-lab.sh --run-set PLANNED.json --rep N` executes the *exact* recorded schedule
+for repetition N — the product control measured independently at the **start and end** of the
+repetition (two distinct reports), variants in the seeded order, each report named by its
+scheduled `report_id` (`order-000-product-control.json`, `order-003-page-64k.json`, …). The
+closer resolves each entry's exact recorded path, verifies its digest, requires the start/end
+control brackets to be two distinct reports over the same snapshot, and requires the same
+variant label to resolve to the same variant digest across repetitions. The analyzer reports
+per-repetition start-to-end control drift.

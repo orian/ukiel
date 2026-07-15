@@ -38,8 +38,10 @@ refuses "missing --snapshot" "missing --snapshot" \
   --suite "$SUITE" --block "$BLOCK" --out "$TMP/out1"
 refuses "missing --suite" "missing --suite" \
   --snapshot "$SNAP" --block "$BLOCK" --out "$TMP/out2"
-refuses "missing --block" "missing --block" \
+refuses "missing --run-set/--block" "missing --run-set or --block" \
   --snapshot "$SNAP" --suite "$SUITE" --out "$TMP/out3"
+refuses "both --run-set and --block" "exactly one of --run-set or --block" \
+  --snapshot "$SNAP" --suite "$SUITE" --block "$BLOCK" --run-set "$SUITE" --out "$TMP/out3b"
 refuses "missing --out" "missing --out" \
   --snapshot "$SNAP" --suite "$SUITE" --block "$BLOCK"
 refuses "absent snapshot manifest" "no snapshot manifest" \
@@ -133,6 +135,54 @@ mkdir -p "$TMP/unmarked"; echo important > "$TMP/unmarked/data"
 if ! run_script --out "$TMP/unmarked" --replace >/dev/null 2>&1 && [[ -f "$TMP/unmarked/data" ]]; then
   echo "ok: --replace refuses an unmarked directory and leaves it intact"; pass=$((pass+1))
 else echo "FAIL: --replace clobbered an unmarked directory"; fail=$((fail+1)); fi
+
+# --- Task 48/1: the RECORDED schedule is the EXECUTED schedule. Fake tools log every bench
+# --- invocation; assert the planned interleaved order runs (not lexical), the two control
+# --- brackets are distinct reports, and each report carries its scheduled run_order.
+ORDERBLK="$TMP/orderblk"; mkdir -p "$ORDERBLK"
+for v in charlie alpha bravo; do printf 'label="%s"\n' "$v" > "$ORDERBLK/$v.toml"; done
+PLAN="$TMP/planned.json"
+python3 bench/parquet-lab-run-set.py plan --block "$ORDERBLK" --backend local --repetitions 2 --seed 47 --out "$PLAN" >/dev/null
+
+ORDERBIN="$TMP/orderbin"; mkdir -p "$ORDERBIN"; LOG="$TMP/invoke.log"; : > "$LOG"
+cat > "$ORDERBIN/parquet-census" <<'C'
+#!/usr/bin/env bash
+out=""; while [[ $# -gt 0 ]]; do [[ "$1" == --report ]] && out="$2"; shift; done
+[[ -n "$out" ]] && echo '{"ok":1}' > "$out"; exit 0
+C
+cat > "$ORDERBIN/parquet-rewrite" <<'R'
+#!/usr/bin/env bash
+out=""; while [[ $# -gt 0 ]]; do [[ "$1" == --output ]] && out="$2"; shift; done
+mkdir -p "$out"; echo '{"manifest_version":"ukiel-parquet-variant/v1"}' > "$out/manifest.json"; exit 0
+R
+cat > "$ORDERBIN/parquet-lab-bench" <<B
+#!/usr/bin/env bash
+res=""; order=""; while [[ \$# -gt 0 ]]; do case "\$1" in --result) res="\$2";; --run-order) order="\$2";; esac; shift; done
+echo "\$(basename "\$res" .json):\$order" >> "$LOG"
+echo "{\"identity\":{\"run_order\":\$order,\"backend\":\"local\",\"snapshot_digest\":\"snap\",\"suite_digest\":\"su\"},\"body\":{\"reader_flags\":{},\"queries\":[]}}" > "\$res"
+exit 0
+B
+chmod +x "$ORDERBIN"/*
+
+PARQUET_LAB_BIN="$ORDERBIN" "$SCRIPT" --snapshot "$SNAP" --suite "$SUITE" --run-set "$PLAN" --rep 0 --out "$TMP/order-run" --mode memory >/dev/null 2>&1
+# Expected order for rep 0, from the plan itself.
+EXPECTED="$(python3 -c "import json;s=json.load(open('$PLAN'));print(chr(10).join(f\"{e['report_id']}:{e['order_index']}\" for e in s['schedule'] if e['repetition']==0))")"
+ACTUAL="$(cat "$LOG")"
+if [[ "$EXPECTED" == "$ACTUAL" ]]; then
+  echo "ok: the recorded schedule is the executed schedule"; pass=$((pass+1))
+else echo "FAIL: executed order != planned"; echo "expected:"; echo "$EXPECTED"; echo "actual:"; echo "$ACTUAL"; fail=$((fail+1)); fi
+
+# The two control brackets are distinct report files with distinct run_orders.
+CTRL_REPORTS=("$TMP/order-run/bench/"order-*product-control.json)
+if [[ ${#CTRL_REPORTS[@]} -eq 2 ]]; then
+  echo "ok: control measured at start and end as two distinct reports"; pass=$((pass+1))
+else echo "FAIL: expected 2 distinct control reports, got ${#CTRL_REPORTS[@]}"; fail=$((fail+1)); fi
+
+# It is NOT lexical order (alpha/bravo/charlie) — the seed shuffles the variants.
+if [[ "$ACTUAL" != *"order-001-alpha"* || "$(echo "$ACTUAL" | sed -n 2p)" != "order-001-alpha:1" ]]; then
+  echo "ok: variants are seed-shuffled, not lexical"; pass=$((pass+1))
+else echo "FAIL: order looks lexical"; fail=$((fail+1)); fi
+
 
 echo
 echo "parquet-lab.sh tests: $pass passed, $fail failed"

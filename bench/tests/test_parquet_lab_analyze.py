@@ -29,35 +29,54 @@ def q(name, warm, match=True):
     return {"name": name, "warm_ms": warm, "expected_match": match}
 
 
-def write_run(dirpath, reps, seed=7):
-    """reps: list over repetitions of {label: (report_dict, compressed_bytes)}. Builds rep
-    dirs, a complete run-set with correct sha256 digests, and returns (run_set, rep_dirs)."""
+def write_run(dirpath, reps, seed=7, control_end=None):
+    """Build a Plan-48 run set: each repetition is [control, *variants, control] with the two
+    control brackets written as DISTINCT reports (per-entry report_id). `reps` is a list over
+    repetitions of {label: (report_dict, compressed_bytes)}; the `product-control` entry gives
+    the *start* control. `control_end[r]` (optional) overrides that repetition's *end* control
+    report so a start-to-end drift can be simulated. Returns (run_set, rep_dirs)."""
     rep_dirs = []
     schedule = []
-    order = 0
+    bytes_by_label = {}
+
+    def emit(rd, r, order, label, kind, rep_report):
+        rid = f"order-{order:03d}-{label}"
+        bp = os.path.join(rd, "bench", f"{rid}.json")
+        with open(bp, "w") as fh:
+            json.dump(rep_report, fh)
+        schedule.append({
+            "repetition": r, "order_index": order, "artifact_kind": kind, "label": label,
+            "report_id": rid, "spec_path": "", "artifact_digest": "", "spec_digest": "",
+            "expected_report_id": f"rep{r}/{rid}",
+            "report_digest": hashlib.sha256(open(bp, "rb").read()).hexdigest(),
+        })
+
     for r, labels in enumerate(reps):
         rd = os.path.join(dirpath, f"rep{r}")
         os.makedirs(os.path.join(rd, "bench"))
         os.makedirs(os.path.join(rd, "census"))
         rep_dirs.append(rd)
-        for label, (rep, cbytes) in labels.items():
-            bp = os.path.join(rd, "bench", f"{label}.json")
-            json.dump(rep, open(bp, "w"))
-            json.dump({"total_compressed_bytes": cbytes}, open(os.path.join(rd, "census", f"{label}.json"), "w"))
-            digest = hashlib.sha256(open(bp, "rb").read()).hexdigest()
-            schedule.append({
-                "repetition": r, "order_index": order,
-                "artifact_kind": "control" if label == "product-control" else "variant",
-                "label": label, "artifact_digest": "",
-                "expected_report_id": f"rep{r}/order{order}/{label}",
-                "report_digest": digest,
-            })
+        control_rep, control_bytes = labels["product-control"]
+        variants = [(l, v) for l, v in labels.items() if l != "product-control"]
+        # census (one file per label; the analyzer reads rep0's census).
+        for label, (_rep, cb) in labels.items():
+            with open(os.path.join(rd, "census", f"{label}.json"), "w") as fh:
+                json.dump({"total_compressed_bytes": cb}, fh)
+            bytes_by_label[label] = cb
+        order = 0
+        emit(rd, r, order, "product-control", "control", control_rep)  # start bracket
+        order += 1
+        for label, (rep_report, _cb) in variants:
+            emit(rd, r, order, label, "variant", rep_report)
             order += 1
+        end_rep = (control_end or {}).get(r, control_rep)
+        emit(rd, r, order, "product-control", "control", end_rep)  # end bracket
+
     run_set = {
         "run_set_version": "ukiel-parquet-run-set/v1", "state": "complete",
-        "suite_digest": "su", "control_digest": "snap", "block": "b", "backend": "local",
-        "reader_config": {}, "host": {}, "repetitions": len(reps), "seed": seed,
-        "schedule": schedule,
+        "suite_digest": "su", "control_digest": "snap", "source": {"kind": "test"},
+        "backend": "local", "reader_config": {},
+        "host": {}, "repetitions": len(reps), "seed": seed, "schedule": schedule,
     }
     return run_set, rep_dirs
 
@@ -111,11 +130,23 @@ class AnalyzeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             control = (report([q("a", [10, 10])]), 1000)
             run_set, rep_dirs = write_run(d, [{"product-control": control}])
-            # Tamper with the report after the run-set bound its digest.
-            with open(os.path.join(rep_dirs[0], "bench", "product-control.json"), "w") as fh:
+            # Tamper with a bound report after the run-set recorded its digest.
+            with open(os.path.join(rep_dirs[0], "bench", "order-000-product-control.json"), "w") as fh:
                 json.dump(report([q("a", [999])]), fh)
             with self.assertRaises(SystemExit):
                 A.analyze(run_set, rep_dirs)
+
+    def test_control_drift_uses_two_distinct_brackets(self):
+        with tempfile.TemporaryDirectory() as d:
+            start = (report([q("a", [10, 10])]), 1000)
+            end = report([q("a", [12, 12])])  # end control slower than start -> drift
+            run_set, rep_dirs = write_run(d, [{"product-control": start}], control_end={0: end})
+            res = A.analyze(run_set, rep_dirs)
+            self.assertEqual(len(res["control_drift"]), 1)
+            drift = res["control_drift"][0]
+            self.assertEqual(drift["start_ms"], 10.0)
+            self.assertEqual(drift["end_ms"], 12.0)
+            self.assertTrue(drift["exceeds_noise"])
 
     def test_a_non_complete_run_set_is_rejected(self):
         with tempfile.TemporaryDirectory() as d:

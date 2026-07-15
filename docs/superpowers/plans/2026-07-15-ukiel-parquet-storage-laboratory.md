@@ -6,21 +6,21 @@
 > plan: it may produce evidence and follow-up issues, but it must not silently
 > turn laboratory controls into production table settings.
 
-**Status:** Tooling implemented; publishable measurement blocked on remediation
-(audit 2026-07-15). Tasks 1–7 landed as a useful first implementation and its 82 focused
-tests pass, but a post-implementation code audit found that several checked acceptance
-claims are stronger than the behavior exercised by those tests. In particular, declared
-selectivity probes are not compiled, sidecar decisions are not attached to Parquet scans,
-both benchmark modes preload files into an in-memory object store, I/O accounting omits
-returned bytes and phase attribution, analysis pools incomparable query latencies, and the
-orchestrator is not fail-fast or safe enough for an expensive run. The smoke fixture remains
-useful as implementation history, not as evidence that the measurement contract is ready.
+**Status:** Remediation largely implemented; measurement still gated (2026-07-15).
+Tasks 47A–47C and 47E landed, and 47F's corrected analyzer landed: probes compile with
+observed selectivity, sidecars affect real scan plans, local files no longer preload, the
+orchestrator fails fast, and noise uses like-for-like suite totals. Task 47D remains partial
+for remote claims (returned bytes, I/O-phase classification, additive repetition I/O,
+MinIO bench wiring, and publishable provenance), while the corrected L1+ smoke-v2 remains
+operator-run.
 
-Tasks 47A–47F below are therefore a mandatory pre-measurement remediation phase. No agent
-may start Task 8, publish a storage result, or file a production-format issue until all six
-tasks pass their focused gates and the corrected L1+ smoke-v2 acceptance gate. The original
-Tasks 1–7 and their commits are preserved below; reopened checkboxes identify claims that
-must be completed by the remediation rather than erasing what was built.
+A follow-up audit found one last blocker even for local timing: the run-set planner records
+a seeded order with start/end controls, but `parquet-lab.sh` still executes lexical order
+with one control and the closer binds both planned controls to the same report. Plan 48 now
+owns that wiring fix and the smallest trustworthy first result: one packed 30M L1+ control
+plus 11 bracketing variants locally. Task 8 and remote/cross-workload conclusions remain
+blocked until their explicit gates pass. The original Tasks 1–7 and their commits remain
+below as implementation history; reopened checkboxes identify claims not yet closed.
 
 Plan 46 is executed and its tooling, receipts, compacted objects, and geometry
 interpretation are available. Its reduced 3M-row baseline did not trigger the 64/256 MiB
@@ -1124,6 +1124,13 @@ git commit -m "bench: validate parquet laboratory measurement contract"
 **Hard prerequisite:** Tasks 47A–47F are checked, smoke-v2 passes, and its
 complete run-set digest is recorded here: `________________`. The operator must
 stop if this field is blank or if any report fails the run-set validator.
+
+Plan 48 (`2026-07-15-ukiel-parquet-storage-minimal-measurement.md`) is the
+reduced directional screen that should run first. It fixes the schedule wiring,
+uses one packed 30M L1+ control and 11 bracketing variants locally, and decides
+whether any candidate earns this task's 64 MiB, ClickBench, combined, sidecar,
+or remote-object-store confirmation. Completing Plan 48 does not by itself
+complete this task.
 
 **Files:**
 

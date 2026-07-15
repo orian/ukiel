@@ -35,12 +35,13 @@ USAGE
 
 # --- Argument parsing and validation. Everything here happens BEFORE any tool runs, so a
 # --- bad invocation is refused without touching a file or launching a benchmark.
-SNAP="" SUITE="" BLOCK="" OUT="" MODE="local" WARM=5 COLD=1 REP=0 REPLACE=0
+SNAP="" SUITE="" BLOCK="" RUNSET="" OUT="" MODE="local" WARM=5 COLD=1 REP=0 REPLACE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --snapshot) SNAP="${2:-}"; shift 2;;
     --suite) SUITE="${2:-}"; shift 2;;
     --block) BLOCK="${2:-}"; shift 2;;
+    --run-set) RUNSET="${2:-}"; shift 2;;
     --out) OUT="${2:-}"; shift 2;;
     --mode) MODE="${2:-}"; shift 2;;
     --warm) WARM="${2:-}"; shift 2;;
@@ -57,16 +58,23 @@ MARKER=".parquet-lab-marker"
 
 [[ -n "$SNAP"  ]] || die "missing --snapshot"
 [[ -n "$SUITE" ]] || die "missing --suite"
-[[ -n "$BLOCK" ]] || die "missing --block"
 [[ -n "$OUT"   ]] || die "missing --out"
 [[ -f "$SNAP/manifest.json" ]] || die "no snapshot manifest at '$SNAP/manifest.json'"
 [[ -f "$SUITE" ]] || die "suite '$SUITE' does not exist"
-[[ -d "$BLOCK" ]] || die "block directory '$BLOCK' does not exist"
 case "$MODE" in memory|local|object-store) ;; *) die "invalid --mode '$MODE' (memory|local|object-store)";; esac
 
-shopt -s nullglob
-SPECS=("$BLOCK"/*.toml)
-[[ ${#SPECS[@]} -gt 0 ]] || die "block '$BLOCK' holds no *.toml variant specs"
+# Exactly one of --run-set (Plan 48: execute the registered schedule) or --block (legacy:
+# lexical spec directory) selects the workload.
+if [[ -n "$RUNSET" && -n "$BLOCK" ]]; then die "pass exactly one of --run-set or --block"; fi
+if [[ -z "$RUNSET" && -z "$BLOCK" ]]; then die "missing --run-set or --block"; fi
+if [[ -n "$RUNSET" ]]; then
+  [[ -f "$RUNSET" ]] || die "run set '$RUNSET' does not exist"
+else
+  [[ -d "$BLOCK" ]] || die "block directory '$BLOCK' does not exist"
+  shopt -s nullglob
+  SPECS=("$BLOCK"/*.toml)
+  [[ ${#SPECS[@]} -gt 0 ]] || die "block '$BLOCK' holds no *.toml variant specs"
+fi
 
 # --- Safe output handling. A run publishes into $OUT only by an atomic rename of a fresh
 # --- temp sibling. --replace removes an EXISTING output only when it is a real directory
@@ -89,7 +97,7 @@ fi
 TMP="${OUT}.tmp-$$"
 rm -rf "$TMP"
 mkdir -p "$TMP/variants" "$TMP/census" "$TMP/bench"
-printf 'block=%s\nmode=%s\nrep=%s\n' "$BLOCK" "$MODE" "$REP" > "$TMP/$MARKER"
+printf 'source=%s\nmode=%s\nrep=%s\n' "${RUNSET:-$BLOCK}" "$MODE" "$REP" > "$TMP/$MARKER"
 
 published=0
 cleanup() {
@@ -118,30 +126,71 @@ require_report() {
   python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f" || die "report '$f' is not valid JSON"
 }
 
-echo "== product control (original snapshot bytes), rep $REP =="
-run_tool parquet-census --manifest "$SNAP/manifest.json" --report "$TMP/census/product-control.json" --replace
-run_tool parquet-lab-bench run --manifest "$SNAP/manifest.json" --suite "$SUITE" \
-  --result "$TMP/bench/product-control.json" --mode "$MODE" --cold-iters "$COLD" --warm-iters "$WARM" \
-  --run-order 0 --replace
-require_report "$TMP/bench/product-control.json"
+# census a control/variant once (cached across its repeated appearances in a repetition).
+declare -A CENSUSED
+bench_one() { # bench_one <manifest> <report_id> <run_order>
+  run_tool parquet-lab-bench run --manifest "$1" --suite "$SUITE" \
+    --result "$TMP/bench/$2.json" --mode "$MODE" --cold-iters "$COLD" --warm-iters "$WARM" \
+    --run-order "$3" --replace
+  require_report "$TMP/bench/$2.json"
+}
 
-order=1
-for spec in "${SPECS[@]}"; do
-  label="$(basename "$spec" .toml)"
-  echo "== variant: $label =="
-  vdir="$TMP/variants/$label"
-  run_tool parquet-rewrite --manifest "$SNAP/manifest.json" --spec "$spec" --output "$vdir" --replace
-  run_tool parquet-census --manifest "$vdir/manifest.json" --report "$TMP/census/$label.json" --replace
-  run_tool parquet-lab-bench run --manifest "$vdir/manifest.json" --suite "$SUITE" \
-    --result "$TMP/bench/$label.json" --mode "$MODE" --cold-iters "$COLD" --warm-iters "$WARM" \
-    --run-order "$order" --replace
-  require_report "$TMP/bench/$label.json"
-  order=$((order+1))
-done
+count=0
+if [[ -n "$RUNSET" ]]; then
+  # --- Plan 48: execute the EXACT registered schedule for this repetition, in order. The
+  # --- product control is measured independently at the start AND end (two distinct
+  # --- reports), and each report is named by its scheduled report_id.
+  mapfile -t ENTRIES < <(python3 - "$RUNSET" "$REP" <<'PY'
+import json, sys
+rs = json.load(open(sys.argv[1])); rep = int(sys.argv[2])
+for e in rs["schedule"]:
+    if e["repetition"] == rep:
+        print("\t".join([str(e["order_index"]), e["artifact_kind"], e["label"], e["report_id"], e.get("spec_path", "")]))
+PY
+)
+  [[ ${#ENTRIES[@]} -gt 0 ]] || die "run set '$RUNSET' has no entries for rep $REP"
+  for entry in "${ENTRIES[@]}"; do
+    IFS=$'\t' read -r order kind label rid spec <<<"$entry"
+    if [[ "$kind" == control ]]; then
+      echo "== [$order] product control (rep $REP) -> $rid =="
+      if [[ -z "${CENSUSED[__control__]:-}" ]]; then
+        run_tool parquet-census --manifest "$SNAP/manifest.json" --report "$TMP/census/product-control.json" --replace
+        CENSUSED[__control__]=1
+      fi
+      bench_one "$SNAP/manifest.json" "$rid" "$order"
+    else
+      echo "== [$order] variant $label (rep $REP) -> $rid =="
+      [[ -n "$spec" && -f "$spec" ]] || die "variant '$label' has no spec path '$spec'"
+      vdir="$TMP/variants/$label"
+      if [[ -z "${CENSUSED[$label]:-}" ]]; then
+        run_tool parquet-rewrite --manifest "$SNAP/manifest.json" --spec "$spec" --output "$vdir" --replace
+        run_tool parquet-census --manifest "$vdir/manifest.json" --report "$TMP/census/$label.json" --replace
+        CENSUSED[$label]=1
+      fi
+      bench_one "$vdir/manifest.json" "$rid" "$order"
+    fi
+    count=$((count+1))
+  done
+else
+  # --- Legacy: one census+bench of the product control, then each spec in lexical order.
+  echo "== product control (original snapshot bytes), rep $REP =="
+  run_tool parquet-census --manifest "$SNAP/manifest.json" --report "$TMP/census/product-control.json" --replace
+  bench_one "$SNAP/manifest.json" "product-control" 0
+  order=1
+  for spec in "${SPECS[@]}"; do
+    label="$(basename "$spec" .toml)"
+    echo "== variant: $label =="
+    vdir="$TMP/variants/$label"
+    run_tool parquet-rewrite --manifest "$SNAP/manifest.json" --spec "$spec" --output "$vdir" --replace
+    run_tool parquet-census --manifest "$vdir/manifest.json" --report "$TMP/census/$label.json" --replace
+    bench_one "$vdir/manifest.json" "$label" "$order"
+    order=$((order+1)); count=$((count+1))
+  done
+fi
 
 # Everything produced and parsed: publish atomically.
 echo "state=complete" >> "$TMP/$MARKER"
 if [[ -e "$OUT" ]]; then rm -rf "$OUT"; fi
 mv "$TMP" "$OUT"
 published=1
-echo "block complete: $OUT (${#SPECS[@]} variants + product control, mode=$MODE, rep=$REP)"
+echo "run complete: $OUT ($count measurements, mode=$MODE, rep=$REP)"
