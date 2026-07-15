@@ -84,3 +84,59 @@ pub fn result_digest(_schema: &Schema, batches: &[RecordBatch]) -> Result<String
 pub fn row_count(batches: &[RecordBatch]) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, DictionaryArray, StringArray, StringViewArray};
+    use arrow::datatypes::{Field, Int32Type};
+    use std::sync::Arc;
+
+    /// The same logical strings in Utf8, Utf8View, and Dictionary encodings must all hash to
+    /// the same digest — the regression the smoke matrix exposed, where a high-cardinality
+    /// group-by came back dictionary-encoded from one artifact and plain from another.
+    #[test]
+    fn encoding_does_not_change_the_digest() {
+        let values = vec!["alpha", "beta", "alpha", "gamma"];
+        let plain = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)])),
+            vec![Arc::new(StringArray::from(values.clone()))],
+        )
+        .unwrap();
+        let view = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "s",
+                DataType::Utf8View,
+                false,
+            )])),
+            vec![Arc::new(StringViewArray::from(values.clone()))],
+        )
+        .unwrap();
+        let dict: DictionaryArray<Int32Type> = values.iter().copied().collect();
+        let dict = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "s",
+                dict.data_type().clone(),
+                false,
+            )])),
+            vec![Arc::new(dict)],
+        )
+        .unwrap();
+
+        let a = result_digest(&plain.schema(), &[plain.clone()]).unwrap();
+        let b = result_digest(&view.schema(), &[view]).unwrap();
+        let c = result_digest(&dict.schema(), &[dict]).unwrap();
+        assert_eq!(a, b, "Utf8 and Utf8View must digest equal");
+        assert_eq!(a, c, "Utf8 and Dictionary must digest equal");
+
+        // A genuinely different value still changes the digest.
+        let other = RecordBatch::try_new(
+            plain.schema(),
+            vec![Arc::new(StringArray::from(vec![
+                "alpha", "beta", "alpha", "delta",
+            ]))],
+        )
+        .unwrap();
+        assert_ne!(a, result_digest(&other.schema(), &[other]).unwrap());
+    }
+}
