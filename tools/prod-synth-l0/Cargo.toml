@@ -1,0 +1,31 @@
+[package]
+name = "prod-synth-l0"
+version.workspace = true
+edition.workspace = true
+description = "Deterministically restage prod-synth rows as Ukiel day-partitioned, flush-sized L0 Parquet."
+
+# A standalone offline transformer, NOT a loader. It reads a plan-45 source artifact,
+# regroups the same rows into UTC-day-partitioned, flush-sized level-0 files with the
+# product's own L0 writer properties, and emits an L0 manifest. It touches no database,
+# object store, Kafka, HTTP, DataFusion, catalog, ingest, or compactor -- only the
+# stable ukiel-core writer/sort primitives and the two pure contract libraries. The
+# boundary is enforced by tools/prod-synth-l0/tests/boundary.rs.
+
+[dependencies]
+prod-synth-contract = { workspace = true }
+prod-synth-integrity = { workspace = true }
+ukiel-core = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true }
+bytes = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "prod-synth-l0"
+path = "src/main.rs"

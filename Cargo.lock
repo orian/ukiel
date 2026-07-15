@@ -3383,6 +3383,19 @@ dependencies = [
 [[package]]
 name = "prod-synth-l0"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "bytes",
+ "clap",
+ "parquet",
+ "prod-synth-contract",
+ "prod-synth-integrity",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "ukiel-core",
+]
 
 [[package]]
 name = "prost"
