@@ -85,7 +85,7 @@ impl std::error::Error for FingerprintError {}
 /// disjoint sets with [`RowMultiset::merge`], and read the result with
 /// [`RowMultiset::digest`] — or compare two directly, which is what every caller
 /// actually wants.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowMultiset {
     /// Number of rows folded in. Pins the cardinality, so a lost or added row shows.
     pub count: u64,
@@ -95,16 +95,6 @@ pub struct RowMultiset {
     /// Four 64-bit wrapping sums over the row digest's four little-endian lanes.
     /// Catches even-count duplication, which XOR cancels.
     pub sum: [u64; 4],
-}
-
-impl Default for RowMultiset {
-    fn default() -> Self {
-        RowMultiset {
-            count: 0,
-            xor: [0u8; 32],
-            sum: [0u64; 4],
-        }
-    }
 }
 
 impl RowMultiset {

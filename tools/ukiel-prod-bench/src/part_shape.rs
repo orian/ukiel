@@ -96,8 +96,8 @@ pub enum KeyBand {
     B641To1280,
     /// 1281..=8000: still filtered, at the largest tier (degrading false-positive rate).
     B1281To8000,
-    /// > 8000: too dense for any bounded filter — no filter is stored, and the part is
-    /// always kept. Expected degradation, not a correctness bug.
+    /// Over 8000 keys: too dense for any bounded filter — no filter is stored, and the
+    /// part is always kept. Expected degradation, not a correctness bug.
     Gt8000,
 }
 
@@ -460,15 +460,15 @@ pub fn scan_object(
     }
     // Bitmap truth: if the catalog carries an exact bitmap, it must be exactly the keys
     // the object holds. A bitmap that disagrees with its own file is worse than none.
-    if let Some(bm) = &bitmap_keys {
-        if *bm != seen_keys {
-            bail!(
-                "{}: the exact bitmap does not match the object's key set ({} vs {} distinct)",
-                part.meta.path,
-                bm.len(),
-                seen_keys.len()
-            );
-        }
+    if let Some(bm) = &bitmap_keys
+        && *bm != seen_keys
+    {
+        bail!(
+            "{}: the exact bitmap does not match the object's key set ({} vs {} distinct)",
+            part.meta.path,
+            bm.len(),
+            seen_keys.len()
+        );
     }
 
     let span = (key_max - key_min + 1).max(1);

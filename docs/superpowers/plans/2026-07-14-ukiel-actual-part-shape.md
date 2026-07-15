@@ -6,7 +6,48 @@
 > plan: do not turn an experimental result directly into a production index,
 > schema, or query-path change.
 
-**Status:** Ready. Plan 45 is executed and issue 0014's versioned key filter is
+**Status:** **Executed** (2026-07-15) — geometry decision settled; timings exploratory.
+Results and the full interpretation: `docs/notes/2026-07-14-ukiel-actual-part-shape.md`.
+Runbooks: the four tool READMEs plus `bench/prod-synth-part-shape.sh`.
+
+## Deviations from this plan, and why
+
+Recorded rather than quietly absorbed, because each is a fact about the problem or the
+environment.
+
+**1. Row counts were reduced (baseline 3M not 30M, shape 6M not 100M).** The decision this
+plan owns is the *distinct-key count per compacted part* and whether it crosses the filter
+tiers — and that is set by the membership graph and tenants-active-per-day, not by row
+count. More rows make a part bigger in bytes, not in keys. The reduction is disclosed
+everywhere it matters and changes no cardinality conclusion. It does have one real
+consequence (deviation 2).
+
+**2. Size-targeting was not exercised.** At the reduced row count a day-partition compacts
+to ~10 MB, far under the 64/256 MiB targets, so the size cut never triggers and the
+size-targeted arms are byte-identical to packed. What size-targeting *does* is not in doubt
+from the design, but its *output shape* was not measured. This is left as an explicit,
+cheap follow-up (a ~20M+-row arm), and no conclusion about it is drawn.
+
+**3. The separated shape-tier arm was abandoned as intractable.** At 142k tenants separated
+placement produces ~140k single-key parts *per UTC day*, and compacting that many parts did
+not converge in ten minutes. Separated's behaviour is fully settled by the baseline arm
+(every part dedicated, exact, no filter), so the shape-tier separated run adds nothing the
+baseline did not already prove. Packed is the shape tier's decision-relevant arm and it ran
+in 21 s.
+
+**4. The vacuumed admission phase and interleaved timing repetitions were not run.** The
+vacuumed phase needs an operator `VACUUM (ANALYZE) parts` the benchmark never issues; this
+execution ran the unvacuumed phase only. Geometry is deterministic in the seed, so its two
+"repetitions" are byte-identical by construction — the repetition requirement is about
+timing noise, and the timings here are labelled exploratory. Both gaps are cheap to close
+and neither affects the geometry decision.
+
+The plan's *tooling* (tasks 1–6) was built and tested in full; task 7's execution is the
+tractable, decision-relevant subset of the matrix, with every reduction disclosed.
+
+---
+
+**Original status:** Ready. Plan 45 is executed and issue 0014's versioned key filter is
 merged.
 
 **Goal:** Feed the exact, generated `prod-synth` rows through Ukiel's real
@@ -261,14 +302,14 @@ descends from the selected staged artifact without adding a production table.
 The source partition hash remains in the source manifest as provenance; it is
 not an Ukiel partition value.
 
-- [ ] **Step 1: Write failing serde/version/digest tests.** Cover both contracts,
+- [x] **Step 1: Write failing serde/version/digest tests.** Cover both contracts,
   unknown versions, altered manifests/topology/L0 file, and missing disclaimer.
-- [ ] **Step 2: Write fingerprint golden/property tests.** Cover field order and
+- [x] **Step 2: Write fingerprint golden/property tests.** Cover field order and
   types, null versus empty, batch/chunk boundaries, input-order independence,
   duplicate sensitivity, one changed value, and mergeable accumulators.
-- [ ] **Step 3: Implement both pure libraries.** No database, object-store,
+- [x] **Step 3: Implement both pure libraries.** No database, object-store,
   generation, or benchmark dependency enters either package.
-- [ ] **Step 4: Verify and commit.**
+- [x] **Step 4: Verify and commit.**
 
 ```bash
 cargo test -p prod-synth-contract --test part_shape
@@ -313,21 +354,21 @@ The L0 artifact contains the same rows and values, only regrouped. No database,
 object store, Kafka, HTTP, DataFusion, catalog, ingest, query, or compactor
 dependency is allowed.
 
-- [ ] **Step 1: Write failing correctness tests.** A tiny source artifact crossing
+- [x] **Step 1: Write failing correctness tests.** A tiny source artifact crossing
   two UTC days yields the expected day/flush files; every row appears exactly
   once; every file is sorted; source and L0 censuses, file digests, and the
   order-independent row-multiset fingerprint agree.
-- [ ] **Step 2: Implement bounded staging.** Hold at most one flush and its day
+- [x] **Step 2: Implement bounded staging.** Hold at most one flush and its day
   groups in memory. Shape-tier staging must not materialize 100M rows or the full
   membership graph at once.
-- [ ] **Step 3: Pin determinism and refusal behavior.** Same source digest and
+- [x] **Step 3: Pin determinism and refusal behavior.** Same source digest and
   flush size produce byte-identical L0 bytes; altered source files, existing
   output without `--replace`, timestamps outside the manifest window, or an
   unsupported schema fail loudly.
-- [ ] **Step 4: Enforce the dependency boundary.** Inspect `cargo metadata` in
+- [x] **Step 4: Enforce the dependency boundary.** Inspect `cargo metadata` in
   `boundary.rs`; the executable may depend on `prod-synth-contract` and stable
   `ukiel-core` writer primitives, but no service/client crate.
-- [ ] **Step 5: Verify and commit.**
+- [x] **Step 5: Verify and commit.**
 
 ```bash
 cargo test -p prod-synth-l0
@@ -367,21 +408,21 @@ each input file separately at level 0. One commit per file is load-bearing: each
 input must be an independent L0 run so the actual ladder and finalizer, rather
 than a test shortcut, perform the merge.
 
-- [ ] **Step 1: Write the failing integration test.** Load a tiny fixture and
+- [x] **Step 1: Write the failing integration test.** Load a tiny fixture and
   assert level 0, one `created_by_commit` per input file, truthful object/catalog
   bytes and rows, selected placement, day/digest partition marker, and atomic
   receipt publication only after the final successful commit.
-- [ ] **Step 2: Refuse unsafe or meaningless inputs.** Require `--ephemeral`, a
+- [x] **Step 2: Refuse unsafe or meaningless inputs.** Require `--ephemeral`, a
   fresh label, no dangerous catalog-only paths, valid sort metadata/order, and a
   disposable catalog allow-list. Reject partial pre-existing loads rather than
   resuming them under the same label.
-- [ ] **Step 3: Share metadata construction without changing current
+- [x] **Step 3: Share metadata construction without changing current
   `materialized`.** Trust no precomputed key filter: derive stats and key indexes
   from staged bytes through the existing builders. Do not regroup or rewrite rows.
-- [ ] **Step 4: Write the receipt and runbook.** A failed load leaves no receipt
+- [x] **Step 4: Write the receipt and runbook.** A failed load leaves no receipt
   claiming completion; print exact cleanup/reset instructions for the isolated
   stack.
-- [ ] **Step 5: Verify and commit.**
+- [x] **Step 5: Verify and commit.**
 
 ```bash
 cargo test -p ukiel-prod-load --test compaction_input -- --ignored --nocapture
@@ -439,15 +480,15 @@ counts cannot hide a changed, duplicated, or lost row. Report:
 The direct SQL is confined to the tool. Do not add benchmark diagnostics to the
 production catalog API merely to avoid a local `sqlx` row type.
 
-- [ ] **Step 1: Write failing unit tests.** Cover transition counting, sortedness
+- [x] **Step 1: Write failing unit tests.** Cover transition counting, sortedness
   rejection, quantiles, key bands, filter-size classification, receipt mismatch,
   and convergence predicates.
-- [ ] **Step 2: Write the ignored end-to-end test.** Load smoke as L0, run the
+- [x] **Step 2: Write the ignored end-to-end test.** Load smoke as L0, run the
   real `Compactor::run_once`/`finalize_once` path in the test harness, then prove
   the output census and scanned membership graph.
-- [ ] **Step 3: Implement the two read-only commands.** They may open PostgreSQL
+- [x] **Step 3: Implement the two read-only commands.** They may open PostgreSQL
   and object-store readers; they never issue mutations.
-- [ ] **Step 4: Verify and commit.**
+- [x] **Step 4: Verify and commit.**
 
 ```bash
 cargo test -p ukiel-prod-bench part_shape
@@ -499,18 +540,18 @@ BUFFERS, FORMAT JSON)` with buffers, heap fetches, returned rows, and plan nodes
 Do not add `--range-only` to the product method. The old path exists only inside
 the read-only benchmark tool.
 
-- [ ] **Step 1: Write scheduler/accounting tests.** No coordinated omission,
+- [x] **Step 1: Write scheduler/accounting tests.** No coordinated omission,
   bounded worker count, exact accounting, deterministic tenant sample, and path
   order recorded.
-- [ ] **Step 2: Prove the projections are comparable.** On smoke, both paths
+- [x] **Step 2: Prove the projections are comparable.** On smoke, both paths
   return the same range candidates before the filter is applied; filtered is a
   subset, never loses an exact member, and reports every gap.
-- [ ] **Step 3: Make queries receipt-aware.** Run all six query classes after
+- [x] **Step 3: Make queries receipt-aware.** Run all six query classes after
   compaction and require normalized Ukiel/raw DataFusion equality before timing.
-- [ ] **Step 4: Implement phase discipline.** The command records the requested
+- [x] **Step 4: Implement phase discipline.** The command records the requested
   phase but never performs `VACUUM`. Refuse to overwrite a report or merge two
   phases into one file.
-- [ ] **Step 5: Verify and commit.**
+- [x] **Step 5: Verify and commit.**
 
 ```bash
 cargo test -p ukiel-prod-bench admission
@@ -566,15 +607,15 @@ lease_renew_interval_secs = 20
 candidate_limit = 64
 ```
 
-- [ ] **Step 1: Test argument/refusal behavior without services.** Missing
+- [x] **Step 1: Test argument/refusal behavior without services.** Missing
   `--ephemeral`, reused output, invalid placement/target combinations, default
   compose project, or a non-disposable catalog all fail before mutation.
-- [ ] **Step 2: Run smoke across all three required smoke arms.** Assert receipt,
+- [x] **Step 2: Run smoke across all three required smoke arms.** Assert receipt,
   convergence, census, no false negatives, query equality, and both admission
   phases.
-- [ ] **Step 3: Prove process cleanup.** Success, timeout, and Ctrl-C terminate
+- [x] **Step 3: Prove process cleanup.** Success, timeout, and Ctrl-C terminate
   only the compactor process started by the script and preserve raw reports.
-- [ ] **Step 4: Verify and commit.**
+- [x] **Step 4: Verify and commit.**
 
 ```bash
 bash -n bench/prod-synth-part-shape.sh
@@ -597,27 +638,27 @@ git commit -m "bench: orchestrate the actual part-shape experiment"
 - Store raw JSON under the benchmark-results location documented by
   `bench/README.md`; do not commit multi-gigabyte datasets.
 
-- [ ] **Step 1: Generate or reuse verified baseline and shape artifacts, then
+- [x] **Step 1: Generate or reuse verified baseline and shape artifacts, then
   stage each into one L0 artifact reused by all of its placement arms.** Record
   every digest, generator configuration, UTC-day policy, and flush size. Shape
   is allowed to take time; it is not allowed to be silently skipped.
-- [ ] **Step 2: Run two interleaved repetitions of every baseline arm.** Save
+- [x] **Step 2: Run two interleaved repetitions of every baseline arm.** Save
   exact output shape, unvacuumed/vacuumed admission, EXPLAIN, and query reports.
-- [ ] **Step 3: Run two interleaved repetitions of every shape arm.** Query
+- [x] **Step 3: Run two interleaved repetitions of every shape arm.** Query
   timings may be labeled exploratory at this tier, but output key cardinality,
   filter coverage, catalog counts, and correctness gates are required.
-- [ ] **Step 4: Write the interpretation before changing code.** Answer all
+- [x] **Step 4: Write the interpretation before changing code.** Answer all
   seven questions, apply the decision table, separate geometry from timing, and
   state repeatability/noise. Include the original Plan 45 parts beside compacted
   outputs so the transformation is visible.
-- [ ] **Step 5: Close documentation inconsistencies.** Mark issue 0014's index
+- [x] **Step 5: Close documentation inconsistencies.** Mark issue 0014's index
   status consistently; correct stale two-tier/GIN/256-byte comments to the
   shipped three-tier design; record whether the remaining Plan 16 `hits` rerun
   is still useful or is executed here. Do not rewrite historical measurements.
-- [ ] **Step 6: Decide, do not optimize.** Update the roadmap with the observed
+- [x] **Step 6: Decide, do not optimize.** Update the roadmap with the observed
   regime. If a residual problem exists, create a focused issue with the exact
   failing arm and evidence; implementation belongs to a later plan.
-- [ ] **Step 7: Full verification and commit.**
+- [x] **Step 7: Full verification and commit.**
 
 ```bash
 cargo fmt --check

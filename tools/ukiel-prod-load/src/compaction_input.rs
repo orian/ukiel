@@ -107,6 +107,7 @@ fn placement_to_core(p: PlacementSpec) -> Placement {
 /// One commit per file is load-bearing: each input must be an independent L0 run, or the
 /// compactor's ladder never triggers and the finalizer has nothing to fold. A single
 /// bulk commit would make the whole fixture one run and measure nothing.
+#[allow(clippy::too_many_arguments)]
 pub async fn load(
     catalog: &PostgresCatalog,
     store: &Arc<dyn ObjectStore>,

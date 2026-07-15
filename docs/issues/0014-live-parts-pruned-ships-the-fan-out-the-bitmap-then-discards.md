@@ -1,7 +1,7 @@
 # 0014 — `live_parts_pruned` ships candidates that exact key pruning then discards
 
 - **Severity:** Medium (query-admission latency and catalog CPU scale with a hypertable's range fan-out; no known correctness impact)
-- **Status:** **Resolved** — Candidate B (versioned Bloom in `BYTEA`) selected on measurements, shipped in migration 0012. See [Resolution](#resolution).
+- **Status:** **Resolved** — Candidate B (versioned Bloom in `BYTEA`) selected on measurements, in the initial catalog schema (`key_filter` on `parts`, carried in `parts_live_idx`'s `INCLUDE`). See [Resolution](#resolution).
 - **Components:** `crates/ukiel-catalog` (`live_parts_pruned`), `crates/ukiel-query` (provider), `crates/ukiel-e2e` (catalog benchmark)
 - **Found by:** issue 0011's million-logical-table catalog fixture, 2026-07-13
 
@@ -272,8 +272,12 @@ payload.** Candidate A (`pg_roaringbitmap`) was not needed: the portable fallbac
 reduced the median tenant's rows to the exact floor, so the extension's deployment
 contract bought nothing worth its cost.
 
-Shipped in migration `0012_part_packing_keys.sql`; the layout lives in
-`ukiel_core::keyfilter`.
+In the initial catalog schema: the `key_filter BYTEA` column on `parts`, carried in the
+`parts_live_idx` `INCLUDE` payload. (The change originally shipped as migration
+`0012_part_packing_keys.sql`; the migration chain was later collapsed into a single
+`0001_init.sql`, since Ukiel has no deployed installations.) The layout lives in
+`ukiel_core::keyfilter`, and it is a **three-tier** filter (128/1024/2048 bytes) with no
+filter stored past `MAX_KEYS_WORTH_FILTERING` (8,000 keys).
 
 ### The fixture had to be repaired first, and it was wrong twice
 

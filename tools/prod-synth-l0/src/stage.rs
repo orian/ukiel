@@ -308,8 +308,9 @@ impl Writer<'_> {
         let mut by_day: BTreeMap<i32, Vec<u32>> = BTreeMap::new();
         for row in 0..flush.num_rows() {
             let t = ts.value(row);
-            if t < prod_synth_contract::FIXTURE_WINDOW_START_MS
-                || t >= prod_synth_contract::FIXTURE_WINDOW_END_MS
+            if !(prod_synth_contract::FIXTURE_WINDOW_START_MS
+                ..prod_synth_contract::FIXTURE_WINDOW_END_MS)
+                .contains(&t)
             {
                 return Err(StageError::TimestampOutOfWindow {
                     ts: t,
