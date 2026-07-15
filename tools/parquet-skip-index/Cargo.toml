@@ -11,6 +11,7 @@ description = "Build conservative experimental skip-index sidecars for a laborat
 
 [dependencies]
 parquet-lab-contract = { workspace = true }
+parquet-skip-index-core = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true }
 bytes = { workspace = true }

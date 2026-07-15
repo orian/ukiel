@@ -12,7 +12,9 @@ description = "Run declared queries read-only over one laboratory artifact with 
 [dependencies]
 parquet-lab-contract = { workspace = true }
 parquet-lab-integrity = { workspace = true }
+parquet-skip-index-core = { workspace = true }
 datafusion = { workspace = true }
+datafusion-datasource-parquet = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true, features = ["async", "object_store"] }
 object_store = { workspace = true }

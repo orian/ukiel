@@ -29,6 +29,9 @@ pub struct Counters {
     /// several).
     pub ranges: AtomicU64,
     pub requested_bytes: AtomicU64,
+    /// Every byte range actually requested, by object path — the spy log that proves a
+    /// skipped row group's data range is never fetched.
+    pub fetched_ranges: std::sync::Mutex<Vec<(String, std::ops::Range<u64>)>>,
 }
 
 /// A plain-data snapshot of the counters, for a report.
@@ -121,6 +124,9 @@ impl ObjectStore for CountingObjectStore {
             self.counters
                 .requested_bytes
                 .fetch_add(r.end.saturating_sub(r.start), Ordering::Relaxed);
+            if let Ok(mut log) = self.counters.fetched_ranges.lock() {
+                log.push((location.to_string(), r.clone()));
+            }
         }
         self.inner.get_opts(location, options).await
     }
@@ -136,6 +142,11 @@ impl ObjectStore for CountingObjectStore {
         self.counters
             .requested_bytes
             .fetch_add(bytes, Ordering::Relaxed);
+        if let Ok(mut log) = self.counters.fetched_ranges.lock() {
+            for r in ranges {
+                log.push((location.to_string(), r.clone()));
+            }
+        }
         self.inner.get_ranges(location, ranges).await
     }
 

@@ -2,10 +2,10 @@
 //! row group finds zero matches. Tested over many deterministic pseudo-random groups and
 //! predicates for every supported index and predicate kind.
 
-use parquet_skip_index::prefix_set::PrefixSet;
-use parquet_skip_index::value_set::ValueSet;
-use parquet_skip_index::zone_map::ZoneMap;
-use parquet_skip_index::{Decision, Predicate, Value};
+use parquet_skip_index_core::prefix_set::PrefixSet;
+use parquet_skip_index_core::value_set::ValueSet;
+use parquet_skip_index_core::zone_map::ZoneMap;
+use parquet_skip_index_core::{Decision, Predicate, Value};
 
 /// A tiny deterministic PRNG (SplitMix64) — no `rand`, no wall-clock, fully reproducible.
 struct Rng(u64);

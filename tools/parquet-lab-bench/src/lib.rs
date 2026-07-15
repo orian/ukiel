@@ -10,6 +10,7 @@ pub mod compare;
 pub mod counting_store;
 pub mod runner;
 pub mod skip;
+pub mod skip_scan;
 pub mod suites;
 
 use std::path::Path;

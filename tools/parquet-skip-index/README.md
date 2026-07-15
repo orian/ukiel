@@ -43,3 +43,11 @@ against the native row-group pruning DataFusion reports separately.
 A sidecar is a reversible laboratory carrier, **not** a proposed production format — it
 exists to price a candidate before deciding whether a real implementation belongs in
 Parquet metadata, an object sidecar, or the catalog.
+
+## Core library and scan application (Task 47C)
+
+The index *semantics* (the three prototypes and the no-false-negative evaluation) live in
+the pure `parquet-skip-index-core` library, shared with `parquet-lab-bench` — which applies
+a sidecar to an actual scan by building a per-file `ParquetAccessPlan` that omits only
+`NoMatch` row groups (native statistics/page/Bloom pruning stays enabled underneath). A spy
+object store proves a skipped row group's data range is never fetched.

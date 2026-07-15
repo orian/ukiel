@@ -31,6 +31,7 @@ members = [
     "tools/parquet-census",
     "tools/parquet-rewrite",
     "tools/parquet-lab-bench",
+    "tools/parquet-skip-index-core",
     "tools/parquet-skip-index",
 ]
 
@@ -97,6 +98,7 @@ prod-synth-contract = { path = "tools/prod-synth-contract" }
 prod-synth-integrity = { path = "tools/prod-synth-integrity" }
 parquet-lab-contract = { path = "tools/parquet-lab-contract" }
 parquet-lab-integrity = { path = "tools/parquet-lab-integrity" }
+parquet-skip-index-core = { path = "tools/parquet-skip-index-core" }
 # Plan 45: the generator must build without a service client in the graph, so it
 # takes its CLI from `clap` and nothing else new.
 clap = { version = "4", features = ["derive"] }

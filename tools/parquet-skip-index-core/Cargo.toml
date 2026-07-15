@@ -1,0 +1,15 @@
+[package]
+name = "parquet-skip-index-core"
+version.workspace = true
+edition.workspace = true
+description = "Pure sidecar parsing and conservative Predicate -> NoMatch|Maybe|Unknown evaluation for the plan-47 skip indices (no Arrow, no Parquet)."
+
+# The single home of skip-index semantics: the three conservative prototypes and the
+# payload decode/evaluate dispatch, over the laboratory's own `Value` type. It has NO Arrow
+# and NO Parquet — the builder (which reads row groups) and the benchmark (which applies
+# access plans) both depend on it, so the no-false-negative guarantee lives in exactly one
+# place. No executable depends on another executable.
+
+[dependencies]
+parquet-lab-contract = { workspace = true }
+blake3 = { workspace = true }

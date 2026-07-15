@@ -922,29 +922,29 @@ git commit -m "bench: compile parquet selectivity probes"
 `Predicate -> NoMatch | Maybe | Unknown` evaluation. The builder executable and
 benchmark may depend on it; neither executable depends on the other.
 
-- [ ] **Step 1: Move, do not duplicate, index semantics into the core crate.**
+- [x] **Step 1: Move, do not duplicate, index semantics into the core crate.**
   Preserve the existing property tests and golden format. Structured predicates
   come from the compiled suite, not ad-hoc SQL-expression parsing.
-- [ ] **Step 2: Build a per-file `ParquetAccessPlan`.** For every timed query,
+- [x] **Step 2: Build a per-file `ParquetAccessPlan`.** For every timed query,
   evaluate the bound predicate for every row group and omit only `NoMatch`.
   Attach the plan to the DataFusion `PartitionedFile` while leaving native
   statistics/page/Bloom pruning enabled underneath it. `Maybe`, `Unknown`, and
   every unsupported expression keep the group.
-- [ ] **Step 3: Separate refusal from fail-open fallback.** Wrong
+- [x] **Step 3: Separate refusal from fail-open fallback.** Wrong
   artifact/schema/variant/version identity refuses the run before timing.
   Missing/corrupt payload or a per-row-group decode mismatch keeps affected row
   groups and increments a stable fallback reason; it must never become
   `NoMatch`.
-- [ ] **Step 4: Report the complete pruning ledger.** Per query record sidecar
+- [x] **Step 4: Report the complete pruning ledger.** Per query record sidecar
   fetch requests/bytes, entries evaluated, `NoMatch`/`Maybe`/`Unknown`, fallback
   reasons, custom-selected groups, native-final groups where observable,
   decoded rows, index build time, and index storage bytes. Missing native metrics
   are `null`.
-- [ ] **Step 5: Prove that the scan changes.** An integration fixture must show
+- [x] **Step 5: Prove that the scan changes.** An integration fixture must show
   fewer row groups and fewer returned data bytes with a sidecar, identical
   schema/result digest, and no reduction for unknown/corrupt entries. A spy
   object store must prove a skipped row group's data range is never fetched.
-- [ ] **Step 6: Verify and commit.**
+- [x] **Step 6: Verify and commit.**
 
 ```bash
 cargo test -p parquet-skip-index-core

@@ -3221,11 +3221,13 @@ dependencies = [
  "bytes",
  "clap",
  "datafusion",
+ "datafusion-datasource-parquet",
  "futures",
  "object_store",
  "parquet",
  "parquet-lab-contract",
  "parquet-lab-integrity",
+ "parquet-skip-index-core",
  "serde",
  "serde_json",
  "tempfile",
@@ -3310,10 +3312,19 @@ dependencies = [
  "clap",
  "parquet",
  "parquet-lab-contract",
+ "parquet-skip-index-core",
  "serde",
  "serde_json",
  "tempfile",
  "toml",
+]
+
+[[package]]
+name = "parquet-skip-index-core"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "parquet-lab-contract",
 ]
 
 [[package]]
