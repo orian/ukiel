@@ -1,29 +1,41 @@
 #!/usr/bin/env python3
-"""Plan 47: derive the dominated / Pareto / workload-specific classification from ONE
-block's raw reports.
+"""Plan 47 (Task 47F): classify a COMPLETE run set's registered repetitions.
 
-This is analysis, not measurement — it reads the immutable JSON `bench/parquet-lab.sh`
-wrote and computes the registered noise band and the decision-rule labels. It never mutates
-a spec, re-runs a benchmark, or picks bytes; the chosen candidate stays an explicit digest a
-human carries forward.
+This is analysis over immutable, *registered* reports — not a glob. It accepts one complete
+`ukiel-parquet-run-set/v1`, loads only the reports it binds (verifying each report digest),
+and derives the noise band from **like-for-like** suite totals: for warm iteration i it sums
+that iteration's per-query latency into one suite total T_i, and takes median/MAD over the
+T_i samples. It NEVER pools raw samples from different queries (a fast count and a slow scan
+are not comparable). The 5% size floor is a decision threshold, not measured size noise.
 
-    bench/parquet-lab-analyze.py --run RUN_DIR [--noise-floor 0.05]
+    parquet-lab-analyze.py --run-set COMPLETE.json --reports rep0 rep1 [--json-out OUT.json]
 
-Noise band (per dimension) from the plan:
+Noise band (per the plan), applied to the warm suite total:
 
-    noise = max(5%, 3 * MAD(control reps) / median(control reps))
-
-A block run has one product-control result; its per-query warm iterations are the control
-reps used for the time band. Size has no within-run reps, so the size band is the floor.
-Publishable results interleave two runs (Task 8) — point --run at a merged directory, or run
-this per block and compare, to get a real multi-rep band.
+    time_band = 3 * MAD(control T_i pool) / median(control T_i pool)
+    size_band = 0.05   # fixed decision threshold
 """
 import argparse
-import glob
+import hashlib
 import json
 import os
 import statistics
 import sys
+
+CONTROL = "product-control"
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def read_json(path):
+    with open(path) as fh:
+        return json.load(fh)
 
 
 def median(xs):
@@ -37,43 +49,22 @@ def mad(xs):
     return median([abs(x - m) for x in xs])
 
 
-def noise_band(reps, floor):
-    m = median(reps)
-    if m == 0:
-        return floor
-    return max(floor, 3.0 * mad(reps) / m)
-
-
-def warm_all(qs):
-    """All warm samples across every query, as one control-rep pool for the time band."""
-    out = []
-    for q in qs:
-        out.extend(q.get("warm_ms", []))
-    return out
-
-
-def query_time(qs):
-    """A single representative time for a report: sum of per-query warm medians."""
-    return sum(q.get("warm_median_ms", 0.0) for q in qs)
-
-
-def load(run):
-    bench = {}
-    for p in glob.glob(os.path.join(run, "bench", "*.json")):
-        label = os.path.splitext(os.path.basename(p))[0]
-        bench[label] = json.load(open(p))
-    census = {}
-    for p in glob.glob(os.path.join(run, "census", "*.json")):
-        label = os.path.splitext(os.path.basename(p))[0]
-        census[label] = json.load(open(p))
-    return bench, census
+def suite_totals(report):
+    """Like-for-like suite totals: T_i = sum over queries of warm_ms[i]. Returns [] with a
+    reason if the warm-iteration counts are not equal across queries (incomparable)."""
+    qs = report["body"]["queries"]
+    if not qs:
+        return [], "no_queries"
+    lengths = {len(q.get("warm_ms", [])) for q in qs}
+    if len(lengths) != 1 or 0 in lengths:
+        return [], "unequal_warm_iterations"
+    n = lengths.pop()
+    return [sum(q["warm_ms"][i] for q in qs) for i in range(n)], None
 
 
 def classify(size_delta, time_delta, size_band, time_band):
-    size_better = size_delta < -size_band
-    size_worse = size_delta > size_band
-    time_better = time_delta < -time_band
-    time_worse = time_delta > time_band
+    size_better, size_worse = size_delta < -size_band, size_delta > size_band
+    time_better, time_worse = time_delta < -time_band, time_delta > time_band
     if not (size_better or time_better) and (size_worse or time_worse):
         return "dominated"
     if (size_better or time_better) and not (size_worse or time_worse):
@@ -83,64 +74,117 @@ def classify(size_delta, time_delta, size_band, time_band):
     return "no-demonstrated-change"
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--run", required=True)
-    ap.add_argument("--noise-floor", type=float, default=0.05)
-    ap.add_argument("--json-out")
-    args = ap.parse_args()
+def load_reports(run_set, rep_dirs):
+    """Load exactly the bound reports, verifying each digest. Returns {label: [reports...]}."""
+    if run_set.get("state") != "complete":
+        raise SystemExit("error: only a COMPLETE run set is analyzable")
+    if len(rep_dirs) != run_set["repetitions"]:
+        raise SystemExit(f"error: expected {run_set['repetitions']} report dirs, got {len(rep_dirs)}")
+    by_label = {}
+    exclusions = []
+    for entry in run_set["schedule"]:
+        path = os.path.join(rep_dirs[entry["repetition"]], "bench", f"{entry['label']}.json")
+        if not os.path.isfile(path):
+            raise SystemExit(f"error: bound report missing: {entry['expected_report_id']}")
+        if entry.get("report_digest") and sha256_file(path) != entry["report_digest"]:
+            raise SystemExit(f"error: report {entry['expected_report_id']} does not match its bound digest")
+        by_label.setdefault(entry["label"], []).append((entry, read_json(path)))
+    return by_label, exclusions
 
-    bench, census = load(args.run)
-    if "product-control" not in bench:
-        print("error: no product-control bench report in the run", file=sys.stderr)
-        return 2
 
-    control_qs = bench["product-control"]["body"]["queries"]
-    control_time = query_time(control_qs)
-    control_bytes = census.get("product-control", {}).get("total_compressed_bytes", 0)
+def census_bytes(rep_dir, label):
+    path = os.path.join(rep_dir, "census", f"{label}.json")
+    if os.path.isfile(path):
+        return read_json(path).get("total_compressed_bytes")
+    return None
 
-    time_band = noise_band(warm_all(control_qs), args.noise_floor)
-    size_band = args.noise_floor  # no within-run size reps; the floor is the honest band
 
-    rows = []
-    for label, rep in sorted(bench.items()):
-        if label == "product-control":
+def analyze(run_set, rep_dirs):
+    by_label, exclusions = load_reports(run_set, rep_dirs)
+    if CONTROL not in by_label:
+        raise SystemExit("error: the run set has no product control")
+
+    # The control T_i pool across all its repetitions -> the noise band.
+    control_pool = []
+    for _entry, rep in by_label[CONTROL]:
+        ts, reason = suite_totals(rep)
+        if reason:
+            exclusions.append({"label": CONTROL, "reason": reason})
+        control_pool.extend(ts)
+    control_median = median(control_pool)
+    time_band = (3.0 * mad(control_pool) / control_median) if control_median else 0.0
+    size_band = 0.05
+
+    control_bytes = census_bytes(rep_dirs[0], CONTROL)
+
+    variants = []
+    for label, reps in sorted(by_label.items()):
+        if label == CONTROL:
             continue
-        # Every query must have matched the control before this variant is even eligible.
-        matched = all(q.get("expected_match", False) for q in rep["body"]["queries"])
-        vtime = query_time(rep["body"]["queries"])
-        vbytes = census.get(label, {}).get("total_compressed_bytes", control_bytes)
-        size_delta = (vbytes - control_bytes) / control_bytes if control_bytes else 0.0
-        time_delta = (vtime - control_time) / control_time if control_time else 0.0
-        label_class = "REJECTED-answer-changed" if not matched else classify(
-            size_delta, time_delta, size_band, time_band
-        )
-        rows.append({
+        pool = []
+        matched = True
+        for entry, rep in reps:
+            ts, reason = suite_totals(rep)
+            if reason:
+                exclusions.append({"label": label, "reason": reason})
+            pool.extend(ts)
+            # Correctness gate: every query answer matched the control.
+            if not all(q.get("expected_match", False) for q in rep["body"]["queries"]):
+                matched = False
+        v_median = median(pool)
+        time_delta = (v_median - control_median) / control_median if control_median else 0.0
+        v_bytes = census_bytes(rep_dirs[0], label)
+        size_delta = ((v_bytes - control_bytes) / control_bytes) if (v_bytes and control_bytes) else 0.0
+        cls = "REJECTED-answer-changed" if not matched else classify(size_delta, time_delta, size_band, time_band)
+        variants.append({
             "variant": label,
             "answers_match": matched,
-            "size_delta_pct": round(size_delta * 100, 2),
+            "reps": len(reps),
+            "time_median_ms": round(v_median, 3),
             "time_delta_pct": round(time_delta * 100, 2),
-            "classification": label_class,
+            "size_delta_pct": round(size_delta * 100, 2),
+            "classification": cls,
         })
 
-    print(f"control: {control_bytes} compressed bytes, {control_time:.2f} ms total warm")
-    print(f"noise bands: size {size_band*100:.1f}%, time {time_band*100:.1f}%\n")
-    print(f"{'variant':32} {'size Δ%':>8} {'time Δ%':>8}  classification")
-    for r in rows:
-        print(f"{r['variant']:32} {r['size_delta_pct']:>8} {r['time_delta_pct']:>8}  {r['classification']}")
+    return {
+        "formulas": {
+            "suite_total": "T_i = sum_q warm_ms[q][i]",
+            "time_band": "3 * MAD(control T_i pool) / median(control T_i pool)",
+            "size_band": "0.05 fixed decision threshold",
+        },
+        "seed": run_set["seed"],
+        "repetitions": run_set["repetitions"],
+        "order": [e["expected_report_id"] for e in run_set["schedule"]],
+        "suite_digest": run_set.get("suite_digest", ""),
+        "control_digest": run_set.get("control_digest", ""),
+        "control_median_ms": round(control_median, 3),
+        "control_bytes": control_bytes,
+        "time_band": time_band,
+        "size_band": size_band,
+        "exclusions": exclusions,
+        "variants": variants,
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--run-set", required=True)
+    ap.add_argument("--reports", nargs="+", required=True)
+    ap.add_argument("--json-out")
+    args = ap.parse_args()
+    run_set = read_json(args.run_set)
+    result = analyze(run_set, args.reports)
+
+    print(f"control: {result['control_bytes']} compressed bytes, {result['control_median_ms']} ms warm median")
+    print(f"noise bands: size {result['size_band']*100:.1f}% (threshold), time {result['time_band']*100:.1f}%")
+    if result["exclusions"]:
+        print(f"exclusions: {result['exclusions']}")
+    print(f"\n{'variant':32} {'size Δ%':>8} {'time Δ%':>8}  classification")
+    for v in result["variants"]:
+        print(f"{v['variant']:32} {v['size_delta_pct']:>8} {v['time_delta_pct']:>8}  {v['classification']}")
 
     if args.json_out:
-        json.dump(
-            {
-                "control_bytes": control_bytes,
-                "control_time_ms": control_time,
-                "size_band": size_band,
-                "time_band": time_band,
-                "variants": rows,
-            },
-            open(args.json_out, "w"),
-            indent=2,
-        )
+        json.dump(result, open(args.json_out, "w"), indent=2)
     return 0
 
 

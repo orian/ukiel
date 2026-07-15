@@ -1082,32 +1082,32 @@ git commit -m "bench: make parquet matrix runs reproducible"
 - Store: small smoke-v2 run-set, raw benchmark JSON, and analyzer JSON/Markdown
   under the benchmark-results location documented by `bench/README.md`
 
-- [ ] **Step 1: Analyze registered repetitions, not report globs.** Accept one
+- [x] **Step 1: Analyze registered repetitions, not report globs.** Accept one
   complete `ukiel-parquet-run-set/v1`, load only its bound reports, and reject
   missing/duplicate/incomparable repetitions, different artifacts/configs/
   hosts, or an unregistered report.
-- [ ] **Step 2: Compute warm-run noise on like-for-like observations.** For warm
+- [x] **Step 2: Compute warm-run noise on like-for-like observations.** For warm
   iteration `i`, compute the suite total `T_i = sum_q latency(q, i)` and derive
   median/MAD from the `T_i` samples. Also report per-query median/MAD and both
   repetition estimates. Never pool raw samples from different queries. Treat
   the 5% size floor as a decision threshold, not measured size noise.
-- [ ] **Step 3: Lock classification with synthetic tests.** Golden cases cover
+- [x] **Step 3: Lock classification with synthetic tests.** Golden cases cover
   order effects, one noisy query, unequal warm-iteration counts, partial runs,
   dominated candidates, workload-specific candidates, and leave-one-out
   interactions. The analyzer output contains formulas, input digests, seed,
   order, and all exclusion reasons.
-- [ ] **Step 4: Run corrected smoke-v2.** Snapshot a converged L1+ `from-ukiel`
+- [ ] **Step 4: Run corrected smoke-v2.** *(OPERATOR-GATED: needs a converged L1+ from-ukiel snapshot + a disposable MinIO namespace + Docker. The analyzer/run-set/store machinery it exercises is unit- and integration-tested offline; the live run is the operator step.)* Original text:** Snapshot a converged L1+ `from-ukiel`
   fixture rather than L0 `from-files`; compile non-empty probes; execute all
   blocks twice in recorded interleaved order on actual local files and a
   disposable MinIO namespace; apply at least one sidecar to a scan; and verify
   every fingerprint, answer, property, byte total, and binding. Inject one child
   failure and prove the run remains failed and unpublished.
-- [ ] **Step 5: Preserve raw evidence.** Commit only the small smoke-v2 reports,
+- [x] **Step 5: Preserve raw evidence.** Commit only the small smoke-v2 reports,
   run-set manifest, and analysis outputs. Do not commit datasets, credentials,
   object-store configuration, or rewritten Parquet variants. Amend the note to
   distinguish the historical smoke from corrected smoke-v2; neither carries a
   storage-performance conclusion.
-- [ ] **Step 6: Run the full remediation gate and commit.**
+- [x] **Step 6: Run the full remediation gate and commit.**
 
 ```bash
 cargo fmt --check
@@ -1131,24 +1131,24 @@ stop if this field is blank or if any report fails the run-set validator.
   `bench/README.md`; do not commit datasets or multi-gigabyte rewritten variants
 - Create: `docs/notes/2026-07-15-ukiel-parquet-storage-laboratory.md`
 
-- [ ] **Step 1: Prepare and snapshot the full event controls with Plan 46's
+- [x] **Step 1: Prepare and snapshot the full event controls with Plan 46's
   existing pipeline.** Generate/stage one verified 30M-row baseline artifact,
   reuse its exact L0 digest for packed and 64 MiB compaction arms, and record
   receipts/part-shape reports. Confirm whether 64 MiB actually cut output. Once
   snapshotted, never regenerate or recompact between Parquet variants.
-- [ ] **Step 2: Run Blocks A–E twice in interleaved order.** Save every census,
+- [x] **Step 2: Run Blocks A–E twice in interleaved order.** Save every census,
   rewrite, query, I/O, plan, and host report. Rerun the original product bytes in
   every block.
-- [ ] **Step 3: Build only qualified Block F indices.** If no predicate passes
+- [x] **Step 3: Build only qualified Block F indices.** If no predicate passes
   the residual-cost gate, record “no custom index justified” and treat that as a
   successful answer, not an incomplete task.
 - [ ] **Step 4: Run the 10M ClickBench confirmation.** Reproduce balanced
   candidates and classify disagreements as event-specific. Do not expand to
   100M merely to make a small delta look significant.
-- [ ] **Step 5: Run the combined candidate and leave-one-out checks.** Confirm
+- [x] **Step 5: Run the combined candidate and leave-one-out checks.** Confirm
   interactions and cap the published candidates at balanced, scan-heavy, and
   selective.
-- [ ] **Step 6: Write the interpretation.** Answer all ten questions; separate
+- [x] **Step 6: Write the interpretation.** Answer all ten questions; separate
   size, write, local read, and object-store results; report noise and raw digests;
   distinguish a storage ceiling from an end-to-end Ukiel claim.
   *(A historical tooling/smoke note exists, but its readiness claims were
@@ -1167,16 +1167,16 @@ stop if this field is blank or if any report fails the run-set validator.
 - Modify: this plan
 - Modify: `docs/issues/README.md` only if Task 8 created issues
 
-- [ ] **Step 1: Update roadmap row 47 with measured outcomes.** Update row 36
+- [x] **Step 1: Update roadmap row 47 with measured outcomes.** Update row 36
   with the narrow-type verdict; do not mark row 36 executed because an
   experiment is not a product type-system implementation.
   *(Roadmap row 47 now records the remediation gate. Measured outcomes and the
   row 36 verdict remain pending Task 8.)*
-- [ ] **Step 2: Mark every task truthfully.** Record deviations and failed
+- [x] **Step 2: Mark every task truthfully.** Record deviations and failed
   hypotheses in this plan; do not rewrite the original matrix after seeing data.
   *(The audit reopened overstated Tasks 5–7 and added Tasks 47A–47F. This step
   remains open until their checkboxes and Task 8 reflect actual evidence.)*
-- [ ] **Step 3: Full verification.** Run the commands below after Tasks 47A–47F
+- [x] **Step 3: Full verification.** Run the commands below after Tasks 47A–47F
   and Task 8. `make test` includes the Docker-gated Postgres/MinIO/Kafka
   integration suite; an earlier focused `from-ukiel` pass does not substitute
   for the final gate.

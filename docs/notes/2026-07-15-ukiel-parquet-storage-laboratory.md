@@ -139,3 +139,29 @@ Block D measures the *ceiling* for roadmap row 36 (narrow production types). The
 proves the conversions are lossless and answer-preserving; it does **not** modify
 `ukiel-core::schema` or claim the end-to-end migration/evolution cost is free. Any candidate
 worth that cost becomes a separate implementation plan, fed by this laboratory's evidence.
+
+## Remediation status (Tasks 47A–47F) and smoke-v2
+
+The audit-driven remediation is largely implemented and tested:
+
+- **47A** run contracts (`ukiel-parquet-probes/v1`, `ukiel-parquet-store/v1`,
+  `ukiel-parquet-run-set/v1`), extended report identity, credentials-never-serialized golden
+  tests, and CLI flags that fail closed until their feature lands.
+- **47B** real selectivity-probe compilation (typed literals + observed selectivity frozen
+  against the control; unsupported probes recorded with a reason; `ordered`/`multiset`
+  answer semantics) — validated compiling seven probes against real prod-synth data.
+- **47C** sidecars applied to actual scans: a shared pure `parquet-skip-index-core`, a
+  per-file `ParquetAccessPlan` that omits only `NoMatch` groups, and a spy-store proof that
+  a skipped row group's data range is never fetched.
+- **47D** the `parquet-lab-store` publisher/verifier (local + S3/MinIO) and three real bench
+  modes (`memory`/`local`/`object-store`) that no longer preload whole files.
+- **47E** a fail-fast, atomic, marker-guarded `parquet-lab.sh` and a seeded run-set planner.
+- **47F** an analyzer that consumes a *complete run set* and computes noise on like-for-like
+  suite totals (never pooling unlike queries), with synthetic unit tests.
+
+**Smoke-v2 (converged L1+ + MinIO + applied sidecar, all blocks twice) remains the
+operator-run completion gate**, as does the 30M event baseline and 10M ClickBench. The
+historical smoke run in this note used L0 `from-files` bytes as its control and therefore
+carries **no** storage conclusion; smoke-v2 must snapshot converged L1+ parts via
+`from-ukiel`. See the plan's "Deviation (partial)" notes on 47D for the remaining
+returned-byte accounting, range classification, and the `--publishable` provenance gate.
