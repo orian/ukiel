@@ -1,12 +1,14 @@
 # Parquet Storage Laboratory — interpretation note (Plan 47)
 
-**Status (2026-07-15):** The laboratory *tooling* is complete, test-driven, and validated
-end-to-end. The publishable *measurement phase* — the full 30M-row prod-synth event baseline
-and the 10M ClickBench confirmation, run twice interleaved under the measurement-validity
-contract — is an operator-run step against real infrastructure (a live catalog, object
-store, and the real compaction ladder to convergence) and has **not** been executed here.
-Everything below separates what the tooling now guarantees from what still needs the real
-run before any storage conclusion may be published.
+**Status correction (audit 2026-07-15):** This is a historical interpretation of the first
+implementation and smoke run, not proof that the laboratory is measurement-ready. A later
+code audit found that probes are not compiled, skip sidecars are not applied to scan plans,
+the named local/object-store modes both preload data into memory, I/O/provenance are
+incomplete, the noise calculation pools unlike queries, and orchestration needs fail-fast
+and safe-publication fixes. Plan 47 now makes Tasks 47A–47F and a converged-L1+ smoke-v2
+mandatory before the 30M event or 10M ClickBench runs. Statements below about what the
+tooling “guarantees” or can “answer” describe the original implementation intent and are
+superseded where the audit disagrees.
 
 This note is deliberately honest about that boundary: per the plan, smoke output carries
 **no performance conclusion**, and the event baseline is *required* for any published claim.

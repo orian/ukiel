@@ -6,15 +6,21 @@
 > plan: it may produce evidence and follow-up issues, but it must not silently
 > turn laboratory controls into production table settings.
 
-**Status:** Tooling executed (2026-07-15). Tasks 1–7 are implemented, test-driven, and
-committed; the offline tools install standalone and the `from-ukiel` snapshot adapter is
-validated against a real Postgres + the in-harness compactor. All five blocks (17 variants)
-run through the full rewrite→census→bench pipeline on a real prod-synth smoke fixture, with
-fingerprints preserved, answers matched, and I/O accounted. The **publishable measurement
-phase** — Task 8's 30M event baseline (packed + 64 MiB) and 10M ClickBench, twice
-interleaved — remains an operator run against live infrastructure and is documented in
-`docs/notes/2026-07-15-ukiel-parquet-storage-laboratory.md`; smoke carries no storage
-conclusion, per this plan's own rule.
+**Status:** Tooling implemented; publishable measurement blocked on remediation
+(audit 2026-07-15). Tasks 1–7 landed as a useful first implementation and its 82 focused
+tests pass, but a post-implementation code audit found that several checked acceptance
+claims are stronger than the behavior exercised by those tests. In particular, declared
+selectivity probes are not compiled, sidecar decisions are not attached to Parquet scans,
+both benchmark modes preload files into an in-memory object store, I/O accounting omits
+returned bytes and phase attribution, analysis pools incomparable query latencies, and the
+orchestrator is not fail-fast or safe enough for an expensive run. The smoke fixture remains
+useful as implementation history, not as evidence that the measurement contract is ready.
+
+Tasks 47A–47F below are therefore a mandatory pre-measurement remediation phase. No agent
+may start Task 8, publish a storage result, or file a production-format issue until all six
+tasks pass their focused gates and the corrected L1+ smoke-v2 acceptance gate. The original
+Tasks 1–7 and their commits are preserved below; reopened checkboxes identify claims that
+must be completed by the remediation rather than erasing what was built.
 
 Plan 46 is executed and its tooling, receipts, compacted objects, and geometry
 interpretation are available. Its reduced 3M-row baseline did not trigger the 64/256 MiB
@@ -161,19 +167,26 @@ depends on another executable package or calls another command handler.
 
 | component | one responsibility | allowed side effects |
 |---|---|---|
-| `parquet-lab-contract` | serde contracts for snapshots, variants, index sidecars, suites, and reports | none |
+| `parquet-lab-contract` | serde contracts for snapshots, variants, index sidecars, probes, stores, suites, run sets, and reports | none |
 | `parquet-lab-integrity` | canonical logical-row fingerprint shared by snapshot and rewrite tools | none |
 | `parquet-lab-snapshot` | freeze an explicit Parquet file set, including a Plan 46 receipt adapter, into a verified local artifact | read catalog/object store or local files; write only the selected output directory |
 | `parquet-census` | inspect one snapshot/variant and report physical Parquet structure | local reads; one explicit report file |
 | `parquet-rewrite` | rewrite one snapshot under one explicit variant spec | local reads; one fresh output directory |
+| `parquet-skip-index-core` | pure predicate and sidecar evaluation shared by builder and reader | none |
 | `parquet-skip-index` | build one versioned experimental sidecar-index artifact | local reads; one fresh output directory |
-| `parquet-lab-bench` | run declared queries read-only over one existing artifact, optionally consuming a sidecar | local or read-only object-store access; one explicit result file |
+| `parquet-lab-store` | publish or verify one artifact in an explicit disposable S3-compatible namespace | bounded upload for `publish`; read-only access for `verify`; one explicit receipt |
+| `parquet-lab-bench` | run declared queries read-only over one existing artifact, optionally consuming a sidecar | memory, local, or read-only object-store access; one explicit result file |
 | `bench/parquet-lab.sh` | orchestrate commands for one declared matrix block | starts child commands and writes a run directory; implements no snapshot, rewrite, index, or query logic |
+| `bench/parquet-lab-run-set.py` | plan and validate repetitions and their deterministic schedule | writes only one run-set manifest; starts no benchmark commands |
+| `bench/parquet-lab-analyze.py` | analyze one complete bound run set | reads immutable reports; writes explicit JSON/Markdown outputs |
 
 The offline tools must install and run without PostgreSQL, Kafka, Ukiel services,
 or repository-relative paths. Only `parquet-lab-snapshot from-ukiel` may depend
 on catalog/object-store clients. `from-files`, census, rewrite, sidecar build,
-and the local benchmark must remain usable on any explicit Parquet dataset.
+the local benchmark, and analysis must remain usable on any explicit Parquet
+dataset. `parquet-lab-store` is optional and is the only offline tool allowed to
+upload laboratory data; deletion remains an operator responsibility outside
+this toolchain.
 
 The pipeline is:
 
@@ -188,7 +201,8 @@ Plan 46 receipt + converged final objects
     -> parquet-census + parquet-lab-bench
     -> optional parquet-skip-index for one residual predicate family
     -> parquet-lab-bench with/without the sidecar
-    -> raw JSON reports + one interpretation note
+    -> complete bound run set + raw JSON reports
+    -> parquet-lab-analyze + one interpretation note
 ```
 
 ## Versioned artifact contracts
@@ -655,19 +669,27 @@ parquet-lab-bench run \
   [--skip-manifest FILE]
 ```
 
-- [x] **Step 1: Define versioned suites.** Import the six prod-synth query
+- [ ] **Step 1: Define versioned suites.** Import the six prod-synth query
   classes and existing adapted ClickBench SQL without calling their executable
   handlers. Add parameterized probes with expected selectivity/result digests.
-- [x] **Step 2: Write accounting tests.** `CountingObjectStore` attributes
+  *(Audit: suite SQL is imported, but `compile_suite` currently hard-codes an
+  empty probe vector. Task 47B completes the probe contract and compiler.)*
+- [ ] **Step 2: Write accounting tests.** `CountingObjectStore` attributes
   HEAD/get/range requests and requested/returned bytes by metadata, index, and
   data phase. No coordinated omission; every scheduled query is completed or
   failed and counted.
+  *(Audit: request count and requested bytes exist; returned bytes, phase
+  attribution, retries/errors, and whole-repetition accounting do not. Task 47D
+  completes this claim.)*
 - [x] **Step 3: Implement schema/result equivalence before timing.** Physical
   variants are exposed through the declared logical projection; normalized
   batches must equal the snapshot control exactly.
-- [x] **Step 4: Capture plans and DataFusion metrics.** Pin reader flags, cache
+- [ ] **Step 4: Capture plans and DataFusion metrics.** Pin reader flags, cache
   posture, cold/warm phases, run order, host metadata, and missing metrics as
   `null`. Refuse report overwrite.
+  *(Audit: plans and some metrics are captured, but publishable host identity,
+  repetition/order identity, and a real cache/backend posture are missing.
+  Tasks 47A and 47D complete this claim.)*
 - [x] **Step 5: Prove read-only boundaries and commit.** The package has no
   catalog mutator, writer, generator, or compactor dependency.
 
@@ -689,16 +711,25 @@ git commit -m "bench: compare parquet variants with exact query and io accountin
 - [x] **Step 1: Encode Blocks A–E as explicit specs.** Every spec changes one
   axis from its block control and has a stable label. The script runs one block,
   never an implicit all-night matrix.
-- [x] **Step 2: Test orchestration/refusal without large data.** Missing
+- [ ] **Step 2: Test orchestration/refusal without large data.** Missing
   manifests, reused output, spec/parent mismatch, invalid stage order, absent
   control, and partial reports fail before a benchmark claim is emitted.
-- [x] **Step 3: Run the complete smoke matrix.** Every variant fingerprints
+  *(Audit: the script lacks `set -e`, and `--replace` performs an insufficiently
+  guarded recursive deletion. Task 47E adds failure propagation, safe publish,
+  and destructive-path refusal tests.)*
+- [ ] **Step 3: Run the complete smoke matrix.** Every variant fingerprints
   equal, every query answer matches, every requested property is confirmed by
   census, and local/object-store accounting balances.
-- [x] **Step 4: Add selection/confirmation logic to reports, not the writer.**
+  *(Audit: all variants traversed the original smoke pipeline, but both named
+  storage modes used `InMemory`, probes were empty, and sidecars did not prune.
+  Task 47F's smoke-v2 is the completion gate.)*
+- [ ] **Step 4: Add selection/confirmation logic to reports, not the writer.**
   Compute the registered noise band, dominated/Pareto/workload-specific labels,
   and carry-forward candidates. Do not mutate later TOML specs automatically;
   the chosen digest is explicit.
+  *(Audit: the analyzer pools warm samples from queries with different latency
+  scales and has no validated two-repetition run-set input. Task 47F replaces
+  that calculation.)*
 - [x] **Step 5: Verify shell, workspace, and commit.**
 
 ```bash
@@ -742,12 +773,17 @@ parquet-lab-bench run \
 - [x] **Step 3: Implement the three bounded prototypes.** Payload budgets and
   prefix lengths are explicit in the spec. No index is built for a column/query
   family absent from the compiled suite.
-- [x] **Step 4: Translate only `NoMatch` into `ParquetAccessPlan`.** Preserve
+- [ ] **Step 4: Translate only `NoMatch` into `ParquetAccessPlan`.** Preserve
   native DataFusion pruning underneath. Report custom-skipped, native-skipped,
   decoded, sidecar request/byte, build-time, and storage costs separately.
-- [x] **Step 5: Compare against native controls on smoke and commit.** A native
+  *(Audit: the runner only loads and verifies sidecars. It does not evaluate a
+  query predicate or attach a `ParquetAccessPlan`. Task 47C implements and
+  proves scan-time use.)*
+- [ ] **Step 5: Compare against native controls on smoke and commit.** A native
   feature matching the result makes the custom candidate fail the simplicity
   gate, as intended.
+  *(Audit: sidecar binding/cost was compared, not actual pruning. Task 47C and
+  smoke-v2 complete this claim.)*
 
 ```bash
 cargo test -p parquet-skip-index -p parquet-lab-bench
@@ -755,7 +791,327 @@ cargo clippy -p parquet-skip-index -p parquet-lab-bench --all-targets -- -D warn
 git commit -m "bench: prototype conservative parquet skip-index sidecars"
 ```
 
+## Mandatory pre-measurement remediation
+
+The following tasks repair the measurement contract exposed by the
+post-implementation audit. They are ordered by dependency: 47A owns shared
+contracts; 47B and 47C make workload and sidecar semantics real; 47D makes the
+storage modes and counters truthful; 47E makes execution safe and reproducible;
+47F validates the complete system and its statistics. An agent must not combine
+these tasks into one monolithic command or crate.
+
+**Agent handoff order:** assign one task per branch/agent and preserve its
+single-purpose commit. Land 47A first. Land 47B next; 47C depends on its
+structured predicates. Land 47D before 47C's returned-byte acceptance test is
+closed. Rebase and land 47E after 47A and 47D so it targets the final CLI/report
+shape. Run 47F only after 47A–47E are on the same branch. Before marking a task
+complete, the agent must run its focused commands, update only that task's
+checkboxes, record any deviation inline, and leave Task 8 untouched.
+
+### Task 47A: Bind probes, storage locations, repetitions, and run sets
+
+**Files:**
+
+- Modify: `tools/parquet-lab-contract/src/{lib,suite,report}.rs`
+- Create: `tools/parquet-lab-contract/src/{store,run_set}.rs`
+- Modify: `tools/parquet-lab-contract/tests/contracts.rs`
+- Modify: `tools/parquet-lab-bench/src/main.rs`
+
+**Contracts:**
+
+- `ukiel-parquet-probes/v1` declares structured predicates independently from
+  SQL rendering: equality, range, prefix, substring, `IS NULL`, and projection.
+  Each probe binds its column, typed literals, SQL, exact control digest,
+  control row count, observed match count/selectivity, and result semantics
+  (`ordered` or `multiset`).
+- `ukiel-parquet-store/v1` binds one artifact manifest digest to one immutable
+  object namespace. It records store kind, endpoint identity without secrets,
+  bucket/prefix, and sorted object path/size/SHA-256 tuples. Credentials and
+  mutable client configuration never appear in the receipt.
+- `ukiel-parquet-run-set/v1` binds suite, snapshot/control, block/spec, backend,
+  reader configuration, host, repetition count, seed, scheduled order, and
+  every expected report identity. Its `complete` state additionally binds every
+  produced report digest. It has `planned`, `failed`, and `complete` states;
+  only a complete run set is analyzable.
+- Extend benchmark reports with repetition number, seed, order digest, backend
+  identity, result semantics, and optional returned-byte/error/retry fields.
+  Unknown or unobservable values are `null`, never zero.
+
+- [ ] **Step 1: Write failing serde and binding tests.** Reject unknown versions,
+  duplicate probe/query/repetition IDs, absolute/traversing object keys,
+  duplicate objects, missing repetitions, inconsistent suite/artifact/backend
+  digests, and a `complete` run set with a missing or duplicate report.
+- [ ] **Step 2: Implement canonical digests and validation.** Stable ordering is
+  part of each digest. A report must bind to exactly one scheduled run-set entry;
+  changing seed, order, backend, reader flags, or artifact invalidates it.
+- [ ] **Step 3: Keep credentials out of artifacts.** Add golden tests proving
+  store receipts and reports cannot serialize access keys, secret keys, session
+  tokens, or raw environment values.
+- [ ] **Step 4: Add CLI parsing but no behavior change yet.** The benchmark may
+  accept `--probes`, `--rep`, `--seed`, and `--store-receipt`; until Tasks 47B
+  and 47D implement them, requesting those paths must fail with a clear
+  “unsupported until remediation” error rather than silently ignoring them.
+- [ ] **Step 5: Verify and commit.**
+
+```bash
+cargo test -p parquet-lab-contract -p parquet-lab-bench
+cargo clippy -p parquet-lab-contract -p parquet-lab-bench --all-targets -- -D warnings
+git commit -m "bench: bind parquet laboratory run contracts"
+```
+
+### Task 47B: Compile real selectivity probes and stable answer semantics
+
+**Files:**
+
+- Modify: `tools/parquet-lab-bench/src/{lib,main,compare}.rs`
+- Modify: `tools/parquet-lab-bench/src/suites/{mod,prod_synth,clickbench,probes}.rs`
+- Create: `tools/parquet-lab-bench/tests/{probes,result_semantics}.rs`
+- Create: `bench/config/parquet-lab/probes/{prod-synth,clickbench}.toml`
+- Modify: `tools/parquet-lab-bench/README.md`
+
+- [ ] **Step 1: Expose an explicit compiler interface.**
+
+```text
+parquet-lab-bench compile-suite \
+  --manifest CONTROL.json --queries FILE --probes PROBES.toml \
+  --output SUITE.json
+```
+
+  Compile each probe against the immutable control, materialize typed literals,
+  exact result digest, total rows, match rows, and observed selectivity, then
+  freeze those values in the suite. Refuse an empty probe set for Blocks A, D,
+  E, or F; Block E specifically requires a non-packing-key equality probe.
+- [ ] **Step 2: Make unsupported probes explicit.** A requested probe is either
+  compiled or recorded with one stable reason (`column_missing`,
+  `no_literal_in_band`, `unsupported_type`, or `empty_control`). Never replace
+  it with `Vec::new()` or silently drop it. The matrix preflight refuses a block
+  whose required probe family did not compile.
+- [ ] **Step 3: Make answer semantics correct.** `ordered` digests canonical
+  Arrow values in result order. `multiset` digests canonical rows independent of
+  batch and row order while preserving duplicate counts. Audit ClickBench SQL:
+  every potentially multi-row query must either have deterministic total
+  ordering or use `multiset`; scalar aggregates remain `ordered`.
+- [ ] **Step 4: Test the compiled workload.** Golden fixtures cover every probe
+  kind and selectivity band, missing literals, nulls, Unicode prefixes, duplicate
+  result rows, changed answers, reordered batches, and deterministic recompiles.
+  Assert that at least one equality probe reaches the benchmark runner.
+- [ ] **Step 5: Verify and commit.**
+
+```bash
+cargo test -p parquet-lab-bench --test probes
+cargo test -p parquet-lab-bench --test result_semantics
+cargo clippy -p parquet-lab-bench --all-targets -- -D warnings
+git commit -m "bench: compile parquet selectivity probes"
+```
+
+### Task 47C: Apply conservative sidecars to actual Parquet scans
+
+**Files:**
+
+- Create: `tools/parquet-skip-index-core/Cargo.toml`
+- Create: `tools/parquet-skip-index-core/src/{lib,predicate,sidecar}.rs`
+- Modify: `Cargo.toml`
+- Modify: `tools/parquet-skip-index/Cargo.toml`
+- Refactor: `tools/parquet-skip-index/src/{lib,zone_map,value_set,prefix_set}.rs`
+- Modify: `tools/parquet-lab-bench/Cargo.toml`
+- Modify: `tools/parquet-lab-bench/src/{runner,skip,metrics}.rs`
+- Modify: `tools/parquet-lab-bench/tests/skip_index.rs`
+- Create: `tools/parquet-skip-index-core/tests/properties.rs`
+
+`parquet-skip-index-core` is a pure library containing sidecar parsing and
+`Predicate -> NoMatch | Maybe | Unknown` evaluation. The builder executable and
+benchmark may depend on it; neither executable depends on the other.
+
+- [ ] **Step 1: Move, do not duplicate, index semantics into the core crate.**
+  Preserve the existing property tests and golden format. Structured predicates
+  come from the compiled suite, not ad-hoc SQL-expression parsing.
+- [ ] **Step 2: Build a per-file `ParquetAccessPlan`.** For every timed query,
+  evaluate the bound predicate for every row group and omit only `NoMatch`.
+  Attach the plan to the DataFusion `PartitionedFile` while leaving native
+  statistics/page/Bloom pruning enabled underneath it. `Maybe`, `Unknown`, and
+  every unsupported expression keep the group.
+- [ ] **Step 3: Separate refusal from fail-open fallback.** Wrong
+  artifact/schema/variant/version identity refuses the run before timing.
+  Missing/corrupt payload or a per-row-group decode mismatch keeps affected row
+  groups and increments a stable fallback reason; it must never become
+  `NoMatch`.
+- [ ] **Step 4: Report the complete pruning ledger.** Per query record sidecar
+  fetch requests/bytes, entries evaluated, `NoMatch`/`Maybe`/`Unknown`, fallback
+  reasons, custom-selected groups, native-final groups where observable,
+  decoded rows, index build time, and index storage bytes. Missing native metrics
+  are `null`.
+- [ ] **Step 5: Prove that the scan changes.** An integration fixture must show
+  fewer row groups and fewer returned data bytes with a sidecar, identical
+  schema/result digest, and no reduction for unknown/corrupt entries. A spy
+  object store must prove a skipped row group's data range is never fetched.
+- [ ] **Step 6: Verify and commit.**
+
+```bash
+cargo test -p parquet-skip-index-core
+cargo test -p parquet-skip-index
+cargo test -p parquet-lab-bench --test skip_index
+cargo clippy -p parquet-skip-index-core -p parquet-skip-index -p parquet-lab-bench --all-targets -- -D warnings
+git commit -m "bench: apply parquet sidecars to scan plans"
+```
+
+### Task 47D: Use real storage backends and account for actual I/O
+
+**Files:**
+
+- Create: `tools/parquet-lab-store/Cargo.toml`
+- Create: `tools/parquet-lab-store/src/{main,lib,publish,verify}.rs`
+- Create: `tools/parquet-lab-store/README.md`
+- Create: `tools/parquet-lab-store/tests/{publish,boundary}.rs`
+- Modify: `Cargo.toml`
+- Modify: `tools/parquet-lab-bench/src/{main,lib,runner,counting_store,metrics}.rs`
+- Modify: `tools/parquet-lab-bench/tests/{runner,counting_store,boundary}.rs`
+- Modify: `tools/parquet-lab-bench/README.md`
+
+**Interfaces:**
+
+```text
+parquet-lab-store publish \
+  --manifest ARTIFACT.json --config STORE.toml --prefix DISPOSABLE \
+  --receipt STORE.json
+parquet-lab-store verify --receipt STORE.json --config STORE.toml
+
+parquet-lab-bench run ... --mode memory
+parquet-lab-bench run ... --mode local
+parquet-lab-bench run ... --mode object-store \
+  --store-receipt STORE.json --store-config STORE.toml
+```
+
+`memory` is the existing decode-only micro mode. `local` reads the artifact via
+an actual local-filesystem object store without copying complete files into RAM.
+`object-store` reads the immutable receipt namespace through the configured
+S3-compatible store. The read-only benchmark never uploads or deletes objects.
+
+- [ ] **Step 1: Implement the single-purpose publisher.** Upload with bounded
+  buffers to an explicit disposable prefix, verify HEAD/size/digest, and publish
+  the receipt atomically. Refuse an existing prefix, root/empty prefix, path
+  traversal, a mutable/unverified manifest, or overwrite. Verification is
+  read-only. No delete command belongs in this tool.
+- [ ] **Step 2: Stop preloading files in publishable modes.** Retain `InMemory`
+  only for `--mode memory`. Local and object-store sessions must reuse their
+  backing store and preserve the declared cache posture across iterations.
+- [ ] **Step 3: Count requested and returned I/O.** Record HEAD, GET, range and
+  multi-range requests; requested bytes; bytes actually yielded to the reader;
+  errors; and observable retries. Classify ranges as footer/metadata,
+  page-index/Bloom, data, or mixed using verified Parquet offsets. When a client
+  hides retries, report `null` and identify the client retry policy.
+- [ ] **Step 4: Make per-query and per-repetition accounting additive.** Retain
+  every cold and warm iteration instead of overwriting with the last sample.
+  Assert query totals sum exactly to repetition totals; count failed scheduled
+  queries and refuse a publishable partial report.
+- [ ] **Step 5: Require publishable provenance.** Capture git SHA, dirty flag,
+  CPU model/count, RAM, kernel, storage mode/endpoint identity, reader flags,
+  cache posture, and DataFusion/Parquet versions. `--publishable` refuses
+  unknown required fields. Tests may use explicit fixture metadata.
+- [ ] **Step 6: Test local plus disposable MinIO.** Assert no full-file preload,
+  range counters against known bytes, receipt/artifact mismatch refusal,
+  read-only benchmark permissions, and equivalent answers across memory/local/
+  object-store. Keep the MinIO test operator-gated if Docker is unavailable.
+- [ ] **Step 7: Verify standalone installation and commit.**
+
+```bash
+cargo test -p parquet-lab-store -p parquet-lab-bench
+cargo install --path tools/parquet-lab-store --root /tmp/parquet-lab-store-install
+cargo clippy -p parquet-lab-store -p parquet-lab-bench --all-targets -- -D warnings
+git commit -m "bench: measure parquet on real storage backends"
+```
+
+### Task 47E: Make matrix execution fail-fast, safe, and reproducible
+
+**Files:**
+
+- Modify: `bench/parquet-lab.sh`
+- Create: `bench/parquet-lab-run-set.py`
+- Modify: `bench/tests/parquet-lab.bats`
+- Modify: `bench/README.md`
+
+Keep responsibilities narrow: `parquet-lab.sh` executes one declared
+block/repetition; `parquet-lab-run-set.py` plans, validates, and closes a run set.
+Neither script implements rewrite, census, query, upload, or analysis logic.
+
+- [ ] **Step 1: Make one-block execution fail-fast.** Use `set -euo pipefail`,
+  traps, a fresh temporary sibling, and atomic final publication. Any child
+  failure writes a failed run-set state and returns nonzero; “block complete” is
+  impossible until all expected JSON reports parse and bind.
+- [ ] **Step 2: Remove unsafe replacement.** Prefer refusing an existing output.
+  If `--replace` remains, it may replace only a non-symlink directory containing
+  the laboratory marker with the exact expected run-set/snapshot/suite/block
+  digest and approved parent; it must refuse `/`, `.`, the repository root,
+  empty paths, parent traversal, symlinks, and an unmarked directory.
+- [ ] **Step 3: Register deterministic interleaving.** The run-set planner takes
+  `--repetitions 2 --seed N`, emits a seeded order with the product control at
+  the beginning and end of each repetition, and records the complete schedule
+  before execution. Reusing the seed reproduces byte-identical order; a report
+  outside the schedule is rejected.
+- [ ] **Step 4: Add adversarial shell tests.** Cover child exit/non-JSON/partial
+  output, interrupted execution, duplicate reports, missing control, unsafe
+  replace paths, symlinks, stale marker, different seed/order, and successful
+  atomic close. Assert failed runs cannot be analyzed.
+- [ ] **Step 5: Verify and commit.**
+
+```bash
+bash -n bench/parquet-lab.sh
+python3 -m py_compile bench/parquet-lab-run-set.py
+bats bench/tests/parquet-lab.bats
+git commit -m "bench: make parquet matrix runs reproducible"
+```
+
+### Task 47F: Correct the statistics and pass smoke-v2
+
+**Files:**
+
+- Modify: `bench/parquet-lab-analyze.py`
+- Create: `bench/tests/test_parquet_lab_analyze.py`
+- Modify: `docs/notes/2026-07-15-ukiel-parquet-storage-laboratory.md`
+- Store: small smoke-v2 run-set, raw benchmark JSON, and analyzer JSON/Markdown
+  under the benchmark-results location documented by `bench/README.md`
+
+- [ ] **Step 1: Analyze registered repetitions, not report globs.** Accept one
+  complete `ukiel-parquet-run-set/v1`, load only its bound reports, and reject
+  missing/duplicate/incomparable repetitions, different artifacts/configs/
+  hosts, or an unregistered report.
+- [ ] **Step 2: Compute warm-run noise on like-for-like observations.** For warm
+  iteration `i`, compute the suite total `T_i = sum_q latency(q, i)` and derive
+  median/MAD from the `T_i` samples. Also report per-query median/MAD and both
+  repetition estimates. Never pool raw samples from different queries. Treat
+  the 5% size floor as a decision threshold, not measured size noise.
+- [ ] **Step 3: Lock classification with synthetic tests.** Golden cases cover
+  order effects, one noisy query, unequal warm-iteration counts, partial runs,
+  dominated candidates, workload-specific candidates, and leave-one-out
+  interactions. The analyzer output contains formulas, input digests, seed,
+  order, and all exclusion reasons.
+- [ ] **Step 4: Run corrected smoke-v2.** Snapshot a converged L1+ `from-ukiel`
+  fixture rather than L0 `from-files`; compile non-empty probes; execute all
+  blocks twice in recorded interleaved order on actual local files and a
+  disposable MinIO namespace; apply at least one sidecar to a scan; and verify
+  every fingerprint, answer, property, byte total, and binding. Inject one child
+  failure and prove the run remains failed and unpublished.
+- [ ] **Step 5: Preserve raw evidence.** Commit only the small smoke-v2 reports,
+  run-set manifest, and analysis outputs. Do not commit datasets, credentials,
+  object-store configuration, or rewritten Parquet variants. Amend the note to
+  distinguish the historical smoke from corrected smoke-v2; neither carries a
+  storage-performance conclusion.
+- [ ] **Step 6: Run the full remediation gate and commit.**
+
+```bash
+cargo fmt --check
+cargo clippy -p parquet-lab-contract -p parquet-lab-integrity -p parquet-lab-snapshot -p parquet-census -p parquet-rewrite -p parquet-skip-index-core -p parquet-skip-index -p parquet-lab-store -p parquet-lab-bench --all-targets -- -D warnings
+cargo test -p parquet-lab-contract -p parquet-lab-integrity -p parquet-lab-snapshot -p parquet-census -p parquet-rewrite -p parquet-skip-index-core -p parquet-skip-index -p parquet-lab-store -p parquet-lab-bench
+python3 -m unittest bench/tests/test_parquet_lab_analyze.py
+bats bench/tests/parquet-lab.bats
+git diff --check
+git commit -m "bench: validate parquet laboratory measurement contract"
+```
+
 ### Task 8: Execute bounded event and OLAP matrices
+
+**Hard prerequisite:** Tasks 47A–47F are checked, smoke-v2 passes, and its
+complete run-set digest is recorded here: `________________`. The operator must
+stop if this field is blank or if any report fails the run-set validator.
 
 **Files:**
 
@@ -780,12 +1136,12 @@ git commit -m "bench: prototype conservative parquet skip-index sidecars"
 - [ ] **Step 5: Run the combined candidate and leave-one-out checks.** Confirm
   interactions and cap the published candidates at balanced, scan-heavy, and
   selective.
-- [x] **Step 6: Write the interpretation.** Answer all ten questions; separate
+- [ ] **Step 6: Write the interpretation.** Answer all ten questions; separate
   size, write, local read, and object-store results; report noise and raw digests;
   distinguish a storage ceiling from an end-to-end Ukiel claim.
-  *(Done as `docs/notes/2026-07-15-ukiel-parquet-storage-laboratory.md`, scoped to the
-  tooling-complete state: it answers each question with tooling-readiness and the smoke
-  validation, and marks the publishable numbers as pending the operator-run baseline.)*
+  *(A historical tooling/smoke note exists, but its readiness claims were
+  superseded by the audit. This step completes only after the publishable runs
+  answer the questions with validated raw evidence.)*
 - [ ] **Step 7: File focused follow-up issues only for demonstrated residuals.**
   Each issue names exact artifact/query/spec digests, benefit, regressions,
   production placement options, backward compatibility, fallback semantics,
@@ -799,25 +1155,19 @@ git commit -m "bench: prototype conservative parquet skip-index sidecars"
 - Modify: this plan
 - Modify: `docs/issues/README.md` only if Task 8 created issues
 
-- [x] **Step 1: Update roadmap row 47 with measured outcomes.** Update row 36
+- [ ] **Step 1: Update roadmap row 47 with measured outcomes.** Update row 36
   with the narrow-type verdict; do not mark row 36 executed because an
   experiment is not a product type-system implementation.
-  *(Row 47 status set to "Tooling executed"; row 36 records the proven lossless-projection
-  mechanism and that the byte-savings magnitude still needs the 30M baseline.)*
-- [x] **Step 2: Mark every task truthfully.** Record deviations and failed
+  *(Roadmap row 47 now records the remediation gate. Measured outcomes and the
+  row 36 verdict remain pending Task 8.)*
+- [ ] **Step 2: Mark every task truthfully.** Record deviations and failed
   hypotheses in this plan; do not rewrite the original matrix after seeing data.
-  *(Tasks 1–7 executed and committed. Task 8 Steps 1–5, 7 are the operator-run measurement
-  phase and are NOT executed here — they need a live catalog/object-store/compactor and a
-  30M-row compaction to convergence. The smoke matrix validated the whole pipeline; two bugs
-  it exposed were fixed. No custom skip index is justified yet — the residual only exists
-  after Blocks A–E on the real data, so Step 3's "no custom index justified" is deferred to
-  the real run rather than asserted from smoke.)*
-- [x] **Step 3: Full verification.** `cargo fmt --check` and `cargo clippy --all-targets -- -D
-  warnings` are clean across all seven laboratory crates; `git diff --check` is clean; the
-  whole workspace builds; the offline laboratory test suite (72 tests) and the shell refusal
-  tests (12) pass. `make test`'s Docker-gated integration suite (Postgres/MinIO/Kafka) is the
-  operator gate — the `from-ukiel` adapter's own testcontainers integration test was run here
-  against a real Postgres + the in-harness compactor and passed.
+  *(The audit reopened overstated Tasks 5–7 and added Tasks 47A–47F. This step
+  remains open until their checkboxes and Task 8 reflect actual evidence.)*
+- [ ] **Step 3: Full verification.** Run the commands below after Tasks 47A–47F
+  and Task 8. `make test` includes the Docker-gated Postgres/MinIO/Kafka
+  integration suite; an earlier focused `from-ukiel` pass does not substitute
+  for the final gate.
 
 ```bash
 cargo fmt --check
@@ -826,7 +1176,7 @@ make test
 git diff --check
 ```
 
-- [x] **Step 4: Commit documentation/results metadata.**
+- [ ] **Step 4: Commit documentation/results metadata.**
 
 ```bash
 git commit -m "bench: record parquet storage laboratory results"
@@ -836,14 +1186,17 @@ git commit -m "bench: record parquet storage laboratory results"
 
 Plan 47 is complete only when:
 
+- Tasks 47A–47F and corrected L1+ smoke-v2 have passed before Task 8;
+- the complete run set binds two repetitions, deterministic interleaving,
+  artifact/suite/backend/host identity, and every immutable raw report;
 - the input is a verified immutable snapshot of actual compacted Ukiel parts;
 - the product control uses original bytes and appears in every matrix block;
 - every variant preserves file membership/order and the logical-row fingerprint;
 - every timed query first passes exact schema/result equivalence;
 - census proves properties actually written rather than trusting requested
   settings;
-- writer cost, storage bytes, local read behavior, and object-store requests/
-  bytes are reported separately;
+- writer cost, storage bytes, actual local-file reads, and real object-store
+  requests/requested bytes/returned bytes are reported separately;
 - native page/statistics/Bloom features are measured with corresponding reader
   switches on and off;
 - row groups/pages, encodings/dictionaries, compression, physical types, and
