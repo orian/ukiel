@@ -1,0 +1,26 @@
+[package]
+name = "parquet-census"
+version.workspace = true
+edition.workspace = true
+description = "Inspect the physical Parquet structure of a laboratory snapshot or variant, by file, row group, and column chunk."
+
+# Standalone and offline: Arrow + Parquet only, no DataFusion, no Ukiel service, no
+# object store. It reads footers first and streams only the columns it must to report a
+# metric the footer cannot give. The boundary test keeps the dependency floor honest.
+
+[dependencies]
+parquet-lab-contract = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "parquet-census"
+path = "src/main.rs"

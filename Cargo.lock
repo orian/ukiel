@@ -3196,6 +3196,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "parquet-census"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "bytes",
+ "clap",
+ "parquet",
+ "parquet-lab-contract",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "parquet-lab-contract"
 version = "0.1.0"
 dependencies = [

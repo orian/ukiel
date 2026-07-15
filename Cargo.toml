@@ -28,6 +28,7 @@ members = [
     "tools/parquet-lab-contract",
     "tools/parquet-lab-integrity",
     "tools/parquet-lab-snapshot",
+    "tools/parquet-census",
 ]
 
 [workspace.package]

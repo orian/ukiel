@@ -561,17 +561,17 @@ indices, Bloom offsets/lengths, footer bytes, and per-column fractions. Where a
 footer cannot provide NDV or value-width/cardinality, stream only that column
 and label the measurement `scanned`; never invent it from min/max.
 
-- [ ] **Step 1: Build golden files covering every relevant encoding, codec,
+- [x] **Step 1: Build golden files covering every relevant encoding, codec,
   dictionary fallback, page/statistics mode, Bloom, null pattern, and multiple
   row groups.** Assert the census reads what was actually written.
-- [ ] **Step 2: Implement footer-first inspection plus bounded optional column
+- [x] **Step 2: Implement footer-first inspection plus bounded optional column
   scans.** Report provenance (`footer`, `page_index`, or `scanned`) per metric.
-- [ ] **Step 3: Add determinism/refusal tests.** Stable sort order, atomic
+- [x] **Step 3: Add determinism/refusal tests.** Stable sort order, atomic
   report, parent-manifest verification, unknown physical type reported without
   dropping the column, corrupt footer fails loudly.
-- [ ] **Step 4: Enforce standalone installation and dependency boundary.** No
+- [x] **Step 4: Enforce standalone installation and dependency boundary.** No
   DataFusion or Ukiel dependency; Arrow/Parquet only.
-- [ ] **Step 5: Verify and commit.**
+- [x] **Step 5: Verify and commit.**
 
 ```bash
 cargo test -p parquet-census
