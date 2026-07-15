@@ -13,6 +13,7 @@
 //! Generation and loading are **facts read from the manifest and the catalog**, not
 //! actions this process may take.
 
+pub mod admission;
 pub mod catalog;
 pub mod part_shape;
 pub mod queries;
@@ -102,4 +103,22 @@ pub async fn find_loaded(
         );
     }
     Ok(ht.id)
+}
+
+/// The tenants a benchmark may ask about, from the loaded logical tables.
+///
+/// Ukiel's v1 scoping is `slice = packing_key == namespace_id`, so the namespace of each
+/// `events` logical table *is* a queryable tenant. Reading them from the catalog rather
+/// than the receipt keeps the receipt small and means the benchmark asks about exactly
+/// the tenants that were loaded. Benchmark-local read-only SQL, confined to the tool.
+pub async fn queryable_tenants(catalog: &PostgresCatalog, ht: HypertableId) -> Result<Vec<i64>> {
+    let rows: Vec<(i64,)> = sqlx::query_as(
+        "SELECT DISTINCT namespace_id FROM logical_tables WHERE hypertable_id = $1 \
+         ORDER BY namespace_id",
+    )
+    .bind(ht.0)
+    .fetch_all(catalog.pool_for_tests())
+    .await
+    .context("listing queryable tenants")?;
+    Ok(rows.into_iter().map(|(n,)| n).collect())
 }

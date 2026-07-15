@@ -34,11 +34,16 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the six-query suite: scoped Ukiel against raw DataFusion over the same files.
+    ///
+    /// Two forms: `--manifest --label` (a plan-45 materialized load) or `--receipt` (a
+    /// plan-46 compacted load, whose paths change under compaction).
     Queries {
         #[arg(long)]
-        manifest: PathBuf,
+        manifest: Option<PathBuf>,
         #[arg(long)]
-        label: String,
+        label: Option<String>,
+        #[arg(long)]
+        receipt: Option<PathBuf>,
         #[arg(long)]
         config: PathBuf,
         #[arg(long)]
@@ -46,6 +51,27 @@ enum Command {
         /// Timed iterations after one warmup. The median is reported.
         #[arg(long, default_value_t = 5)]
         iters: usize,
+    },
+    /// The honest admission A/B: range-only vs the real filtered path, closed-loop (plan 46).
+    Admission {
+        #[arg(long)]
+        receipt: PathBuf,
+        #[arg(long)]
+        config: PathBuf,
+        /// `unvacuumed` or `vacuumed`. Recorded, never performed — VACUUM is an operator step.
+        #[arg(long)]
+        phase: String,
+        #[arg(long)]
+        result: PathBuf,
+        #[arg(long, default_value_t = 16)]
+        workers: usize,
+        #[arg(long, default_value_t = 5)]
+        warmup_secs: u64,
+        #[arg(long, default_value_t = 30)]
+        duration_secs: u64,
+        /// `range-first` (default) or `filter-first`, recorded for interleaved repetitions.
+        #[arg(long)]
+        path_order: Option<String>,
     },
     /// The issue-0014 A/B: range candidates, filter candidates, exact members.
     Catalog {
@@ -94,12 +120,48 @@ async fn run() -> Result<()> {
         Command::Queries {
             manifest,
             label,
+            receipt,
             config,
             result,
             iters,
         } => {
             require_read_only("queries")?;
-            cmd_queries(&manifest, &label, &config, &result, iters).await
+            match (manifest, label, receipt) {
+                (Some(m), Some(l), None) => cmd_queries(&m, &l, &config, &result, iters).await,
+                (None, None, Some(r)) => cmd_queries_receipt(&r, &config, &result, iters).await,
+                _ => bail!(
+                    "queries takes either --manifest and --label (a materialized load) or \
+                     --receipt (a compacted load), not a mix"
+                ),
+            }
+        }
+        Command::Admission {
+            receipt,
+            config,
+            phase,
+            result,
+            workers,
+            warmup_secs,
+            duration_secs,
+            path_order,
+        } => {
+            require_read_only("admission")?;
+            let filter_first = match path_order.as_deref() {
+                None | Some("range-first") => false,
+                Some("filter-first") => true,
+                Some(other) => bail!("unknown --path-order '{other}' (range-first | filter-first)"),
+            };
+            cmd_admission(
+                &receipt,
+                &config,
+                &phase,
+                &result,
+                workers,
+                warmup_secs,
+                duration_secs,
+                filter_first,
+            )
+            .await
         }
         Command::Catalog {
             manifest,
@@ -525,16 +587,68 @@ async fn cmd_queries(
     // way of it.
     let raw = raw_session(&store, &store_url, &manifest, label).await?;
 
-    let mut results: Vec<QueryResult> = Vec::new();
+    let (results, failures) = run_suite(
+        &catalog,
+        ht,
+        &store,
+        &store_url,
+        &cache,
+        &raw,
+        &classes(&manifest),
+        iters,
+    )
+    .await?;
+
+    write_result(
+        result,
+        serde_json::json!({
+            "kind": "queries",
+            "disclaimer": manifest.disclaimer,
+            "label": label,
+            "iters": iters,
+            "manifest": {
+                "seed": manifest.config.seed,
+                "tier": manifest.config.tier.as_str(),
+                "topology_digest": manifest.topology.digest,
+                "profile": manifest.source.files,
+            },
+            "generated": manifest.generated,
+            "results": results,
+        }),
+    )?;
+
+    let _ = topology;
+    if failures > 0 {
+        // Every query was attempted; the failure is reported after the rest, not instead
+        // of it.
+        bail!("{failures} query/class pair(s) failed. See the table above.");
+    }
+    Ok(())
+}
+
+/// Run the six-query suite over each tenant against a shared raw reference, requiring
+/// scoped/raw equality before timing. Shared by the manifest and receipt query commands.
+#[allow(clippy::too_many_arguments)]
+async fn run_suite(
+    catalog: &PostgresCatalog,
+    ht: HypertableId,
+    store: &Arc<dyn object_store::ObjectStore>,
+    store_url: &url::Url,
+    cache: &Arc<ukiel_query::metadata_cache::ParquetMetadataCache>,
+    raw: &SessionContext,
+    tenants: &[(i64, String)],
+    iters: usize,
+) -> Result<(Vec<QueryResult>, usize)> {
+    let mut results = Vec::new();
     let mut failures = 0usize;
 
-    for (tenant, class) in classes(&manifest) {
-        // The scoped path: the tenant is a property of the session, not the SQL.
+    for (tenant, class) in tenants {
+        let (tenant, class) = (*tenant, class.clone());
         let scoped = ukiel_query::context::session_for_namespace(
-            &catalog,
+            catalog,
             NamespaceId(tenant),
             store.clone(),
-            &store_url,
+            store_url,
             cache.clone(),
         )
         .await
@@ -547,66 +661,59 @@ async fn cmd_queries(
 
         for q in queries::suite() {
             let raw_sql = queries::scoped_to_raw(&q.sql, tenant);
-
-            // Correctness first, always. A timing taken before the two arms are known to
-            // agree is a timing of two different questions.
-            let a = match queries::run(&scoped, &q.sql).await {
-                Ok(v) => v,
-                Err(e) => {
-                    // Record the failure and keep going: a suite that stops at the first
-                    // error tells you about one query and hides the other five.
-                    failures += 1;
-                    results.push(QueryResult {
-                        query: q.id.clone(),
-                        class: class.clone(),
-                        tenant,
-                        rows: 0,
-                        ukiel_ms: f64::NAN,
-                        raw_ms: f64::NAN,
-                        planned_parts: planned,
-                        agreed: false,
-                        error: Some(format!("scoped Ukiel: {e:#}")),
-                    });
-                    continue;
-                }
-            };
-            let b = match queries::run(&raw, &raw_sql).await {
-                Ok(v) => v,
-                Err(e) => {
-                    failures += 1;
-                    results.push(QueryResult {
-                        query: q.id.clone(),
-                        class: class.clone(),
-                        tenant,
-                        rows: 0,
-                        ukiel_ms: f64::NAN,
-                        raw_ms: f64::NAN,
-                        planned_parts: planned,
-                        agreed: false,
-                        error: Some(format!("raw DataFusion: {e:#}")),
-                    });
-                    continue;
-                }
-            };
-            if let Err(e) = queries::same(&a, &b) {
-                failures += 1;
+            let fail = |failures: &mut usize, results: &mut Vec<QueryResult>, rows, msg: String| {
+                *failures += 1;
                 results.push(QueryResult {
                     query: q.id.clone(),
                     class: class.clone(),
                     tenant,
-                    rows: queries::row_count(&a),
+                    rows,
                     ukiel_ms: f64::NAN,
                     raw_ms: f64::NAN,
                     planned_parts: planned,
                     agreed: false,
-                    error: Some(format!("{e}")),
+                    error: Some(msg),
                 });
+            };
+
+            // Correctness first: a timing taken before the two arms agree is a timing of
+            // two different questions.
+            let a = match queries::run(&scoped, &q.sql).await {
+                Ok(v) => v,
+                Err(e) => {
+                    fail(
+                        &mut failures,
+                        &mut results,
+                        0,
+                        format!("scoped Ukiel: {e:#}"),
+                    );
+                    continue;
+                }
+            };
+            let b = match queries::run(raw, &raw_sql).await {
+                Ok(v) => v,
+                Err(e) => {
+                    fail(
+                        &mut failures,
+                        &mut results,
+                        0,
+                        format!("raw DataFusion: {e:#}"),
+                    );
+                    continue;
+                }
+            };
+            if let Err(e) = queries::same(&a, &b) {
+                fail(
+                    &mut failures,
+                    &mut results,
+                    queries::row_count(&a),
+                    format!("{e}"),
+                );
                 continue;
             }
 
             let ukiel_ms = median_ms(&scoped, &q.sql, iters).await?;
-            let raw_ms = median_ms(&raw, &raw_sql, iters).await?;
-
+            let raw_ms = median_ms(raw, &raw_sql, iters).await?;
             results.push(QueryResult {
                 query: q.id.clone(),
                 class: class.clone(),
@@ -648,38 +755,215 @@ async fn cmd_queries(
             r.ukiel_ms / r.raw_ms.max(1e-9),
         );
     }
-
     println!(
-        "\n  `parts` is what the catalog shipped for that tenant — the planning input the scan \
-         received. `raw` reads every file in the fixture and filters, so a ratio below 1 is the \
-         value of the catalog's pruning."
+        "\n  `parts` is what the catalog shipped for that tenant. `raw` reads every file and \
+         filters, so a ratio below 1 is the value of the catalog's pruning."
     );
+    Ok((results, failures))
+}
+
+/// A bare DataFusion session over an explicit list of object paths — the final compacted
+/// parts, from the catalog. After compaction the object paths are whatever REPLACE wrote,
+/// so the raw reference reads exactly the live parts rather than guessing a prefix.
+async fn raw_session_from_paths(
+    store: &Arc<dyn object_store::ObjectStore>,
+    store_url: &url::Url,
+    paths: &[String],
+) -> Result<SessionContext> {
+    use datafusion::datasource::file_format::parquet::ParquetFormat;
+    use datafusion::datasource::listing::{
+        ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+    };
+
+    let ctx = SessionContext::new();
+    ctx.register_object_store(store_url, store.clone());
+    let base = store_url.as_str().trim_end_matches('/');
+    let urls: Vec<ListingTableUrl> = paths
+        .iter()
+        .map(|p| {
+            ListingTableUrl::parse(format!("{base}/{p}"))
+                .with_context(|| format!("building a raw URL for {p}"))
+        })
+        .collect::<Result<_>>()?;
+    if urls.is_empty() {
+        bail!("the fixture has no live parts to read");
+    }
+    let options =
+        ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
+    let schema = options.infer_schema(&ctx.state(), &urls[0]).await.context(
+        "reading the compacted objects for the raw reference. A materialized compaction-input \
+         load must have run — this reads real objects.",
+    )?;
+    let config = ListingTableConfig::new_with_multi_paths(urls)
+        .with_listing_options(options)
+        .with_schema(schema);
+    ctx.register_table("events", Arc::new(ListingTable::try_new(config)?))?;
+    Ok(ctx)
+}
+
+/// The compacted query-equivalence command: run the suite after compaction and require
+/// scoped-Ukiel == raw-DataFusion for every query and tenant.
+async fn cmd_queries_receipt(
+    receipt_path: &Path,
+    config: &Path,
+    result: &Path,
+    iters: usize,
+) -> Result<()> {
+    let receipt = ukiel_prod_bench::read_receipt(receipt_path)?;
+    let cfg = load_config(config)?;
+    let catalog = PostgresCatalog::connect(&cfg.catalog.url).await?;
+    let ht = ukiel_prod_bench::find_loaded(&catalog, &receipt).await?;
+
+    // Refuse a fixture that has not converged: query timings on a half-compacted fixture
+    // measure a transient.
+    let now = ukiel_prod_bench::part_shape::observe(&catalog, ht, &receipt.partition_marker_digest)
+        .await?;
+    if now.l0_parts > 0 || now.multi_run_partitions > 0 {
+        bail!(
+            "'{}' is not final ({}). Run `wait-compacted` first.",
+            receipt.hypertable,
+            now.still_changing(receipt.input_rows as i64)
+        );
+    }
+
+    let (store, store_url) = ukield::run::build_store(&cfg.object_store)?;
+    let store: Arc<dyn object_store::ObjectStore> = store;
+    let cache = Arc::new(ukiel_query::metadata_cache::ParquetMetadataCache::new(256));
+
+    println!("{}\n", receipt.disclaimer);
+    println!(
+        "compacted query suite — '{}' ({} final parts, {} rows), median of {iters}",
+        receipt.hypertable, now.live_parts, now.live_rows,
+    );
+
+    // The raw reference reads exactly the final compacted objects.
+    let paths: Vec<String> = catalog
+        .live_parts(ht, None)
+        .await?
+        .into_iter()
+        .map(|p| p.meta.path)
+        .collect();
+    let raw = raw_session_from_paths(&store, &store_url, &paths).await?;
+
+    // A deterministic spread of queryable tenants — the whole set is exercised if small,
+    // else an even sample across it.
+    let all = ukiel_prod_bench::queryable_tenants(&catalog, ht).await?;
+    let tenants: Vec<(i64, String)> = pick_spread(&all, 8)
+        .into_iter()
+        .map(|t| (t, format!("t{t}")))
+        .collect();
+
+    let (results, failures) = run_suite(
+        &catalog, ht, &store, &store_url, &cache, &raw, &tenants, iters,
+    )
+    .await?;
 
     write_result(
         result,
         serde_json::json!({
-            "kind": "queries",
-            "disclaimer": manifest.disclaimer,
-            "label": label,
+            "kind": "queries-compacted",
+            "disclaimer": receipt.disclaimer,
+            "hypertable": receipt.hypertable,
+            "placement": receipt.placement.as_str(),
             "iters": iters,
-            "manifest": {
-                "seed": manifest.config.seed,
-                "tier": manifest.config.tier.as_str(),
-                "topology_digest": manifest.topology.digest,
-                "profile": manifest.source.files,
-            },
-            "generated": manifest.generated,
+            "receipt": { "l0_digest": receipt.l0_manifest.digest, "source": receipt.source_manifest.digest },
+            "final_parts": now.live_parts,
+            "final_rows": now.live_rows,
             "results": results,
         }),
     )?;
-
-    let _ = topology;
     if failures > 0 {
-        // Every query was attempted; the failure is reported after the rest, not instead
-        // of it.
-        bail!("{failures} query/class pair(s) failed. See the table above.");
+        bail!("{failures} query/tenant pair(s) failed after compaction. See the table above.");
     }
     Ok(())
+}
+
+async fn cmd_admission(
+    receipt_path: &Path,
+    config: &Path,
+    phase: &str,
+    result: &Path,
+    workers: usize,
+    warmup_secs: u64,
+    duration_secs: u64,
+    filter_first: bool,
+) -> Result<()> {
+    use ukiel_prod_bench::admission::{AdmissionConfig, Phase, run};
+
+    let phase = match phase {
+        "unvacuumed" => Phase::Unvacuumed,
+        "vacuumed" => Phase::Vacuumed,
+        other => bail!("unknown --phase '{other}' (unvacuumed | vacuumed)"),
+    };
+    // Refuse to overwrite a report or merge two phases into one file.
+    if result.exists() {
+        bail!(
+            "{} already exists. Each admission phase writes its own file; refusing to overwrite \
+             or merge phases.",
+            result.display()
+        );
+    }
+
+    let receipt = ukiel_prod_bench::read_receipt(receipt_path)?;
+    let cfg = load_config(config)?;
+    let catalog = PostgresCatalog::connect(&cfg.catalog.url).await?;
+    let ht = ukiel_prod_bench::find_loaded(&catalog, &receipt).await?;
+    let tenants = ukiel_prod_bench::queryable_tenants(&catalog, ht).await?;
+
+    println!("{}\n", receipt.disclaimer);
+    println!(
+        "admission A/B — '{}', phase {phase:?}, {workers} workers, {warmup_secs}s warmup + \
+         {duration_secs}s measured, {} tenants",
+        receipt.hypertable,
+        tenants.len(),
+    );
+    println!(
+        "  NOTE: this command records the phase; it never runs VACUUM. The vacuumed phase \
+         requires an operator-issued `VACUUM (ANALYZE) parts` beforehand."
+    );
+
+    let admission_cfg = AdmissionConfig {
+        workers,
+        warmup: std::time::Duration::from_secs(warmup_secs),
+        duration: std::time::Duration::from_secs(duration_secs),
+        filter_first,
+    };
+    let report = run(&catalog, ht, tenants, phase, &admission_cfg).await?;
+
+    let pr = |p: &ukiel_prod_bench::admission::PathResult| {
+        println!(
+            "  {:<11} {:>9.0} ops/s   p50 {:>6.2}  p95 {:>6.2}  p99 {:>6.2}  max {:>7.2} ms   \
+             {:>6.1} parts  {:>8.0} tuple-bytes  residue {:.1}",
+            p.path.label(),
+            p.throughput_per_sec,
+            p.p50_ms,
+            p.p95_ms,
+            p.p99_ms,
+            p.max_ms,
+            p.mean_parts,
+            p.mean_tuple_bytes,
+            p.mean_provider_residue,
+        );
+    };
+    println!();
+    pr(&report.range_only);
+    pr(&report.filtered);
+    println!(
+        "\n  the pre-0014 range-only path shipped {:.1}x the tuple bytes for the same answers.",
+        report.bytes_shipped_ratio,
+    );
+
+    write_result(result, serde_json::to_value(&report)?)
+}
+
+/// A deterministic even spread of at most `k` values from a sorted list.
+fn pick_spread(all: &[i64], k: usize) -> Vec<i64> {
+    if all.len() <= k {
+        return all.to_vec();
+    }
+    let mut out: Vec<i64> = (0..k).map(|i| all[i * (all.len() - 1) / (k - 1)]).collect();
+    out.dedup();
+    out
 }
 
 /// One warmup, then the median of `iters`. The median, not the mean: a single slow run

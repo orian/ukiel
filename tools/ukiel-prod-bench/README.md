@@ -40,6 +40,35 @@ fraction, exact-bitmap present/omitted counts, key-filter NULL and size counts (
 benchmark-local read-only SQL), the issue-0014 key-count bands, and the filter's storage
 cost as a fraction of the parts table and live index.
 
+```bash
+# The honest admission A/B: pre-0014 range-only vs the real filtered path, closed-loop.
+ukiel-prod-bench admission --receipt receipt.json --config compactor.toml \
+  --phase unvacuumed|vacuumed --result adm.json \
+  --workers 16 --warmup-secs 5 --duration-secs 30 [--path-order range-first|filter-first]
+
+# Compacted query equivalence: the same suite, receipt form.
+ukiel-prod-bench queries --receipt receipt.json --config compactor.toml --result q.json --iters 5
+```
+
+`admission` runs two read-only paths over the same deterministic tenant sequence with a
+fixed pool of closed-loop workers: **range-only** (benchmark-local SQL reproducing the
+pre-0014 predicate with the full part-row projection, so it ships every range candidate
+carrying its JSONB `column_stats`) and **filtered** (the real `live_parts_pruned`). Both
+deserialize and touch the returned metadata — the cost issue 0014 fixed is the
+JSONB/TOAST/SQLx/network cost of shipping rows nobody needed, which a `count(*)` would
+miss. It reports offered/completed/failed, throughput, p50/p95/p99/max, mean parts and
+tuple bytes per query, and the provider's exact residue, plus `EXPLAIN (ANALYZE, BUFFERS,
+FORMAT JSON)` for both paths.
+
+The range-only SQL lives in the tool, never in the product — Ukiel has no range-only
+mode, and adding a worse one so a benchmark could measure it would be putting a regression
+in the product to make a graph.
+
+**Phases.** `--phase` is *recorded, never performed*: the command never runs `VACUUM`.
+Measure `unvacuumed` immediately after convergence, then issue an operator
+`VACUUM (ANALYZE) parts` yourself, then measure `vacuumed`. Each phase writes its own
+result file; the command refuses to overwrite one or merge two phases.
+
 ### Plan 45: the materialized load
 
 ```bash
