@@ -8,7 +8,39 @@ from the manifest and the catalog, not actions it may take — which is what mak
 numbers it prints reproducible. A benchmark runner that can repair its own inputs will
 eventually repair them, and then its numbers describe an input nobody chose.
 
-## Run
+## Two families of command
+
+The **manifest/label** commands measure a plan-45 materialized load. The **receipt**
+commands (plan 46) measure a compaction-input load whose paths and part counts change
+under compaction, so they carry fixture identity in the receipt instead.
+
+### Plan 46: the compacted part-shape experiment
+
+```bash
+# Wait for a compaction-input load to reach one final run per partition. Read-only polling.
+ukiel-prod-bench wait-compacted --receipt receipt.json --config compactor.toml --timeout-secs 600
+
+# Scan the final objects and report the actual part shape.
+ukiel-prod-bench part-shape --receipt receipt.json --config compactor.toml --result shape.json
+```
+
+`wait-compacted` succeeds only when the fixture has **no live L0 parts**, every partition
+is **one live run**, two consecutive polls see the **same part ids**, the **row census**
+equals the receipt, and every part carries the **artifact marker**. It prints why an
+unfinished fixture is still changing, and times out loudly.
+
+`part-shape` reads the final catalog rows and **scans the sorted packing-key column of
+every object** to count exact distinct keys — never inferring cardinality from min/max, a
+Bloom filter, or the source topology. In one integrity pass it streams the full schema
+through the shared row-multiset fingerprint and checks it against the staged input's, so
+equal row counts cannot hide a changed, duplicated, or lost row. It refuses to run
+against a fixture that has not converged. The report covers file/row/byte quantiles, exact
+distinct-key and density quantiles, the level/run/partition distribution, the dedicated
+fraction, exact-bitmap present/omitted counts, key-filter NULL and size counts (read by
+benchmark-local read-only SQL), the issue-0014 key-count bands, and the filter's storage
+cost as a fraction of the parts table and live index.
+
+### Plan 45: the materialized load
 
 ```bash
 # The issue-0014 A/B: range candidates vs filter candidates vs exact members.

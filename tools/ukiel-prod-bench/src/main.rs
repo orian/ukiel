@@ -58,6 +58,24 @@ enum Command {
         #[arg(long)]
         result: PathBuf,
     },
+    /// Poll a compaction-input load until it is final (plan 46). Read-only.
+    WaitCompacted {
+        #[arg(long)]
+        receipt: PathBuf,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, default_value_t = 600)]
+        timeout_secs: u64,
+    },
+    /// Scan a final fixture's objects and report the actual part shape (plan 46).
+    PartShape {
+        #[arg(long)]
+        receipt: PathBuf,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        result: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -92,6 +110,227 @@ async fn run() -> Result<()> {
             require_read_only("catalog")?;
             cmd_catalog(&manifest, &label, &config, &result).await
         }
+        Command::WaitCompacted {
+            receipt,
+            config,
+            timeout_secs,
+        } => {
+            require_read_only("wait-compacted")?;
+            cmd_wait_compacted(&receipt, &config, timeout_secs).await
+        }
+        Command::PartShape {
+            receipt,
+            config,
+            result,
+        } => {
+            require_read_only("part-shape")?;
+            cmd_part_shape(&receipt, &config, &result).await
+        }
+    }
+}
+
+async fn cmd_wait_compacted(receipt_path: &Path, config: &Path, timeout_secs: u64) -> Result<()> {
+    use std::time::Duration;
+    use ukiel_prod_bench::part_shape::{Convergence, observe};
+
+    let receipt = ukiel_prod_bench::read_receipt(receipt_path)?;
+    let cfg = load_config(config)?;
+    let catalog = PostgresCatalog::connect(&cfg.catalog.url).await?;
+    let ht = ukiel_prod_bench::find_loaded(&catalog, &receipt).await?;
+    let expected_rows = receipt.input_rows as i64;
+
+    println!(
+        "waiting for '{}' to converge ({} L0 runs in, {} rows), timeout {timeout_secs}s",
+        receipt.hypertable, receipt.input_parts, receipt.input_rows,
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let mut prev = observe(&catalog, ht, &receipt.partition_marker_digest).await?;
+    let mut last_report = Instant::now();
+
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let cur = observe(&catalog, ht, &receipt.partition_marker_digest).await?;
+
+        if Convergence::converged(&prev, &cur, expected_rows) {
+            println!(
+                "converged: {} live parts across {} partition(s), {} rows, all marked",
+                cur.live_parts, cur.partitions, cur.live_rows,
+            );
+            return Ok(());
+        }
+
+        // A live L0 part, a multi-run partition, or a wrong census means the compactor is
+        // still working; changing part ids mean it is still in flight. Report why, but not
+        // more than once a second, so the wait is legible without being noisy.
+        if last_report.elapsed() >= Duration::from_secs(1) {
+            println!(
+                "  still changing: {} ({} live parts, {} L0, {} multi-run partitions)",
+                cur.still_changing(expected_rows),
+                cur.live_parts,
+                cur.l0_parts,
+                cur.multi_run_partitions,
+            );
+            last_report = Instant::now();
+        }
+
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out after {timeout_secs}s: {}. The fixture never reached one final run per \
+                 partition — check the compactor is running against this catalog with \
+                 finalize_after_secs = 0.",
+                cur.still_changing(expected_rows)
+            );
+        }
+        prev = cur;
+    }
+}
+
+async fn cmd_part_shape(receipt_path: &Path, config: &Path, result: &Path) -> Result<()> {
+    use prod_synth_integrity::RowMultiset;
+    use ukiel_prod_bench::part_shape::{build_report, filter_storage, observe, scan_object};
+
+    let receipt = ukiel_prod_bench::read_receipt(receipt_path)?;
+    let cfg = load_config(config)?;
+    let catalog = PostgresCatalog::connect(&cfg.catalog.url).await?;
+    let ht = ukiel_prod_bench::find_loaded(&catalog, &receipt).await?;
+
+    // Require convergence before measuring: a shape read mid-compaction measures a
+    // transient. `part-shape` does not wait — that is `wait-compacted`'s job — it just
+    // refuses to run against a fixture that has not settled.
+    let now = observe(&catalog, ht, &receipt.partition_marker_digest).await?;
+    if now.l0_parts > 0 || now.multi_run_partitions > 0 {
+        bail!(
+            "'{}' is not final ({}). Run `wait-compacted` first — measuring a shape mid-compaction \
+             measures a transient.",
+            receipt.hypertable,
+            now.still_changing(receipt.input_rows as i64),
+        );
+    }
+    if !now.all_marked {
+        bail!(
+            "a live part is missing the artifact marker; this is not the fixture the receipt describes"
+        );
+    }
+
+    println!("{}\n", receipt.disclaimer);
+    println!(
+        "scanning {} final parts of '{}' (placement {})",
+        now.live_parts,
+        receipt.hypertable,
+        receipt.placement.as_str(),
+    );
+
+    use object_store::ObjectStoreExt as _;
+    let (store, _url) = ukield::run::build_store(&cfg.object_store)?;
+    let store: Arc<dyn object_store::ObjectStore> = store;
+
+    let parts = catalog.live_parts(ht, None).await?;
+
+    // Runs per partition, from the catalog.
+    let mut runs: std::collections::BTreeMap<String, std::collections::BTreeSet<i64>> =
+        std::collections::BTreeMap::new();
+    for p in &parts {
+        runs.entry(p.meta.partition_values.to_string())
+            .or_default()
+            .insert(p.created_by_commit.0);
+    }
+    let runs_per_partition: Vec<usize> = runs.values().map(|s| s.len()).collect();
+
+    // Scan every object: exact keys, sortedness, row/byte agreement, bitmap truth, and
+    // the full-row fingerprint. One object at a time — a shape-tier partition can be a
+    // large file, and the scan holds only the one it is reading.
+    let mut fingerprint = RowMultiset::default();
+    let mut scanned = Vec::with_capacity(parts.len());
+    for p in &parts {
+        let bytes = store
+            .get(&object_store::path::Path::from(p.meta.path.clone()))
+            .await
+            .with_context(|| format!("GET {}", p.meta.path))?
+            .bytes()
+            .await
+            .with_context(|| format!("reading {}", p.meta.path))?;
+        scanned.push(scan_object(
+            p,
+            &bytes,
+            &receipt.packing_key,
+            &mut fingerprint,
+        )?);
+    }
+
+    let storage = filter_storage(&catalog, ht).await?;
+    let report = build_report(&receipt, scanned, runs_per_partition, storage, &fingerprint);
+
+    if !report.fingerprint_matches_input {
+        bail!(
+            "the compacted rows do not fingerprint to the staged input. A row was changed, \
+             duplicated, or lost during compaction — this is a correctness failure, not a shape."
+        );
+    }
+
+    print_part_shape(&report);
+    write_result(result, serde_json::to_value(&report)?)
+}
+
+fn print_part_shape(r: &ukiel_prod_bench::part_shape::PartShapeReport) {
+    println!(
+        "\n'{}' — {} final parts, {} rows, {} bytes; fingerprint matches the staged input",
+        r.hypertable, r.live_parts, r.live_rows, r.live_bytes,
+    );
+    println!(
+        "  distinct keys/part  p10 {:.0}  p50 {:.0}  p90 {:.0}  p99 {:.0}  max {:.0}",
+        r.distinct_keys.p10,
+        r.distinct_keys.p50,
+        r.distinct_keys.p90,
+        r.distinct_keys.p99,
+        r.distinct_keys.max,
+    );
+    println!(
+        "  key density         p10 {:.4}  p50 {:.4}  p90 {:.4}",
+        r.key_density.p10, r.key_density.p50, r.key_density.p90,
+    );
+    println!(
+        "  file bytes          p50 {:.0}  p90 {:.0}  max {:.0}",
+        r.file_bytes.p50, r.file_bytes.p90, r.file_bytes.max,
+    );
+    println!(
+        "  levels {:?}   partitions {}   runs/partition p50 {:.0} max {:.0}   dedicated {:.1}%",
+        r.level_histogram,
+        r.partitions,
+        r.runs_per_partition.p50,
+        r.runs_per_partition.max,
+        r.dedicated_fraction * 100.0
+    );
+    println!("\n  key-count bands (issue-0014 tiers):");
+    for (band, n) in &r.key_bands {
+        println!("    {band:<18} {n}");
+    }
+    println!(
+        "\n  exact bitmaps: {} present, {} omitted",
+        r.exact_bitmap_present, r.exact_bitmap_omitted
+    );
+    println!(
+        "  key filters: {} NULL, by size {:?}",
+        r.key_filter_null, r.key_filter_by_size
+    );
+    println!(
+        "  filter bytes {} = {:.2}% of the {}-byte parts table, {:.2}% of the {}-byte live index",
+        r.key_filter_bytes,
+        pct(r.key_filter_bytes, r.parts_table_bytes),
+        r.parts_table_bytes,
+        pct(r.key_filter_bytes, r.live_index_bytes),
+        r.live_index_bytes,
+    );
+    println!(
+        "\n  68 parts is a GEOMETRY measurement, not a saturation test — plan 40 owns capacity."
+    );
+}
+
+fn pct(num: i64, den: i64) -> f64 {
+    if den == 0 {
+        0.0
+    } else {
+        num as f64 / den as f64 * 100.0
     }
 }
 

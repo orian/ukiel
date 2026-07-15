@@ -14,9 +14,15 @@
 //! actions this process may take.
 
 pub mod catalog;
+pub mod part_shape;
 pub mod queries;
 
-use anyhow::{Result, bail};
+use std::path::Path;
+
+use anyhow::{Context, Result, bail};
+use prod_synth_contract::PartShapeReceipt;
+use ukiel_catalog::PostgresCatalog;
+use ukiel_core::HypertableId;
 
 /// Fail startup if the requested work would need a mutation.
 ///
@@ -43,4 +49,57 @@ pub fn require_read_only(command: &str) -> Result<()> {
 /// the tools are joined by the manifest on disk, not by linking.
 pub fn hypertable_name(label: &str) -> String {
     format!("prod_synth_events_{label}")
+}
+
+/// Read and validate a compaction receipt: right version, synthetic, and its referenced
+/// source and L0 manifests both reverifiable is checked by the caller against what it
+/// holds. Here we parse and version-gate.
+pub fn read_receipt(path: &Path) -> Result<PartShapeReceipt> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(PartShapeReceipt::parse(
+        &path.display().to_string(),
+        &bytes,
+    )?)
+}
+
+/// Find the loaded fixture the receipt names, and re-check it against the catalog — the
+/// receipt is identity, not authority.
+///
+/// After compaction the *part count* and *paths* will not match the receipt's input
+/// (that is the whole point), so this checks the durable identity: the hypertable exists
+/// under the receipt's name and id, its schema/packing key match, and it is non-empty.
+/// The row census and marker are checked where they are used (convergence, part-shape),
+/// against the receipt's fingerprint and marker.
+pub async fn find_loaded(
+    catalog: &PostgresCatalog,
+    receipt: &PartShapeReceipt,
+) -> Result<HypertableId> {
+    let ht = catalog
+        .get_hypertable(&receipt.hypertable)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "no load named '{}' in this catalog. Load it first with `ukiel-prod-load \
+             compaction-input`; this tool measures a load, it does not create one.",
+                receipt.hypertable
+            )
+        })?;
+    if ht.id.0 != receipt.hypertable_id {
+        bail!(
+            "'{}' has id {} but the receipt records {}. This is a different load — refusing to \
+             measure it.",
+            receipt.hypertable,
+            ht.id.0,
+            receipt.hypertable_id
+        );
+    }
+    if ht.packing_key != receipt.packing_key {
+        bail!(
+            "'{}' has packing key '{}', the receipt says '{}'",
+            receipt.hypertable,
+            ht.packing_key,
+            receipt.packing_key
+        );
+    }
+    Ok(ht.id)
 }

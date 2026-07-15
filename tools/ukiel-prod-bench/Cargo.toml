@@ -12,6 +12,7 @@ description = "Measure an existing prod-synth load: scoped Ukiel against raw Dat
 
 [dependencies]
 prod-synth-contract = { workspace = true }
+prod-synth-integrity = { workspace = true }
 ukiel-core = { workspace = true }
 ukiel-catalog = { workspace = true }
 ukiel-query = { workspace = true }
@@ -19,6 +20,8 @@ ukield = { workspace = true }
 datafusion = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
 arrow = { workspace = true }
+parquet = { workspace = true, features = ["async", "object_store"] }
+bytes = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -27,6 +30,9 @@ clap = { workspace = true }
 toml = { workspace = true }
 url = { workspace = true }
 futures = { workspace = true }
+# Benchmark-local read-only SQL over the `key_filter` column, which is not on PartMeta.
+# The plan sanctions confining this direct SQL to the tool.
+sqlx = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -41,6 +47,12 @@ sqlx = { workspace = true }
 # nothing to do with S3.
 ukiel-prod-load = { path = "../ukiel-prod-load" }
 object_store = { workspace = true }
+# TEST ONLY: the end-to-end part-shape test drives the real compactor in-harness
+# (Compactor::run_once/finalize_once) rather than launching a ukield process, so the
+# convergence and output-scan assertions run in `cargo test`. Not a normal dependency —
+# the shipped runner never links the compactor.
+ukiel-compactor = { workspace = true }
+tokio-util = { workspace = true }
 
 [[bin]]
 name = "ukiel-prod-bench"
