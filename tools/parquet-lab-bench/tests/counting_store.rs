@@ -83,6 +83,7 @@ async fn object_store_mode_attributes_io_to_every_query() {
             warm_iters: 2,
             reader_flags: ReaderFlags::default(),
             run_order: 0,
+            skip_manifest: None,
         },
         false,
     )

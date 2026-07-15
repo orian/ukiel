@@ -1434,3 +1434,7 @@ band is `max(5%, 3·MAD(control reps)/median)` per dimension, and the chosen can
 an explicit digest a human carries forward. `bench/config/parquet-lab/product-control.toml`
 documents the product's writer policy for comparison but is never rewritten — the original
 snapshot bytes are the control. Refusal behaviour is covered by `bench/tests/parquet-lab.sh`.
+
+A `--skip-manifest DIR/skip.json` argument prices an experimental sidecar (built by
+`parquet-skip-index`) against native pruning; the sidecar must be provably bound to the
+variant being measured or the run is refused.

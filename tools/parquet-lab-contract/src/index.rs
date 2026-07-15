@@ -21,7 +21,7 @@ pub const SKIP_MANIFEST_VERSION: &str = "ukiel-parquet-skip/v1";
 
 /// The bounded prototype index kinds. New kinds are a new closed variant, never an
 /// open string — an unrecognised kind must be a validation error, not a silent skip.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IndexKind {
     /// External min/max zone map for a scalar or string column.

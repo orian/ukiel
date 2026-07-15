@@ -1,0 +1,29 @@
+[package]
+name = "parquet-skip-index"
+version.workspace = true
+edition.workspace = true
+description = "Build conservative experimental skip-index sidecars for a laboratory variant, to price custom pruning against native Parquet features (plan 47)."
+
+# Standalone and offline: Arrow + Parquet only. A sidecar is an experimental laboratory
+# carrier, not a production format. Every decision is conservative — any doubt resolves to
+# keep, never skip — so a NoMatch can never drop a matching row. The boundary test keeps the
+# dependency floor honest.
+
+[dependencies]
+parquet-lab-contract = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+blake3 = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "parquet-skip-index"
+path = "src/main.rs"

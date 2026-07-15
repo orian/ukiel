@@ -9,6 +9,7 @@
 pub mod compare;
 pub mod counting_store;
 pub mod runner;
+pub mod skip;
 pub mod suites;
 
 use std::path::Path;
@@ -127,6 +128,9 @@ pub struct RunParams {
     pub warm_iters: usize,
     pub reader_flags: ReaderFlags,
     pub run_order: u32,
+    /// An optional experimental skip-index sidecar to price against native pruning. It is
+    /// verified bound to the variant being measured before it is credited.
+    pub skip_manifest: Option<std::path::PathBuf>,
 }
 
 /// Run a suite over an artifact and write the result report.
@@ -146,6 +150,20 @@ pub async fn run(
     let suite = Suite::parse(&suite_path.display().to_string(), &suite_bytes)?;
 
     let (artifact, identity) = load_artifact(manifest_path)?;
+
+    // A skip sidecar, if given, is bound to the variant and priced. Only a variant carries
+    // the output file digests a sidecar binds to.
+    let skip_cost = match &params.skip_manifest {
+        None => None,
+        Some(path) => {
+            let mbytes = std::fs::read(manifest_path)?;
+            let variant = VariantManifest::parse(&manifest_path.display().to_string(), &mbytes)
+                .context("a --skip-manifest run must measure a variant (a sidecar binds to variant files)")?;
+            let files: Vec<parquet_lab_contract::FileDigest> =
+                variant.files.iter().map(|f| f.output.clone()).collect();
+            Some(skip::load_and_bind(path, &digest_bytes(&mbytes), &files)?)
+        }
+    };
 
     // Queries and probes run through the identical path; a probe is a named query with a
     // selectivity band attached.
@@ -232,7 +250,7 @@ pub async fn run(
             snapshot_digest: identity.snapshot_digest,
             variant_digest: identity.variant_digest,
             suite_digest: Some(suite_digest),
-            skip_digest: None,
+            skip_digest: skip_cost.as_ref().map(|c| c.skip_digest.clone()),
             run_order: params.run_order,
         },
         host: host_info(params.mode),
@@ -241,6 +259,7 @@ pub async fn run(
             "reader_flags": params.reader_flags,
             "cold_iters": params.cold_iters,
             "warm_iters": params.warm_iters,
+            "skip_index": skip_cost,
             "queries": query_reports,
         }),
     };

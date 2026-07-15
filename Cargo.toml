@@ -31,6 +31,7 @@ members = [
     "tools/parquet-census",
     "tools/parquet-rewrite",
     "tools/parquet-lab-bench",
+    "tools/parquet-skip-index",
 ]
 
 [workspace.package]

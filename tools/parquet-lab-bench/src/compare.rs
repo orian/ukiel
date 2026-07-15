@@ -123,7 +123,7 @@ mod tests {
         )
         .unwrap();
 
-        let a = result_digest(&plain.schema(), &[plain.clone()]).unwrap();
+        let a = result_digest(&plain.schema(), std::slice::from_ref(&plain)).unwrap();
         let b = result_digest(&view.schema(), &[view]).unwrap();
         let c = result_digest(&dict.schema(), &[dict]).unwrap();
         assert_eq!(a, b, "Utf8 and Utf8View must digest equal");

@@ -73,6 +73,9 @@ enum Command {
         no_reorder_filters: bool,
         #[arg(long)]
         no_bloom_filter_on_read: bool,
+        /// An experimental skip-index sidecar (`skip.json`) to price against native pruning.
+        #[arg(long)]
+        skip_manifest: Option<PathBuf>,
         #[arg(long)]
         replace: bool,
     },
@@ -124,6 +127,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             no_pushdown_filters,
             no_reorder_filters,
             no_bloom_filter_on_read,
+            skip_manifest,
             replace,
         } => {
             let params = parquet_lab_bench::RunParams {
@@ -141,6 +145,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                     bloom_filter_on_read: !no_bloom_filter_on_read,
                 },
                 run_order,
+                skip_manifest,
             };
             parquet_lab_bench::run(&manifest, &suite, &result, params, replace).await?;
             println!("wrote result {}", result.display());

@@ -1,0 +1,6 @@
+# Block F candidate: an external value set on the packing key, to price custom skipping
+# against the native footer/page statistics. Built only after Blocks A-E leave a residual.
+[[column]]
+name = "team_id"
+kind = "value_set"
+budget_bytes = 4096

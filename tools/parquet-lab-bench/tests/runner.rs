@@ -44,6 +44,7 @@ async fn compile_then_run_produces_a_bound_result_report() {
             warm_iters: 5,
             reader_flags: ReaderFlags::default(),
             run_order: 0,
+            skip_manifest: None,
         },
         false,
     )
@@ -85,6 +86,7 @@ async fn a_report_will_not_overwrite_without_replace() {
         warm_iters: 1,
         reader_flags: ReaderFlags::default(),
         run_order: 0,
+        skip_manifest: None,
     };
     parquet_lab_bench::run(&mp, &suite_out, &result, params(), false)
         .await

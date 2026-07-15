@@ -3299,6 +3299,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "parquet-skip-index"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "blake3",
+ "bytes",
+ "clap",
+ "parquet",
+ "parquet-lab-contract",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "parse-display"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

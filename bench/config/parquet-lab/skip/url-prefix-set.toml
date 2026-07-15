@@ -1,0 +1,7 @@
+# Block F candidate: an 8-byte prefix set on a promoted URL column for LIKE 'literal%',
+# only if a real prefix query remains expensive after native features.
+[[column]]
+name = "mat_$current_url"
+kind = "prefix_set"
+prefix_len = 8
+budget_bytes = 8192

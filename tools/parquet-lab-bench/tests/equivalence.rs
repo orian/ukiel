@@ -15,6 +15,7 @@ fn params() -> RunParams {
         warm_iters: 2,
         reader_flags: ReaderFlags::default(),
         run_order: 0,
+        skip_manifest: None,
     }
 }
 
