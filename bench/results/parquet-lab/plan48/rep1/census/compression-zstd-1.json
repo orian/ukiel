@@ -1,0 +1,171 @@
+{
+ "report_kind": "variant",
+ "manifest_digest": "ffb48ad036571d08103a8c4c7e1a8ef427341156463d42c199eac83c1a3ee346",
+ "files": 14,
+ "total_rows": 30000000,
+ "total_compressed_bytes": 1287555543,
+ "total_uncompressed_bytes": 6829215290,
+ "total_metadata_overhead_bytes": 2000820,
+ "scanned_columns": false,
+ "column_aggregates": [
+  {
+   "column": "uuid",
+   "compressed_bytes": 604130616,
+   "uncompressed_bytes": 1211743387,
+   "compressed_fraction": 0.46920742121336195,
+   "num_values": 30000000,
+   "null_count": 0,
+   "encodings": [
+    "PLAIN",
+    "RLE",
+    "RLE_DICTIONARY"
+   ],
+   "dictionary_chunks": 237,
+   "total_chunks": 237,
+   "bloom_chunks": 0
+  },
+  {
+   "column": "properties",
+   "compressed_bytes": 526634071,
+   "uncompressed_bytes": 5419026755,
+   "compressed_fraction": 0.4090185265118306,
+   "num_values": 30000000,
+   "null_count": 0,
+   "encodings": [
+    "PLAIN",
+    "RLE",
+    "RLE_DICTIONARY"
+   ],
+   "dictionary_chunks": 237,
+   "total_chunks": 237,
+   "bloom_chunks": 0
+  },
+  {
+   "column": "timestamp",
+   "compressed_bytes": 61192205,
+   "uncompressed_bytes": 61596860,
+   "compressed_fraction": 0.04752587593807594,
+   "num_values": 30000000,
+   "null_count": 0,
+   "encodings": [
+    "DELTA_BINARY_PACKED",
+    "RLE"
+   ],
+   "dictionary_chunks": 0,
+   "total_chunks": 237,
+   "bloom_chunks": 0
+  },
+  {
+   "column": "distinct_id",
+   "compressed_bytes": 34766142,
+   "uncompressed_bytes": 49244161,
+   "compressed_fraction": 0.027001663880841218,
+   "num_values": 30000000,
+   "null_count": 0,
+   "encodings": [
+    "PLAIN",
+    "RLE",
+    "RLE_DICTIONARY"
+   ],
+   "dictionary_chunks": 237,
+   "total_chunks": 237,
+   "bloom_chunks": 0
+  },
+  {
+   "column": "mat_$current_url",
+   "compressed_bytes": 23595993,
+   "uncompressed_bytes": 26938633,
+   "compressed_fraction": 0.018326194258790122,
+   "num_values": 30000000,
+   "null_count": 0,
+   "encodings": [
+    "PLAIN",
+    "RLE",
+    "RLE_DICTIONARY"
+   ],
+   "dictionary_chunks": 237,
+   "total_chunks": 237,
+   "bloom_chunks": 0
+  },
+  {
+   "column": "elements_chain",
+   "compressed_bytes": 12075067,
+   "uncompressed_bytes": 21868204,
+   "compressed_fraction": 0.009378288234358524,
+   "num_values": 30000000,
+   "null_count": 0,
+   "encodings": [
+    "PLAIN",
+    "RLE",
+    "RLE_DICTIONARY"
+   ],
+   "dictionary_chunks": 237,
+   "total_chunks": 237,
+   "bloom_chunks": 0
+  },
+  {
+   "column": "event",
+   "compressed_bytes": 8682847,
+   "uncompressed_bytes": 15127821,
+   "compressed_fraction": 0.00674366791180829,
+   "num_values": 30000000,
+   "null_count": 0,
+   "encodings": [
+    "PLAIN",
+    "RLE",
+    "RLE_DICTIONARY"
+   ],
+   "dictionary_chunks": 237,
+   "total_chunks": 237,
+   "bloom_chunks": 0
+  },
+  {
+   "column": "mat_$host",
+   "compressed_bytes": 8066099,
+   "uncompressed_bytes": 11346308,
+   "compressed_fraction": 0.006264661003443795,
+   "num_values": 30000000,
+   "null_count": 0,
+   "encodings": [
+    "PLAIN",
+    "RLE",
+    "RLE_DICTIONARY"
+   ],
+   "dictionary_chunks": 237,
+   "total_chunks": 237,
+   "bloom_chunks": 0
+  },
+  {
+   "column": "mat_$lib",
+   "compressed_bytes": 7942315,
+   "uncompressed_bytes": 11290920,
+   "compressed_fraction": 0.006168522238267433,
+   "num_values": 30000000,
+   "null_count": 0,
+   "encodings": [
+    "PLAIN",
+    "RLE",
+    "RLE_DICTIONARY"
+   ],
+   "dictionary_chunks": 237,
+   "total_chunks": 237,
+   "bloom_chunks": 0
+  },
+  {
+   "column": "team_id",
+   "compressed_bytes": 470188,
+   "uncompressed_bytes": 1032241,
+   "compressed_fraction": 0.00036517880922205776,
+   "num_values": 30000000,
+   "null_count": 0,
+   "encodings": [
+    "PLAIN",
+    "RLE",
+    "RLE_DICTIONARY"
+   ],
+   "dictionary_chunks": 237,
+   "total_chunks": 237,
+   "bloom_chunks": 0
+  }
+ ]
+}

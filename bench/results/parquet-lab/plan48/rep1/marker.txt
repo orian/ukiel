@@ -1,0 +1,4 @@
+source=/tmp/claude-1000/-home-orian-workspace-ukiel/5efa53b4-6b0f-40f1-a2ba-7233ff577c12/scratchpad/plan48live/b/planned.json
+mode=local
+rep=1
+state=complete

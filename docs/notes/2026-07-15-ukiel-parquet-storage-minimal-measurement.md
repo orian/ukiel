@@ -1,110 +1,128 @@
-# Minimal Parquet Storage Measurement — note (Plan 48)
+# Minimal Parquet Storage Measurement — result (Plan 48)
 
-**Status (2026-07-15):** The measurement *tooling* is corrected, hardened, and validated
-end-to-end; the **30M-row live screen itself is the operator-run compute step** and has not
-been executed here. This note records what the corrected pipeline now guarantees, the
-exact ready-to-run commands, and the single next action — it does not present a storage
-result, because per Plan 48 no result may be concluded from anything smaller than the 30M
-converged-L1+ baseline.
+**Status (2026-07-15): executed.** The 30M-row minimal screen ran end-to-end over an
+immutable snapshot of **converged, packed, L1+ ZSTD Ukiel parts** — the real product bytes,
+not the L0/LZ4 the earlier smoke used. The corrected run-order tooling (Plan 48 Tasks 1/2/5)
+drove it: the recorded seeded schedule was the executed schedule, with the product control
+measured independently at the start and end of each of two repetitions.
 
-## What was fixed and validated (Tasks 1, 2, 5)
+Raw evidence (planned/complete run sets, all 26 bench reports, per-column censuses, analysis
+JSON/Markdown, receipt, and a SHA-256 inventory) is under
+`bench/results/parquet-lab/plan48/`. Parquet variants and datasets are not committed.
 
-The audit that motivated this plan found that **the recorded schedule was not the executed
-schedule**: `parquet-lab.sh` ignored the run set, ran specs in lexical order, and wrote a
-single `product-control.json`, so the closer bound *both* scheduled control brackets to one
-file — the start/end control was a single measurement wearing two hats. That is now fixed:
+## Headline
 
-- **Task 1** — `parquet-lab.sh --run-set PLANNED.json --rep N` executes the *exact* recorded
-  schedule for the repetition, in the seeded interleaved order, writing each measurement to
-  its scheduled `report_id` (`order-000-product-control.json`, `order-003-page-64k.json`, …).
-  The product control is measured **independently at the start and end** of each repetition
-  (two distinct reports). The closer resolves each entry's exact recorded path, verifies its
-  digest, requires the two control brackets to be distinct reports over the same snapshot,
-  requires the same variant label to resolve to the same variant digest across repetitions,
-  and validates backend/reader-config/run-order. Safe publication (fail-fast, atomic rename,
-  marker-guarded `--replace`, symlink/traversal refusal) is preserved. A fake-tool
-  execution-order test asserts the planned order runs (not lexical) with two distinct control
-  reports; the analyzer now consumes both control measurements and reports start-to-end
-  drift per repetition. **Validated end-to-end on the real prod-synth smoke snapshot**
-  (plan → run rep0 & rep1 → close → analyze), confirming seed-shuffled order, two distinct
-  control brackets, and per-rep drift.
-- **Task 2** — the 11-variant screen is registered as an ordered *list*
-  (`bench/config/parquet-lab/minimal-screen.txt`) consumed by `--specs-from`, never a copied
-  spec directory. The list's SHA-256 and every referenced spec digest are recorded; missing,
-  duplicate, absolute, traversing, non-TOML, or outside-`bench/config/parquet-lab` paths and
-  duplicate labels are refused; a golden test pins the list to exactly the 11 registered
-  specs.
-- **Task 5** — the analyzer requires **repetition agreement** (opposing per-repetition signs
-  beyond noise → `unstable`, never a candidate), keeps **per-query** median/MAD and result
-  rows (so a suite-total win that is actually workload-specific is visible), classifies only
-  size (exact compressed bytes, 5% threshold) and local reads (the registered `3·MAD/median`
-  band), and emits immutable JSON + Markdown with formulas, exclusions, raw identities,
-  seed/order, and control drift. Golden tests cover opposing repetitions, excessive control
-  drift, one dominating query, answer rejection, missing census, tampered/incomplete run
-  sets, and a stable Pareto candidate.
+**Exactly one directional candidate: `compression-zstd-6`** — it compresses the 30M control
+**~12% smaller with no read-latency penalty** (both repetitions slightly *faster*, well
+inside the noise band). Everything else is dominated, workload-neutral, or unchanged. In
+particular, **the two "already-proven lossless" narrow-type projections do not help on ZSTD'd
+event data** — a genuine negative result that directly informs roadmap row 36.
 
-## The 30M live screen (Tasks 3, 4, 6) — the operator step
+## The control
 
-Generation is cheap (1M rows in ~1.5 s → 30M in ~45 s), but the screen is a multi-hour
-compute job: staging ~1.3 GB as L0, loading it into a disposable Ukiel stack, compacting
-**packed placement to convergence** with the real ladder (product L1+ ZSTD bytes — *not* the
-L0/LZ4 bytes the historical smoke used, which made every ZSTD rewrite a false win), freezing
-one immutable `from-ukiel` snapshot, then 11 rewrites + census + **24 timed benchmark runs**
-(2 controls + 11 variants, twice) over 1.3 GB, each query one cold + five warm.
+| property | value |
+|---|---|
+| source | converged, packed, L1+ Ukiel parts frozen with `from-ukiel` |
+| files / rows | 14 / 30,000,000 |
+| codec | ZSTD (level 1 — the product L1+ policy) |
+| compressed bytes | 1,288,132,743 (≈1.29 GB) |
+| warm suite median | 292.4 ms |
+| noise bands | size 5.0% (decision threshold), time 6.9% (`3·MAD/median`) |
+| control drift | rep0 0.21%, rep1 1.55% — both inside noise, no machine drift |
 
-Ready-to-run, with the corrected tooling:
+Two repetitions, seeded interleaved order (seed 47), one cold + five warm per query, `--mode
+local` (real filesystem). No repetition classified `unstable`.
 
-```bash
-# Task 3: freeze the single converged-L1+ product control (packed placement).
-prod-synth generate --tier baseline --profile docs/prod-info --output SRC --seed 0
-prod-synth-l0 stage --manifest SRC/manifest.json --output L0
-# ... compact packed to convergence via bench/prod-synth-part-shape.sh (ephemeral stack),
-# ... then snapshot the converged catalog:
-parquet-lab-snapshot from-ukiel --receipt PLAN46_RECEIPT.json --config UKIEL_CONFIG.toml --output SNAP
-parquet-lab-snapshot verify --manifest SNAP/manifest.json
-parquet-census  --manifest SNAP/manifest.json --report runs/product-control-census.json
-parquet-lab-bench compile-suite --manifest SNAP/manifest.json \
-  --queries bench/queries/prod-synth/queries.sql \
-  --probes  bench/config/parquet-lab/probes/prod-synth.toml --output runs/suite.json
+## All eleven arms
 
-# Task 4: plan both repetitions, then run the exact registered schedule in release mode.
-cargo build --release -p parquet-census -p parquet-rewrite -p parquet-lab-bench
-python3 bench/parquet-lab-run-set.py plan \
-  --specs-from bench/config/parquet-lab/minimal-screen.txt \
-  --backend local --repetitions 2 --seed 47 --out runs/plan48-planned.json
-for rep in 0 1; do
-  PARQUET_LAB_BIN=target/release bench/parquet-lab.sh --snapshot SNAP --suite runs/suite.json \
-    --run-set runs/plan48-planned.json --rep $rep --out runs/rep$rep --mode local --cold 1 --warm 5
-done
-python3 bench/parquet-lab-run-set.py close --run-set runs/plan48-planned.json \
-  --reports runs/rep0 runs/rep1 --out runs/plan48-complete.json
-
-# Task 5/analysis:
-python3 bench/parquet-lab-analyze.py --run-set runs/plan48-complete.json \
-  --reports runs/rep0 runs/rep1 --json-out runs/plan48-analysis.json --md-out runs/plan48-analysis.md
-```
-
-Task 6's page-index / Bloom reader A/Bs and any sidecar remain **gated** on a variant moving
-a named query outside noise; each unearned A/B is recorded `not_run_gate_not_met`, and "no
-custom skip-index experiment earned" is a valid complete result.
-
-## Result placeholders (fill from the operator run)
-
-| axis | variants | size Δ% (rep0/rep1) | local time Δ% (rep0/rep1) | classification |
+| axis | variant | size Δ% | time Δ% (rep0 / rep1) | classification |
 |---|---|---|---|---|
-| geometry | rowgroup-32k, rowgroup-512k, page-64k | _pending_ | _pending_ | _pending_ |
-| encoding | strings-no-dict, ts-plain | _pending_ | _pending_ | _pending_ |
-| compression | lz4-raw, zstd-1, zstd-6 | _pending_ | _pending_ | _pending_ |
-| types | team-int32, ts-timestamp | _pending_ | _pending_ | _pending_ |
-| bloom | distinct-id-01 | _pending_ | _pending_ | _pending_ |
+| compression | **zstd-6** | **−12.08** | −1.10 / −2.51 | **pareto-candidate (balanced)** |
+| compression | zstd-1 | −0.04 | ≈−2.2 | no-demonstrated-change (this *is* the control codec) |
+| compression | lz4-raw | +71.19 | −4.86 | dominated (much bigger for a small decode win) |
+| encoding | strings-no-dict | +14.56 | +55.38 | dominated (dictionaries strongly help, size and time) |
+| encoding | ts-plain | +1.67 | +1.34 | no-demonstrated-change |
+| geometry | rowgroup-32k | +4.32 | +0.99 | no-demonstrated-change |
+| geometry | rowgroup-512k | +0.15 | +1.93 | no-demonstrated-change |
+| geometry | page-64k | +1.42 | +1.33 / −3.42 | no-demonstrated-change |
+| types | team-int32 | +0.74 | −0.88 | no-demonstrated-change |
+| types | ts-timestamp | +6.53 | +2.34 | dominated (Arrow `Timestamp` is bigger) |
+| bloom | distinct-id-01 | +0.74 | +1.59 / −1.59 | no-demonstrated-change |
+
+Every arm passed the eligibility gates before timing: logical fingerprint preserved, schema
+and file membership unchanged, exact query/probe answers equal to the control, and census
+confirming the requested property was actually written (LZ4_RAW codec; `team_id` physical
+`INT32`; a Bloom filter present on `distinct_id`; the dictionary page absent on the promoted
+URL column). **Caveat on the ZSTD level:** Parquet footers record the *codec* (ZSTD) but not
+the *level*, so census cannot read "level 6" back; the −12% byte reduction versus the ZSTD-1
+control (1.13 GB vs 1.29 GB) is the evidence the stronger level took effect, and the variant
+manifest records the requested `zstd(6)`.
+
+## What this refutes and confirms (directional, prod-synth only)
+
+- **Narrow types do not pay on ZSTD'd event data.** `team_id Int64→Int32` moved size by
+  +0.74% (i.e. nothing) and `timestamp→Timestamp(ms)` made it 6.5% *bigger*. ZSTD already
+  compresses the int64 columns effectively, so narrowing the physical type — proven lossless
+  and answer-preserving — buys no bytes here. This is the key input for **roadmap row 36**:
+  the narrow-type ceiling on this workload is ≈0, not the guessed 10–25%.
+- **Dictionaries and the timestamp delta earn their place.** Disabling string dictionaries
+  cost +15% bytes and +55% time (dominated); plain timestamps were neutral-to-slightly-worse.
+- **Row-group/page geometry, and a `distinct_id` Bloom, show no material effect** at this
+  selectivity mix — the catalog + native page statistics already prune what these would.
+- **Stronger whole-file ZSTD is the one lever worth confirming**: ~12% smaller at no read
+  cost, consistent across both repetitions.
+
+## Task 6 — earned attribution checks: none earned
+
+- **Page-index A/B:** gated on `page-64k` moving a *selective* query outside noise. It did
+  not (no-demonstrated-change; selective probes within noise). `not_run_gate_not_met`.
+- **Bloom A/B:** gated on `distinct-id-01` moving `eq_distinct_id` outside noise. It did not
+  (~5.5 ms, within noise). `not_run_gate_not_met`.
+- **Custom skip index:** no equality/prefix probe remained materially expensive after the
+  native result (`eq_distinct_id` at 0.1% selectivity is ~5 ms), so **no custom skip-index
+  experiment is earned** — a complete result, not an omission.
 
 ## The single next earned action
 
-Run the 30M screen above once against a disposable stack, close and analyze it, then follow
-Plan 48 Task 7 Step 4: if no candidate survives repetition agreement, keep the product policy
-and stop Plan 47 storage work; if a candidate survives, confirm only it against the 64 MiB
-control (if that placement produced materially different geometry) and then 10M ClickBench,
-build one combined + leave-one-out arm only after both confirmations, and wire real
-MinIO/S3 + returned-byte/provenance accounting only before any remote-I/O claim. No
-object-store, cross-workload, writer-default, or production claim may be made from this
-screen, and Plan 47 is **not** marked complete.
+One candidate survived: **`compression-zstd-6`, best-balanced.** Per Plan 48 Task 7 Step 4,
+the next (and only) earned confirmation is:
+
+1. Confirm `zstd-6` against the **64 MiB size-targeted control** *only if* that placement
+   produces materially different part geometry than packed (Plan 46 measured the trigger);
+   otherwise the packed result stands.
+2. Confirm the survivor on the **10M ClickBench** slice to see whether the ~12% ZSTD-6 size
+   win is event-specific or general.
+3. A combined candidate + leave-one-out is unnecessary here — there is only one axis to keep.
+4. Wire real MinIO/S3 + returned-byte/provenance accounting **only** before making any
+   remote-I/O claim; this screen is `--mode local` and quotes no object-store metrics.
+
+No object-store, cross-workload, writer-default, or production claim is made from this
+screen. Plan 47 is **not** marked complete: a `zstd-6` production default requires the
+ClickBench confirmation and a focused evidence-backed issue naming the codec change, its
+write-amplification cost, and a rollback gate.
+
+## Reproduction
+
+```bash
+# Stack: docker compose up -d postgres minio ; disposable db `plan48`.
+prod-synth generate --tier baseline --profile docs/prod-info --output b/src --seed 0
+prod-synth-l0 stage --manifest b/src/manifest.json --output b/l0
+ukiel-prod-load compaction-input --l0-manifest b/l0/l0-manifest.json --label b30m-packed \
+  --config config.toml --receipt b/receipt.json --placement packed --ephemeral
+ukield --config config.toml &                       # compactor
+ukiel-prod-bench wait-compacted --receipt b/receipt.json --config config.toml --timeout-secs 3600
+# (place l0-manifest.json + source manifest.json next to the receipt for from-ukiel)
+parquet-lab-snapshot from-ukiel --receipt b/receipt.json --config config.toml --output b/SNAP
+parquet-lab-bench compile-suite --manifest b/SNAP/manifest.json --kind prod-synth \
+  --queries bench/queries/prod-synth/queries.sql \
+  --probes bench/config/parquet-lab/probes/prod-synth.toml --output b/suite.json
+python3 bench/parquet-lab-run-set.py plan --specs-from bench/config/parquet-lab/minimal-screen.txt \
+  --backend local --repetitions 2 --seed 47 --out b/planned.json
+for rep in 0 1; do
+  PARQUET_LAB_BIN=target/release bench/parquet-lab.sh --snapshot b/SNAP --suite b/suite.json \
+    --run-set b/planned.json --rep $rep --out b/rep$rep --mode local --cold 1 --warm 5
+done
+python3 bench/parquet-lab-run-set.py close --run-set b/planned.json --reports b/rep0 b/rep1 --out b/complete.json
+python3 bench/parquet-lab-analyze.py --run-set b/complete.json --reports b/rep0 b/rep1 \
+  --json-out b/analysis.json --md-out b/analysis.md
+```

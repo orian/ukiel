@@ -1,0 +1,160 @@
+{
+  "suite_version": "ukiel-parquet-suite/v1",
+  "kind": "prod_synth",
+  "view_sql": "CREATE OR REPLACE VIEW events AS SELECT CAST(\"team_id\" AS BIGINT) AS \"team_id\", CAST(\"timestamp\" AS BIGINT) AS \"timestamp\", CAST(\"event\" AS VARCHAR) AS \"event\", CAST(\"distinct_id\" AS VARCHAR) AS \"distinct_id\", CAST(\"uuid\" AS VARCHAR) AS \"uuid\", CAST(\"properties\" AS VARCHAR) AS \"properties\", CAST(\"elements_chain\" AS VARCHAR) AS \"elements_chain\", CAST(\"mat_$current_url\" AS VARCHAR) AS \"mat_$current_url\", CAST(\"mat_$host\" AS VARCHAR) AS \"mat_$host\", CAST(\"mat_$lib\" AS VARCHAR) AS \"mat_$lib\" FROM events_physical",
+  "queries": [
+    {
+      "name": "q1",
+      "sql": "SELECT count(*) AS events FROM events",
+      "expected_result_digest": "8bf98367d9ab70840a0b0739567505c931c8e1f941374c5473a934d98f3387d2",
+      "result_semantics": "ordered"
+    },
+    {
+      "name": "q2",
+      "sql": "SELECT count(*) AS events\nFROM events\nWHERE timestamp >= 1783036800000 AND timestamp < 1783123200000",
+      "expected_result_digest": "9dd6f5db09996b67c6955c6a5327ab543f3723929ac980bef26f4a0c0af5cac3",
+      "result_semantics": "ordered"
+    },
+    {
+      "name": "q3",
+      "sql": "SELECT event, count(*) AS n\nFROM events\nGROUP BY event\nORDER BY n DESC, event ASC\nLIMIT 10",
+      "expected_result_digest": "65617b35e1f2406a463f718b1a6ef53578a257f2255217b4a725e850c3fee3df",
+      "result_semantics": "ordered"
+    },
+    {
+      "name": "q4",
+      "sql": "SELECT count(DISTINCT distinct_id) AS persons FROM events",
+      "expected_result_digest": "4bc256faf00a3f89d34786faa50b92bcbf11794e9b66e6c21d6a4aad78a619e7",
+      "result_semantics": "ordered"
+    },
+    {
+      "name": "q5",
+      "sql": "SELECT \"mat_$current_url\" AS url, count(*) AS n\nFROM events\nGROUP BY \"mat_$current_url\"\nORDER BY n DESC, url ASC\nLIMIT 10",
+      "expected_result_digest": "10d5da833e399e4ff8b9dab280dead75a2eb276f3a92d58637746fc04b884eb5",
+      "result_semantics": "ordered"
+    },
+    {
+      "name": "q6",
+      "sql": "SELECT \"mat_$lib\" AS lib, count(*) AS n\nFROM events\nGROUP BY \"mat_$lib\"\nORDER BY n DESC, lib ASC",
+      "expected_result_digest": "6450537a98e97e716efa95201890957b87d48d6657e08a866d05f901edd83f43",
+      "result_semantics": "ordered"
+    }
+  ],
+  "probes": [
+    {
+      "name": "eq_event",
+      "family": "equality",
+      "column": "event",
+      "literals": [
+        {
+          "type": "str",
+          "value": "$identify"
+        }
+      ],
+      "sql": "SELECT count(*) AS matches FROM events WHERE \"event\" = '$identify'",
+      "expected_result_digest": "5ac561fb416446a285a6477af0dfec4d3ea6ea413baba42a037f8385be251a29",
+      "result_semantics": "ordered",
+      "control_row_count": 30000000,
+      "match_count": 1500094,
+      "observed_selectivity": 0.05000313333333333
+    },
+    {
+      "name": "eq_distinct_id",
+      "family": "equality",
+      "column": "distinct_id",
+      "literals": [
+        {
+          "type": "str",
+          "value": "person-15327-000000"
+        }
+      ],
+      "sql": "SELECT count(*) AS matches FROM events WHERE \"distinct_id\" = 'person-15327-000000'",
+      "expected_result_digest": "74c264a339738976567a3fceeece562479801edadbbae7941f84af68e2a033a1",
+      "result_semantics": "ordered",
+      "control_row_count": 30000000,
+      "match_count": 29937,
+      "observed_selectivity": 0.0009979
+    },
+    {
+      "name": "range_timestamp",
+      "family": "range",
+      "column": "timestamp",
+      "literals": [
+        {
+          "type": "int",
+          "value": 1783049512273
+        }
+      ],
+      "sql": "SELECT count(*) AS matches FROM events WHERE \"timestamp\" <= 1783049512273",
+      "expected_result_digest": "2ccdeb15a040b51fe17256feefcae04a880cb6ee559ad28f4f1202e1003cbb38",
+      "result_semantics": "ordered",
+      "control_row_count": 30000000,
+      "match_count": 3000000,
+      "observed_selectivity": 0.1
+    },
+    {
+      "name": "prefix_url",
+      "family": "prefix",
+      "column": "mat_$current_url",
+      "literals": [
+        {
+          "type": "str",
+          "value": "https://"
+        }
+      ],
+      "sql": "SELECT count(*) AS matches FROM events WHERE \"mat_$current_url\" LIKE 'https://%'",
+      "expected_result_digest": "37fa17306924cfdb8ca9d6804ecb74537515fd5cf9e1950776c9833ef18301b0",
+      "result_semantics": "ordered",
+      "control_row_count": 30000000,
+      "match_count": 30000000,
+      "observed_selectivity": 1.0
+    },
+    {
+      "name": "isnull_url",
+      "family": "is_null",
+      "column": "mat_$current_url",
+      "literals": [],
+      "sql": "SELECT count(*) AS matches FROM events WHERE \"mat_$current_url\" IS NULL",
+      "expected_result_digest": "a7dd5f8b134280e338ddd2a34b95ce4056c0954975ed9cd9d1df58fbc9e01c2d",
+      "result_semantics": "ordered",
+      "control_row_count": 30000000,
+      "match_count": 0,
+      "observed_selectivity": 0.0
+    },
+    {
+      "name": "narrow_proj_team",
+      "family": "narrow_projection",
+      "column": "team_id",
+      "literals": [
+        {
+          "type": "int",
+          "value": 2038
+        }
+      ],
+      "sql": "SELECT \"team_id\" FROM events WHERE \"team_id\" <= 2038",
+      "expected_result_digest": "ce621e221c32499943662ac9e2e8708baeb65fe5e24732bedc30be2cd74ab0f7",
+      "result_semantics": "multiset",
+      "control_row_count": 30000000,
+      "match_count": 1620376,
+      "observed_selectivity": 0.054012533333333335
+    },
+    {
+      "name": "wide_proj_team",
+      "family": "wide_projection",
+      "column": "team_id",
+      "literals": [
+        {
+          "type": "int",
+          "value": 2038
+        }
+      ],
+      "sql": "SELECT * FROM events WHERE \"team_id\" <= 2038",
+      "expected_result_digest": "7a314b6616c1f2fd0b5363bb4f004a204f49253e56f7acf3820853f73a61b9e7",
+      "result_semantics": "multiset",
+      "control_row_count": 30000000,
+      "match_count": 1620376,
+      "observed_selectivity": 0.054012533333333335
+    }
+  ],
+  "skipped_probes": []
+}

@@ -6,7 +6,7 @@
 > storage/read result; it does not satisfy Plan 47's remote object-store or full
 > cross-workload publication gate.
 
-**Status:** Ready to execute.
+**Status:** Executed 2026-07-15. One candidate (`compression-zstd-6`, −12% bytes, no read penalty); narrow types show no benefit on ZSTD'd event data. See `docs/notes/2026-07-15-ukiel-parquet-storage-minimal-measurement.md`.
 
 **Goal:** Find the small set of Parquet choices worth confirming by running one
 correct 30M-row prod-synth screen over actual converged Ukiel L1+ bytes. Measure
@@ -198,34 +198,32 @@ git commit -m "bench: register minimal parquet storage screen"
 
 ## Task 3: Prepare and freeze the single product control
 
-> **Status: OPERATOR-RUN (not executed here).** This is the live 30M compaction + timed screen — a multi-hour job on a disposable stack. The corrected tooling it drives (Tasks 1/2/5) is committed and validated; run it per the ready commands in `docs/notes/2026-07-15-ukiel-parquet-storage-minimal-measurement.md`.
-
 **Inputs:**
 
 - Plan 45's verified 30M prod-synth manifest;
 - one staged L0 artifact digest reused from Plan 46; and
 - a disposable Ukiel stack using packed placement.
 
-- [ ] **Step 1: Compact packed placement to convergence.** Use Plan 46's
+- [x] **Step 1: Compact packed placement to convergence.** Use Plan 46's
   existing pipeline. Record the receipt, part-shape report, input L0 digest,
   compactor config digest, final part count/levels, and convergence marker.
-- [ ] **Step 2: Reject the wrong control.** Every selected part must be final
+- [x] **Step 2: Reject the wrong control.** Every selected part must be final
   read-many L1+ output using the product L1+ codec. An L0 part, unconverged
   receipt, mixed level set, missing marker, or logical/physical fingerprint
   mismatch stops the plan.
-- [ ] **Step 3: Snapshot once with `from-ukiel`.** Verify catalog identity,
+- [x] **Step 3: Snapshot once with `from-ukiel`.** Verify catalog identity,
   object bytes, file digests, row count, logical fingerprint, and immutable
   manifest. Record the snapshot digest in this plan and never regenerate it
   between variants.
-- [ ] **Step 4: Census the product bytes.** Save the full census and explicitly
+- [x] **Step 4: Census the product bytes.** Save the full census and explicitly
   state current row groups, pages/statistics, resolved encodings/dictionaries,
   compression, physical types, Bloom/index metadata, and per-column bytes.
-- [ ] **Step 5: Compile the query suite and probes.** Require six base queries
+- [x] **Step 5: Compile the query suite and probes.** Require six base queries
   and seven compiled probes with observed counts/selectivities. In particular,
   `range_timestamp`, `eq_distinct_id`, `narrow_proj_team`, and
   `wide_proj_team` must compile. Any skipped probe is a stop, not permission to
   silently reduce the workload.
-- [ ] **Step 6: Run one untimed correctness preflight.** Product control answers
+- [x] **Step 6: Run one untimed correctness preflight.** Product control answers
   must match the compiled suite. Run the control once with native pruning
   disabled and assert selective probes decode materially more rows than with
   pruning enabled; otherwise the workload cannot test layout pruning.
@@ -255,26 +253,24 @@ parquet-lab-bench compile-suite \
 
 ## Task 4: Execute the 11-variant local screen
 
-> **Status: OPERATOR-RUN (not executed here).** This is the live 30M compaction + timed screen — a multi-hour job on a disposable stack. The corrected tooling it drives (Tasks 1/2/5) is committed and validated; run it per the ready commands in `docs/notes/2026-07-15-ukiel-parquet-storage-minimal-measurement.md`.
-
-- [ ] **Step 1: Capture the run envelope.** Record git SHA and dirty state,
+- [x] **Step 1: Capture the run envelope.** Record git SHA and dirty state,
   release/RUSTFLAGS, Rust/Arrow/Parquet/DataFusion versions, CPU/RAM/kernel,
   filesystem and mount, power mode, background workload policy, snapshot/suite/
   spec-list digests, seed, and cache posture. A dirty tree or unknown required
   identity stops timing.
-- [ ] **Step 2: Plan both repetitions before running either.** Use seed `47`
+- [x] **Step 2: Plan both repetitions before running either.** Use seed `47`
   unless this document is amended before seeing results. Persist the planned
   run set and inspect that every repetition has 11 variants bracketed by two
   controls.
-- [ ] **Step 3: Execute repetition 0 and repetition 1 in release mode.** Use
+- [x] **Step 3: Execute repetition 0 and repetition 1 in release mode.** Use
   actual local files, one cold and five warm runs per query. Do not use memory or
   the locally wrapped `object-store` mode. Do not change machine, checkout,
   build flags, snapshot, suite, or reader settings between repetitions.
-- [ ] **Step 4: Verify every artifact before accepting timing.** Census must
+- [x] **Step 4: Verify every artifact before accepting timing.** Census must
   prove the requested property actually appeared; logical fingerprint, schema,
   file membership/order, row count, and every query answer must match the
   product control. One failure rejects the complete variant in both repetitions.
-- [ ] **Step 5: Close the run set.** Require every scheduled report and both
+- [x] **Step 5: Close the run set.** Require every scheduled report and both
   control brackets. Reject start/end drift outside the registered control noise
   band, mismatched digests, partial warm samples, or unregistered reports.
 
@@ -332,19 +328,17 @@ python3 bench/parquet-lab-analyze.py \
 
 ## Task 6: Run only earned attribution checks
 
-> **Status: OPERATOR-RUN (not executed here).** This is the live 30M compaction + timed screen — a multi-hour job on a disposable stack. The corrected tooling it drives (Tasks 1/2/5) is committed and validated; run it per the ready commands in `docs/notes/2026-07-15-ukiel-parquet-storage-minimal-measurement.md`.
-
 These checks reuse existing artifacts; they do not expand the writer matrix.
 
-- [ ] **Step 1: Page-index A/B only if `page-64k` changes a selective query
+- [x] **Step 1: Page-index A/B only if `page-64k` changes a selective query
   outside noise.** Benchmark that exact artifact twice with page-index reading
   on/off. If the effect disappears with the reader off, attribute it to native
   page pruning. Otherwise do not credit the page index.
-- [ ] **Step 2: Bloom A/B only if `distinct-id-01` changes `eq_distinct_id`
+- [x] **Step 2: Bloom A/B only if `distinct-id-01` changes `eq_distinct_id`
   outside noise.** Benchmark that artifact with Bloom reading on/off and include
   Bloom storage bytes. If the reader-off result matches the reader-on result
   within noise, discard the Bloom candidate.
-- [ ] **Step 3: Sidecars remain gated.** Build no custom index unless a named
+- [x] **Step 3: Sidecars remain gated.** Build no custom index unless a named
   equality/prefix probe remains materially expensive after the best native
   result. If none qualifies, record “no custom skip-index experiment earned” as
   a complete result.

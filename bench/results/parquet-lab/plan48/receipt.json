@@ -1,0 +1,53 @@
+{
+  "receipt_version": "ukiel-prod-part-shape/v1",
+  "disclaimer": "Synthetic, profile-derived fixture. Reproduces the geometry of an observed workload (tenant skew, part membership, key sparsity) from anonymized aggregates only. Contains no production rows, no real tenant identifiers, and no real column values. Not a production copy.",
+  "source_manifest": {
+    "path": "manifest.json",
+    "bytes": 65706,
+    "digest": "14544d4e7475ecd5193518fc3195a0eb4266a1dea8b519433eaec4b7d1a3bb71"
+  },
+  "l0_manifest": {
+    "path": "l0-manifest.json",
+    "bytes": 957956,
+    "digest": "ae7ac09e35761d2a0be724ea3a270e663e216bf304469ccdd7c358c96befbf6b"
+  },
+  "label": "b30m-packed",
+  "hypertable": "prod_synth_events_b30m-packed",
+  "hypertable_id": 1,
+  "placement": {
+    "kind": "packed"
+  },
+  "input_parts": 2673,
+  "input_rows": 30000000,
+  "input_bytes": 2334074761,
+  "packing_key": "team_id",
+  "sort_key": [
+    "team_id",
+    "timestamp",
+    "event",
+    "distinct_id",
+    "uuid"
+  ],
+  "partition_marker_digest": "065622e4a71e8e3cc1f4d75fdb421e50fe893926aaba410ed1f303f85bd1e7a1",
+  "compactor": {
+    "l0_fanout": 4,
+    "fanout": 10,
+    "finalize_after_secs": 3,
+    "finalize_poll_interval_ms": 60000,
+    "lease_ttl_secs": 60,
+    "lease_renew_interval_secs": 20,
+    "candidate_limit": 64
+  },
+  "fingerprint": {
+    "version": "row-multiset/v1",
+    "count": 30000000,
+    "xor": "dc6f12007d5a7b0a2136d9f018c74a1b05057b18a4bd8a4293c39aa989500a97",
+    "sum": [
+      17565195102717362482,
+      6197919612528371245,
+      9502298571718674267,
+      4419537198478895937
+    ],
+    "digest": "94a4f7ada5d98cd15d52f59c6ccbbd0fa86184dfc7083db6b3ebb5b6a6d1f62e"
+  }
+}

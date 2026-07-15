@@ -1,0 +1,1085 @@
+{
+  "formulas": {
+    "suite_total": "T_i = sum_q warm_ms[q][i]",
+    "time_band": "3 * MAD(control T_i pool) / median(control T_i pool)",
+    "size_band": "0.05 fixed decision threshold"
+  },
+  "seed": 47,
+  "repetitions": 2,
+  "order": [
+    "rep0/order-000-product-control",
+    "rep0/order-001-types-team-int32",
+    "rep0/order-002-pages-rowgroup-32k",
+    "rep0/order-003-types-ts-timestamp",
+    "rep0/order-004-encodings-strings-no-dict",
+    "rep0/order-005-blooms-distinct-id-01",
+    "rep0/order-006-pages-page-64k",
+    "rep0/order-007-encodings-ts-plain",
+    "rep0/order-008-compression-zstd-6",
+    "rep0/order-009-compression-zstd-1",
+    "rep0/order-010-pages-rowgroup-512k",
+    "rep0/order-011-compression-lz4-raw",
+    "rep0/order-012-product-control",
+    "rep1/order-000-product-control",
+    "rep1/order-001-types-ts-timestamp",
+    "rep1/order-002-blooms-distinct-id-01",
+    "rep1/order-003-pages-rowgroup-32k",
+    "rep1/order-004-encodings-strings-no-dict",
+    "rep1/order-005-pages-rowgroup-512k",
+    "rep1/order-006-compression-zstd-6",
+    "rep1/order-007-compression-zstd-1",
+    "rep1/order-008-encodings-ts-plain",
+    "rep1/order-009-pages-page-64k",
+    "rep1/order-010-compression-lz4-raw",
+    "rep1/order-011-types-team-int32",
+    "rep1/order-012-product-control"
+  ],
+  "suite_digest": "d830a5c560ae608757d19e4af91bfea055e857686d4e4eda157fe7d95b02759f",
+  "control_digest": "ecbba18b797bc6dc39504e9912cce01c26b5810b0c9b07634b92be18885ee4e1",
+  "control_median_ms": 292.361,
+  "control_bytes": 1288132743,
+  "control_drift": [
+    {
+      "repetition": 0,
+      "start_ms": 287.146,
+      "end_ms": 286.538,
+      "drift_pct": 0.21,
+      "exceeds_noise": false
+    },
+    {
+      "repetition": 1,
+      "start_ms": 296.159,
+      "end_ms": 291.636,
+      "drift_pct": 1.55,
+      "exceeds_noise": false
+    }
+  ],
+  "time_band": 0.0694025288192504,
+  "size_band": 0.05,
+  "exclusions": [],
+  "variants": [
+    {
+      "variant": "blooms-distinct-id-01",
+      "answers_match": true,
+      "reps": 2,
+      "time_median_ms": 290.322,
+      "time_delta_pct": -0.7,
+      "per_rep_time_delta_pct": {
+        "0": 1.59,
+        "1": -1.59
+      },
+      "size_delta_pct": 0.74,
+      "per_query": [
+        {
+          "query": "eq_distinct_id",
+          "warm_median_ms": 5.479,
+          "warm_mad_ms": 0.486,
+          "result_rows": 1
+        },
+        {
+          "query": "eq_event",
+          "warm_median_ms": 26.445,
+          "warm_mad_ms": 0.433,
+          "result_rows": 1
+        },
+        {
+          "query": "isnull_url",
+          "warm_median_ms": 0.411,
+          "warm_mad_ms": 0.096,
+          "result_rows": 1
+        },
+        {
+          "query": "narrow_proj_team",
+          "warm_median_ms": 4.296,
+          "warm_mad_ms": 0.438,
+          "result_rows": 1620376
+        },
+        {
+          "query": "prefix_url",
+          "warm_median_ms": 24.551,
+          "warm_mad_ms": 0.598,
+          "result_rows": 1
+        },
+        {
+          "query": "q1",
+          "warm_median_ms": 3.417,
+          "warm_mad_ms": 0.191,
+          "result_rows": 1
+        },
+        {
+          "query": "q2",
+          "warm_median_ms": 4.098,
+          "warm_mad_ms": 0.575,
+          "result_rows": 1
+        },
+        {
+          "query": "q3",
+          "warm_median_ms": 27.488,
+          "warm_mad_ms": 0.965,
+          "result_rows": 10
+        },
+        {
+          "query": "q4",
+          "warm_median_ms": 48.939,
+          "warm_mad_ms": 1.48,
+          "result_rows": 1
+        },
+        {
+          "query": "q5",
+          "warm_median_ms": 45.696,
+          "warm_mad_ms": 0.898,
+          "result_rows": 10
+        },
+        {
+          "query": "q6",
+          "warm_median_ms": 28.67,
+          "warm_mad_ms": 0.869,
+          "result_rows": 6
+        },
+        {
+          "query": "range_timestamp",
+          "warm_median_ms": 7.264,
+          "warm_mad_ms": 0.315,
+          "result_rows": 1
+        },
+        {
+          "query": "wide_proj_team",
+          "warm_median_ms": 61.77,
+          "warm_mad_ms": 3.215,
+          "result_rows": 1620376
+        }
+      ],
+      "classification": "no-demonstrated-change"
+    },
+    {
+      "variant": "compression-lz4-raw",
+      "answers_match": true,
+      "reps": 2,
+      "time_median_ms": 278.147,
+      "time_delta_pct": -4.86,
+      "per_rep_time_delta_pct": {
+        "0": -3.06,
+        "1": -5.33
+      },
+      "size_delta_pct": 71.19,
+      "per_query": [
+        {
+          "query": "eq_distinct_id",
+          "warm_median_ms": 5.499,
+          "warm_mad_ms": 0.249,
+          "result_rows": 1
+        },
+        {
+          "query": "eq_event",
+          "warm_median_ms": 26.322,
+          "warm_mad_ms": 0.687,
+          "result_rows": 1
+        },
+        {
+          "query": "isnull_url",
+          "warm_median_ms": 0.705,
+          "warm_mad_ms": 0.372,
+          "result_rows": 1
+        },
+        {
+          "query": "narrow_proj_team",
+          "warm_median_ms": 4.266,
+          "warm_mad_ms": 0.218,
+          "result_rows": 1620376
+        },
+        {
+          "query": "prefix_url",
+          "warm_median_ms": 23.28,
+          "warm_mad_ms": 0.565,
+          "result_rows": 1
+        },
+        {
+          "query": "q1",
+          "warm_median_ms": 3.035,
+          "warm_mad_ms": 0.323,
+          "result_rows": 1
+        },
+        {
+          "query": "q2",
+          "warm_median_ms": 5.376,
+          "warm_mad_ms": 0.537,
+          "result_rows": 1
+        },
+        {
+          "query": "q3",
+          "warm_median_ms": 26.664,
+          "warm_mad_ms": 1.397,
+          "result_rows": 10
+        },
+        {
+          "query": "q4",
+          "warm_median_ms": 46.97,
+          "warm_mad_ms": 1.704,
+          "result_rows": 1
+        },
+        {
+          "query": "q5",
+          "warm_median_ms": 44.497,
+          "warm_mad_ms": 0.916,
+          "result_rows": 10
+        },
+        {
+          "query": "q6",
+          "warm_median_ms": 29.067,
+          "warm_mad_ms": 0.859,
+          "result_rows": 6
+        },
+        {
+          "query": "range_timestamp",
+          "warm_median_ms": 7.134,
+          "warm_mad_ms": 0.327,
+          "result_rows": 1
+        },
+        {
+          "query": "wide_proj_team",
+          "warm_median_ms": 53.784,
+          "warm_mad_ms": 2.31,
+          "result_rows": 1620376
+        }
+      ],
+      "classification": "dominated"
+    },
+    {
+      "variant": "compression-zstd-1",
+      "answers_match": true,
+      "reps": 2,
+      "time_median_ms": 285.937,
+      "time_delta_pct": -2.2,
+      "per_rep_time_delta_pct": {
+        "0": -1.41,
+        "1": -1.47
+      },
+      "size_delta_pct": -0.04,
+      "per_query": [
+        {
+          "query": "eq_distinct_id",
+          "warm_median_ms": 5.433,
+          "warm_mad_ms": 0.3,
+          "result_rows": 1
+        },
+        {
+          "query": "eq_event",
+          "warm_median_ms": 25.883,
+          "warm_mad_ms": 0.454,
+          "result_rows": 1
+        },
+        {
+          "query": "isnull_url",
+          "warm_median_ms": 0.308,
+          "warm_mad_ms": 0.011,
+          "result_rows": 1
+        },
+        {
+          "query": "narrow_proj_team",
+          "warm_median_ms": 4.329,
+          "warm_mad_ms": 0.166,
+          "result_rows": 1620376
+        },
+        {
+          "query": "prefix_url",
+          "warm_median_ms": 25.243,
+          "warm_mad_ms": 1.371,
+          "result_rows": 1
+        },
+        {
+          "query": "q1",
+          "warm_median_ms": 3.227,
+          "warm_mad_ms": 0.405,
+          "result_rows": 1
+        },
+        {
+          "query": "q2",
+          "warm_median_ms": 3.864,
+          "warm_mad_ms": 0.375,
+          "result_rows": 1
+        },
+        {
+          "query": "q3",
+          "warm_median_ms": 25.897,
+          "warm_mad_ms": 0.544,
+          "result_rows": 10
+        },
+        {
+          "query": "q4",
+          "warm_median_ms": 48.726,
+          "warm_mad_ms": 1.77,
+          "result_rows": 1
+        },
+        {
+          "query": "q5",
+          "warm_median_ms": 47.942,
+          "warm_mad_ms": 1.241,
+          "result_rows": 10
+        },
+        {
+          "query": "q6",
+          "warm_median_ms": 28.919,
+          "warm_mad_ms": 0.629,
+          "result_rows": 6
+        },
+        {
+          "query": "range_timestamp",
+          "warm_median_ms": 7.21,
+          "warm_mad_ms": 0.342,
+          "result_rows": 1
+        },
+        {
+          "query": "wide_proj_team",
+          "warm_median_ms": 58.741,
+          "warm_mad_ms": 3.21,
+          "result_rows": 1620376
+        }
+      ],
+      "classification": "no-demonstrated-change"
+    },
+    {
+      "variant": "compression-zstd-6",
+      "answers_match": true,
+      "reps": 2,
+      "time_median_ms": 285.203,
+      "time_delta_pct": -2.45,
+      "per_rep_time_delta_pct": {
+        "0": -1.1,
+        "1": -2.51
+      },
+      "size_delta_pct": -12.08,
+      "per_query": [
+        {
+          "query": "eq_distinct_id",
+          "warm_median_ms": 5.321,
+          "warm_mad_ms": 0.674,
+          "result_rows": 1
+        },
+        {
+          "query": "eq_event",
+          "warm_median_ms": 27.098,
+          "warm_mad_ms": 0.684,
+          "result_rows": 1
+        },
+        {
+          "query": "isnull_url",
+          "warm_median_ms": 0.439,
+          "warm_mad_ms": 0.123,
+          "result_rows": 1
+        },
+        {
+          "query": "narrow_proj_team",
+          "warm_median_ms": 4.275,
+          "warm_mad_ms": 0.135,
+          "result_rows": 1620376
+        },
+        {
+          "query": "prefix_url",
+          "warm_median_ms": 24.722,
+          "warm_mad_ms": 0.505,
+          "result_rows": 1
+        },
+        {
+          "query": "q1",
+          "warm_median_ms": 3.345,
+          "warm_mad_ms": 0.748,
+          "result_rows": 1
+        },
+        {
+          "query": "q2",
+          "warm_median_ms": 3.478,
+          "warm_mad_ms": 0.746,
+          "result_rows": 1
+        },
+        {
+          "query": "q3",
+          "warm_median_ms": 28.41,
+          "warm_mad_ms": 1.029,
+          "result_rows": 10
+        },
+        {
+          "query": "q4",
+          "warm_median_ms": 48.6,
+          "warm_mad_ms": 1.781,
+          "result_rows": 1
+        },
+        {
+          "query": "q5",
+          "warm_median_ms": 46.21,
+          "warm_mad_ms": 2.416,
+          "result_rows": 10
+        },
+        {
+          "query": "q6",
+          "warm_median_ms": 28.947,
+          "warm_mad_ms": 0.871,
+          "result_rows": 6
+        },
+        {
+          "query": "range_timestamp",
+          "warm_median_ms": 6.698,
+          "warm_mad_ms": 0.533,
+          "result_rows": 1
+        },
+        {
+          "query": "wide_proj_team",
+          "warm_median_ms": 59.732,
+          "warm_mad_ms": 1.852,
+          "result_rows": 1620376
+        }
+      ],
+      "classification": "pareto-candidate"
+    },
+    {
+      "variant": "encodings-strings-no-dict",
+      "answers_match": true,
+      "reps": 2,
+      "time_median_ms": 454.261,
+      "time_delta_pct": 55.38,
+      "per_rep_time_delta_pct": {
+        "0": 60.34,
+        "1": 53.65
+      },
+      "size_delta_pct": 14.56,
+      "per_query": [
+        {
+          "query": "eq_distinct_id",
+          "warm_median_ms": 5.431,
+          "warm_mad_ms": 0.26,
+          "result_rows": 1
+        },
+        {
+          "query": "eq_event",
+          "warm_median_ms": 26.803,
+          "warm_mad_ms": 0.962,
+          "result_rows": 1
+        },
+        {
+          "query": "isnull_url",
+          "warm_median_ms": 0.43,
+          "warm_mad_ms": 0.119,
+          "result_rows": 1
+        },
+        {
+          "query": "narrow_proj_team",
+          "warm_median_ms": 4.226,
+          "warm_mad_ms": 0.31,
+          "result_rows": 1620376
+        },
+        {
+          "query": "prefix_url",
+          "warm_median_ms": 84.297,
+          "warm_mad_ms": 1.853,
+          "result_rows": 1
+        },
+        {
+          "query": "q1",
+          "warm_median_ms": 3.421,
+          "warm_mad_ms": 0.249,
+          "result_rows": 1
+        },
+        {
+          "query": "q2",
+          "warm_median_ms": 3.724,
+          "warm_mad_ms": 0.223,
+          "result_rows": 1
+        },
+        {
+          "query": "q3",
+          "warm_median_ms": 26.115,
+          "warm_mad_ms": 0.663,
+          "result_rows": 10
+        },
+        {
+          "query": "q4",
+          "warm_median_ms": 49.041,
+          "warm_mad_ms": 0.533,
+          "result_rows": 1
+        },
+        {
+          "query": "q5",
+          "warm_median_ms": 104.568,
+          "warm_mad_ms": 2.197,
+          "result_rows": 10
+        },
+        {
+          "query": "q6",
+          "warm_median_ms": 56.764,
+          "warm_mad_ms": 1.364,
+          "result_rows": 6
+        },
+        {
+          "query": "range_timestamp",
+          "warm_median_ms": 18.091,
+          "warm_mad_ms": 0.941,
+          "result_rows": 1
+        },
+        {
+          "query": "wide_proj_team",
+          "warm_median_ms": 70.23,
+          "warm_mad_ms": 7.251,
+          "result_rows": 1620376
+        }
+      ],
+      "classification": "dominated"
+    },
+    {
+      "variant": "encodings-ts-plain",
+      "answers_match": true,
+      "reps": 2,
+      "time_median_ms": 296.283,
+      "time_delta_pct": 1.34,
+      "per_rep_time_delta_pct": {
+        "0": 2.94,
+        "1": 2.67
+      },
+      "size_delta_pct": 1.67,
+      "per_query": [
+        {
+          "query": "eq_distinct_id",
+          "warm_median_ms": 5.471,
+          "warm_mad_ms": 0.308,
+          "result_rows": 1
+        },
+        {
+          "query": "eq_event",
+          "warm_median_ms": 25.809,
+          "warm_mad_ms": 0.729,
+          "result_rows": 1
+        },
+        {
+          "query": "isnull_url",
+          "warm_median_ms": 0.461,
+          "warm_mad_ms": 0.063,
+          "result_rows": 1
+        },
+        {
+          "query": "narrow_proj_team",
+          "warm_median_ms": 4.287,
+          "warm_mad_ms": 0.069,
+          "result_rows": 1620376
+        },
+        {
+          "query": "prefix_url",
+          "warm_median_ms": 24.119,
+          "warm_mad_ms": 0.382,
+          "result_rows": 1
+        },
+        {
+          "query": "q1",
+          "warm_median_ms": 3.259,
+          "warm_mad_ms": 0.299,
+          "result_rows": 1
+        },
+        {
+          "query": "q2",
+          "warm_median_ms": 4.227,
+          "warm_mad_ms": 0.79,
+          "result_rows": 1
+        },
+        {
+          "query": "q3",
+          "warm_median_ms": 27.634,
+          "warm_mad_ms": 0.309,
+          "result_rows": 10
+        },
+        {
+          "query": "q4",
+          "warm_median_ms": 48.81,
+          "warm_mad_ms": 0.759,
+          "result_rows": 1
+        },
+        {
+          "query": "q5",
+          "warm_median_ms": 47.514,
+          "warm_mad_ms": 0.575,
+          "result_rows": 10
+        },
+        {
+          "query": "q6",
+          "warm_median_ms": 27.921,
+          "warm_mad_ms": 1.046,
+          "result_rows": 6
+        },
+        {
+          "query": "range_timestamp",
+          "warm_median_ms": 11.399,
+          "warm_mad_ms": 0.289,
+          "result_rows": 1
+        },
+        {
+          "query": "wide_proj_team",
+          "warm_median_ms": 63.043,
+          "warm_mad_ms": 3.021,
+          "result_rows": 1620376
+        }
+      ],
+      "classification": "no-demonstrated-change"
+    },
+    {
+      "variant": "pages-page-64k",
+      "answers_match": true,
+      "reps": 2,
+      "time_median_ms": 289.529,
+      "time_delta_pct": -0.97,
+      "per_rep_time_delta_pct": {
+        "0": 1.33,
+        "1": -3.42
+      },
+      "size_delta_pct": 1.42,
+      "per_query": [
+        {
+          "query": "eq_distinct_id",
+          "warm_median_ms": 5.861,
+          "warm_mad_ms": 0.659,
+          "result_rows": 1
+        },
+        {
+          "query": "eq_event",
+          "warm_median_ms": 27.322,
+          "warm_mad_ms": 0.871,
+          "result_rows": 1
+        },
+        {
+          "query": "isnull_url",
+          "warm_median_ms": 0.514,
+          "warm_mad_ms": 0.04,
+          "result_rows": 1
+        },
+        {
+          "query": "narrow_proj_team",
+          "warm_median_ms": 4.284,
+          "warm_mad_ms": 0.28,
+          "result_rows": 1620376
+        },
+        {
+          "query": "prefix_url",
+          "warm_median_ms": 24.674,
+          "warm_mad_ms": 1.13,
+          "result_rows": 1
+        },
+        {
+          "query": "q1",
+          "warm_median_ms": 3.313,
+          "warm_mad_ms": 0.419,
+          "result_rows": 1
+        },
+        {
+          "query": "q2",
+          "warm_median_ms": 4.651,
+          "warm_mad_ms": 0.313,
+          "result_rows": 1
+        },
+        {
+          "query": "q3",
+          "warm_median_ms": 26.385,
+          "warm_mad_ms": 1.488,
+          "result_rows": 10
+        },
+        {
+          "query": "q4",
+          "warm_median_ms": 49.942,
+          "warm_mad_ms": 1.249,
+          "result_rows": 1
+        },
+        {
+          "query": "q5",
+          "warm_median_ms": 47.326,
+          "warm_mad_ms": 1.312,
+          "result_rows": 10
+        },
+        {
+          "query": "q6",
+          "warm_median_ms": 27.035,
+          "warm_mad_ms": 0.601,
+          "result_rows": 6
+        },
+        {
+          "query": "range_timestamp",
+          "warm_median_ms": 7.019,
+          "warm_mad_ms": 0.322,
+          "result_rows": 1
+        },
+        {
+          "query": "wide_proj_team",
+          "warm_median_ms": 59.926,
+          "warm_mad_ms": 2.201,
+          "result_rows": 1620376
+        }
+      ],
+      "classification": "no-demonstrated-change"
+    },
+    {
+      "variant": "pages-rowgroup-32k",
+      "answers_match": true,
+      "reps": 2,
+      "time_median_ms": 295.252,
+      "time_delta_pct": 0.99,
+      "per_rep_time_delta_pct": {
+        "0": 1.58,
+        "1": 2.46
+      },
+      "size_delta_pct": 4.32,
+      "per_query": [
+        {
+          "query": "eq_distinct_id",
+          "warm_median_ms": 5.268,
+          "warm_mad_ms": 0.245,
+          "result_rows": 1
+        },
+        {
+          "query": "eq_event",
+          "warm_median_ms": 29.483,
+          "warm_mad_ms": 0.75,
+          "result_rows": 1
+        },
+        {
+          "query": "isnull_url",
+          "warm_median_ms": 0.305,
+          "warm_mad_ms": 0.013,
+          "result_rows": 1
+        },
+        {
+          "query": "narrow_proj_team",
+          "warm_median_ms": 4.319,
+          "warm_mad_ms": 0.354,
+          "result_rows": 1620376
+        },
+        {
+          "query": "prefix_url",
+          "warm_median_ms": 25.323,
+          "warm_mad_ms": 0.393,
+          "result_rows": 1
+        },
+        {
+          "query": "q1",
+          "warm_median_ms": 3.33,
+          "warm_mad_ms": 0.559,
+          "result_rows": 1
+        },
+        {
+          "query": "q2",
+          "warm_median_ms": 3.674,
+          "warm_mad_ms": 0.149,
+          "result_rows": 1
+        },
+        {
+          "query": "q3",
+          "warm_median_ms": 27.377,
+          "warm_mad_ms": 0.981,
+          "result_rows": 10
+        },
+        {
+          "query": "q4",
+          "warm_median_ms": 50.268,
+          "warm_mad_ms": 1.449,
+          "result_rows": 1
+        },
+        {
+          "query": "q5",
+          "warm_median_ms": 48.318,
+          "warm_mad_ms": 0.867,
+          "result_rows": 10
+        },
+        {
+          "query": "q6",
+          "warm_median_ms": 29.771,
+          "warm_mad_ms": 1.164,
+          "result_rows": 6
+        },
+        {
+          "query": "range_timestamp",
+          "warm_median_ms": 7.523,
+          "warm_mad_ms": 0.282,
+          "result_rows": 1
+        },
+        {
+          "query": "wide_proj_team",
+          "warm_median_ms": 62.253,
+          "warm_mad_ms": 3.441,
+          "result_rows": 1620376
+        }
+      ],
+      "classification": "no-demonstrated-change"
+    },
+    {
+      "variant": "pages-rowgroup-512k",
+      "answers_match": true,
+      "reps": 2,
+      "time_median_ms": 298.007,
+      "time_delta_pct": 1.93,
+      "per_rep_time_delta_pct": {
+        "0": 2.88,
+        "1": 2.47
+      },
+      "size_delta_pct": 0.15,
+      "per_query": [
+        {
+          "query": "eq_distinct_id",
+          "warm_median_ms": 6.024,
+          "warm_mad_ms": 0.357,
+          "result_rows": 1
+        },
+        {
+          "query": "eq_event",
+          "warm_median_ms": 27.622,
+          "warm_mad_ms": 0.837,
+          "result_rows": 1
+        },
+        {
+          "query": "isnull_url",
+          "warm_median_ms": 0.32,
+          "warm_mad_ms": 0.014,
+          "result_rows": 1
+        },
+        {
+          "query": "narrow_proj_team",
+          "warm_median_ms": 3.867,
+          "warm_mad_ms": 0.154,
+          "result_rows": 1620376
+        },
+        {
+          "query": "prefix_url",
+          "warm_median_ms": 25.411,
+          "warm_mad_ms": 1.106,
+          "result_rows": 1
+        },
+        {
+          "query": "q1",
+          "warm_median_ms": 3.297,
+          "warm_mad_ms": 0.129,
+          "result_rows": 1
+        },
+        {
+          "query": "q2",
+          "warm_median_ms": 4.39,
+          "warm_mad_ms": 0.125,
+          "result_rows": 1
+        },
+        {
+          "query": "q3",
+          "warm_median_ms": 27.743,
+          "warm_mad_ms": 1.447,
+          "result_rows": 10
+        },
+        {
+          "query": "q4",
+          "warm_median_ms": 54.172,
+          "warm_mad_ms": 1.284,
+          "result_rows": 1
+        },
+        {
+          "query": "q5",
+          "warm_median_ms": 47.354,
+          "warm_mad_ms": 1.357,
+          "result_rows": 10
+        },
+        {
+          "query": "q6",
+          "warm_median_ms": 28.987,
+          "warm_mad_ms": 1.615,
+          "result_rows": 6
+        },
+        {
+          "query": "range_timestamp",
+          "warm_median_ms": 6.173,
+          "warm_mad_ms": 0.418,
+          "result_rows": 1
+        },
+        {
+          "query": "wide_proj_team",
+          "warm_median_ms": 63.263,
+          "warm_mad_ms": 2.103,
+          "result_rows": 1620376
+        }
+      ],
+      "classification": "no-demonstrated-change"
+    },
+    {
+      "variant": "types-team-int32",
+      "answers_match": true,
+      "reps": 2,
+      "time_median_ms": 289.787,
+      "time_delta_pct": -0.88,
+      "per_rep_time_delta_pct": {
+        "0": 0.66,
+        "1": 0.03
+      },
+      "size_delta_pct": 0.74,
+      "per_query": [
+        {
+          "query": "eq_distinct_id",
+          "warm_median_ms": 5.142,
+          "warm_mad_ms": 0.29,
+          "result_rows": 1
+        },
+        {
+          "query": "eq_event",
+          "warm_median_ms": 26.403,
+          "warm_mad_ms": 1.183,
+          "result_rows": 1
+        },
+        {
+          "query": "isnull_url",
+          "warm_median_ms": 0.473,
+          "warm_mad_ms": 0.016,
+          "result_rows": 1
+        },
+        {
+          "query": "narrow_proj_team",
+          "warm_median_ms": 4.473,
+          "warm_mad_ms": 0.4,
+          "result_rows": 1620376
+        },
+        {
+          "query": "prefix_url",
+          "warm_median_ms": 24.913,
+          "warm_mad_ms": 0.538,
+          "result_rows": 1
+        },
+        {
+          "query": "q1",
+          "warm_median_ms": 3.317,
+          "warm_mad_ms": 0.418,
+          "result_rows": 1
+        },
+        {
+          "query": "q2",
+          "warm_median_ms": 4.463,
+          "warm_mad_ms": 0.603,
+          "result_rows": 1
+        },
+        {
+          "query": "q3",
+          "warm_median_ms": 26.233,
+          "warm_mad_ms": 1.075,
+          "result_rows": 10
+        },
+        {
+          "query": "q4",
+          "warm_median_ms": 50.006,
+          "warm_mad_ms": 1.401,
+          "result_rows": 1
+        },
+        {
+          "query": "q5",
+          "warm_median_ms": 46.501,
+          "warm_mad_ms": 1.82,
+          "result_rows": 10
+        },
+        {
+          "query": "q6",
+          "warm_median_ms": 27.885,
+          "warm_mad_ms": 0.938,
+          "result_rows": 6
+        },
+        {
+          "query": "range_timestamp",
+          "warm_median_ms": 6.728,
+          "warm_mad_ms": 0.345,
+          "result_rows": 1
+        },
+        {
+          "query": "wide_proj_team",
+          "warm_median_ms": 64.248,
+          "warm_mad_ms": 2.432,
+          "result_rows": 1620376
+        }
+      ],
+      "classification": "no-demonstrated-change"
+    },
+    {
+      "variant": "types-ts-timestamp",
+      "answers_match": true,
+      "reps": 2,
+      "time_median_ms": 299.206,
+      "time_delta_pct": 2.34,
+      "per_rep_time_delta_pct": {
+        "0": 4.35,
+        "1": 1.39
+      },
+      "size_delta_pct": 6.53,
+      "per_query": [
+        {
+          "query": "eq_distinct_id",
+          "warm_median_ms": 5.464,
+          "warm_mad_ms": 0.277,
+          "result_rows": 1
+        },
+        {
+          "query": "eq_event",
+          "warm_median_ms": 26.681,
+          "warm_mad_ms": 0.55,
+          "result_rows": 1
+        },
+        {
+          "query": "isnull_url",
+          "warm_median_ms": 0.47,
+          "warm_mad_ms": 0.084,
+          "result_rows": 1
+        },
+        {
+          "query": "narrow_proj_team",
+          "warm_median_ms": 4.26,
+          "warm_mad_ms": 0.314,
+          "result_rows": 1620376
+        },
+        {
+          "query": "prefix_url",
+          "warm_median_ms": 24.464,
+          "warm_mad_ms": 0.832,
+          "result_rows": 1
+        },
+        {
+          "query": "q1",
+          "warm_median_ms": 3.499,
+          "warm_mad_ms": 0.114,
+          "result_rows": 1
+        },
+        {
+          "query": "q2",
+          "warm_median_ms": 3.858,
+          "warm_mad_ms": 0.23,
+          "result_rows": 1
+        },
+        {
+          "query": "q3",
+          "warm_median_ms": 27.7,
+          "warm_mad_ms": 1.509,
+          "result_rows": 10
+        },
+        {
+          "query": "q4",
+          "warm_median_ms": 48.912,
+          "warm_mad_ms": 0.656,
+          "result_rows": 1
+        },
+        {
+          "query": "q5",
+          "warm_median_ms": 46.849,
+          "warm_mad_ms": 1.686,
+          "result_rows": 10
+        },
+        {
+          "query": "q6",
+          "warm_median_ms": 29.716,
+          "warm_mad_ms": 0.663,
+          "result_rows": 6
+        },
+        {
+          "query": "range_timestamp",
+          "warm_median_ms": 15.493,
+          "warm_mad_ms": 1.079,
+          "result_rows": 1
+        },
+        {
+          "query": "wide_proj_team",
+          "warm_median_ms": 64.387,
+          "warm_mad_ms": 3.046,
+          "result_rows": 1620376
+        }
+      ],
+      "classification": "dominated"
+    }
+  ]
+}
