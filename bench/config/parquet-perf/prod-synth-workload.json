@@ -1,0 +1,9 @@
+{
+  "dataset_id": "prod-synth-30m",
+  "roles": {
+    "fixed_width_key": "team_id",
+    "high_cardinality_string": "name",
+    "wide_text": "name"
+  },
+  "hot_columns": ["team_id", "timestamp"]
+}

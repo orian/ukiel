@@ -1,0 +1,38 @@
+# Plan 49 dataset descriptor: the 30M, packed, converged-L1+ prod-synth event artifact
+# (the Plan-48-shaped control). The product control is the frozen Ukiel output; the
+# reconstruction control rebuilds its logical rows under the [baseline] policy below.
+#
+# The driver freezes the product snapshot from a plan-46 compaction receipt, then:
+#   parquet-rewrite reconstruct --manifest PRODUCT/manifest.json \
+#     --baseline <this [baseline] table, emitted as a spec> --output ARTIFACTS/reconstruction
+#   parquet-rewrite vary --manifest ARTIFACTS/reconstruction/manifest.json \
+#     --delta compression-zstd-6.toml --output ARTIFACTS/zstd-6
+version = "ukiel-parquet-perf-dataset/v1"
+dataset_id = "prod-synth-30m"
+kind = "prod-synth"
+
+# The resolved product L1+ writer policy the reconstruction control rebuilds under. This is
+# the reconstruction spec `parquet-rewrite reconstruct --baseline` consumes; it includes the
+# product's ZSTD-1 level so the reconstruction is a like-for-like control, and the ZSTD-6
+# child is the only causal delta on top of it.
+[baseline]
+label = "reconstruction"
+row_group_rows = 1048576
+key_boundary_flush = true
+write_batch_rows = 1024
+data_page_bytes = 1048576
+dictionary_page_bytes = 1048576
+statistics = "page"
+offset_index = true
+compression = "zstd(1)"
+
+# Workload role bindings onto the real event columns, consumed by parquet-scan-bench and the
+# SQL class bindings. Roles are generic so the same scenario pack binds here and to ClickBench.
+[workload]
+dataset_id = "prod-synth-30m"
+hot_columns = ["team_id", "timestamp"]
+
+[workload.roles]
+fixed_width_key = "team_id"
+high_cardinality_string = "name"
+wide_text = "name"

@@ -1,0 +1,34 @@
+# Plan 49 dataset descriptor: the deterministic 10M-row ClickBench (hits) slice already
+# specified by Plan 47. The product control is a `parquet-lab-snapshot from-files` freeze of
+# the first sorted hits parquet files summing to ~10M rows; the reconstruction rebuilds those
+# rows under the [baseline] policy, and the ZSTD-6 child is the one causal delta on top.
+#
+#   parquet-lab-snapshot from-files --schema hits-schema.json \
+#     --files-from clickbench-files.txt --logical-schema hits-logical.json \
+#     --output PRODUCT
+#   parquet-rewrite reconstruct --manifest PRODUCT/manifest.json --baseline <[baseline]> ...
+version = "ukiel-parquet-perf-dataset/v1"
+dataset_id = "clickbench-10m"
+kind = "click-bench"
+
+[baseline]
+label = "reconstruction"
+row_group_rows = 1048576
+key_boundary_flush = false
+write_batch_rows = 1024
+data_page_bytes = 1048576
+dictionary_page_bytes = 1048576
+statistics = "page"
+offset_index = true
+compression = "zstd(1)"
+
+# Workload role bindings onto real hits columns. The generic roles bind the same scenario
+# pack that runs on prod-synth, giving ZSTD-6 a cross-workload verdict.
+[workload]
+dataset_id = "clickbench-10m"
+hot_columns = ["CounterID", "EventTime", "URL"]
+
+[workload.roles]
+fixed_width_key = "CounterID"
+high_cardinality_string = "URL"
+wide_text = "Title"

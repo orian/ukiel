@@ -1,0 +1,9 @@
+{
+  "dataset_id": "clickbench-10m",
+  "roles": {
+    "fixed_width_key": "CounterID",
+    "high_cardinality_string": "URL",
+    "wide_text": "Title"
+  },
+  "hot_columns": ["CounterID", "EventTime", "URL"]
+}

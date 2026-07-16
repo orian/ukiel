@@ -1,0 +1,18 @@
+# Plan 49: the one-variable causal candidate.
+#
+# A variant delta against the reconstruction control that changes exactly one physical axis:
+# the compression level, ZSTD-1 -> ZSTD-6. Consumed directly by `parquet-rewrite vary`:
+#
+#   parquet-rewrite vary --manifest RECONSTRUCTION/manifest.json \
+#     --delta bench/config/parquet-perf/compression-zstd-6.toml --output ARTIFACTS/zstd-6
+#
+# `allowed_changes` is the allowlist: the resolver refuses any physical field that moves
+# outside it, so this can never accidentally change a second axis. ZSTD level is not
+# footer-observable, so the resolved manifest is authoritative for the level while the
+# census proves the codec family.
+version = "ukiel-parquet-variant-delta/v1"
+label = "compression-zstd-6"
+allowed_changes = ["global.compression"]
+
+[changes.global]
+compression = "zstd(6)"
