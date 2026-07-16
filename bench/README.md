@@ -1487,3 +1487,33 @@ referenced spec digest, and refuses a missing, duplicate, absolute, traversing, 
 outside-`bench/config/parquet-lab` path, or a duplicate embedded label. A golden test pins
 `minimal-screen.txt` to exactly the 11 registered Plan 48 specs — changing the screen is a
 plan change, not a runtime convenience.
+
+## Plan 49: the paired parquet-performance framework
+
+Plan 49 measures exactly three artifact roles per dataset — a frozen **product control**, a
+**reconstruction control** (the same logical rows rewritten under the resolved baseline
+policy), and a one-variable **`compression-zstd-6`** child — across a small scenario pack, at
+five separately-timed layers (census, writer, raw byte I/O, direct scan, SQL). The offline
+tools are single-purpose and joined only by versioned files; three orchestration scripts tie
+them together:
+
+- **`parquet-perf-run-set.py plan`** emits `ukiel-parquet-perf-run-set/v1`: two seeded,
+  independently shuffled repetitions, each **bracketed** by both the product and the
+  reconstruction control at start and end, with every ZSTD-6 scenario **paired** to the
+  reconstruction scenario of the same id. Sample counts are **frozen from a control pilot**
+  (`warm = clamp(max(7, ceil(3s / control_median)), 64)`), never derived from a variant.
+  `close` binds the produced reports by digest; only a `complete` set is analyzable.
+- **`parquet-perf.sh`** executes one declared entry by dispatching to the layer's tool
+  (`parquet-write-bench`, `file-read-bench`, `parquet-scan-bench`, `parquet-lab-bench`),
+  publishing through a temp file and an atomic rename. It refuses an existing or partially
+  written destination.
+- **`parquet-perf-analyze.py`** validates the artifact/scenario/cache/host/build bindings,
+  reports **product-vs-reconstruction rewrite bias separately**, computes reconstruction-vs-
+  ZSTD-6 **paired ratios per repetition**, and classifies each scenario without pooling
+  different queries into `dominated`, `no-demonstrated-change`, `unstable`,
+  `pareto-candidate`, `workload-specific`, `cache-specific`, or `storage-only`. Timing uses
+  the larger of 5% and the registered control noise; a publishable analysis refuses an
+  unknown host or a dirty/unidentified build.
+
+Tests: `python3 -m unittest bench/tests/test_parquet_perf_run_set.py
+bench/tests/test_parquet_perf_analyze.py` and `bash bench/tests/parquet-perf.sh`.
