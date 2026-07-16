@@ -3361,6 +3361,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "parquet-scan-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "blake3",
+ "bytes",
+ "clap",
+ "libc",
+ "parquet",
+ "parquet-lab-contract",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "parquet-skip-index"
 version = "0.1.0"
 dependencies = [

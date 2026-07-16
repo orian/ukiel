@@ -1,0 +1,29 @@
+[package]
+name = "parquet-scan-bench"
+version.workspace = true
+edition.workspace = true
+description = "L3 direct Arrow/Parquet decode with explicit row-group selection (plan 49): no DataFusion."
+
+# Reads through the pinned Arrow/Parquet reader directly — no DataFusion session, SQL, or
+# logical plan. It binds projection roles from a workload manifest, compiles global
+# row-group ordinals into explicit access plans, and feeds decoded arrays to a typed
+# deterministic checksum sink. No DataFusion, no catalog, no object store, no Ukiel service.
+
+[dependencies]
+parquet-lab-contract = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+libc = { workspace = true }
+blake3 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "parquet-scan-bench"
+path = "src/main.rs"

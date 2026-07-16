@@ -43,6 +43,7 @@ members = [
     "tools/parquet-write-bench",
     "tools/parquet-cachectl",
     "tools/file-read-bench",
+    "tools/parquet-scan-bench",
 ]
 
 [workspace.package]
