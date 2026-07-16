@@ -3303,6 +3303,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "parquet-lab-write-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "bytes",
+ "parquet",
+ "parquet-lab-contract",
+ "parquet-lab-integrity",
+ "serde_json",
+]
+
+[[package]]
 name = "parquet-rewrite"
 version = "0.1.0"
 dependencies = [
@@ -3313,6 +3326,7 @@ dependencies = [
  "parquet",
  "parquet-lab-contract",
  "parquet-lab-integrity",
+ "parquet-lab-write-core",
  "serde",
  "serde_json",
  "tempfile",
@@ -3343,6 +3357,24 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "parquet-lab-contract",
+]
+
+[[package]]
+name = "parquet-write-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "bytes",
+ "clap",
+ "libc",
+ "parquet",
+ "parquet-lab-contract",
+ "parquet-lab-integrity",
+ "parquet-lab-write-core",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

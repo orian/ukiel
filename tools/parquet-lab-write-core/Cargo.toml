@@ -1,0 +1,20 @@
+[package]
+name = "parquet-lab-write-core"
+version.workspace = true
+edition.workspace = true
+description = "Pure Arrow-to-Parquet write + property-resolution core shared by parquet-rewrite and parquet-write-bench (plan 49)."
+
+# A pure library: Arrow + Parquet + the two pure laboratory libraries only. It knows
+# nothing about CLI paths, timing, reports, or experiment selection — it resolves writer
+# properties, applies lossless physical-type projections, writes logical batches to a
+# supplied sink, and reads back what the writer actually did. No DataFusion, no Ukiel
+# service, no object store, no filesystem orchestration.
+
+[dependencies]
+parquet-lab-contract = { workspace = true }
+parquet-lab-integrity = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true }
+bytes = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }

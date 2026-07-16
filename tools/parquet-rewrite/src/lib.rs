@@ -10,7 +10,6 @@ pub mod config;
 pub mod reconstruct;
 pub mod rewrite;
 pub mod spec;
-pub mod types;
 
 use std::collections::BTreeMap;
 use std::path::Path;

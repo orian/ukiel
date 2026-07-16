@@ -1,0 +1,30 @@
+[package]
+name = "parquet-write-bench"
+version.workspace = true
+edition.workspace = true
+description = "L1 isolated Arrow-to-Parquet writer throughput benchmark (plan 49): times only the write."
+
+# Offline. It reads one frozen logical artifact plus a resolved writer configuration,
+# prepares input outside the clock, times only the write, then validates and discards the
+# output outside the clock. Arrow + Parquet + the pure write core + the pure contract only —
+# no DataFusion, no catalog, no object store, no Ukiel service.
+
+[dependencies]
+parquet-lab-contract = { workspace = true }
+parquet-lab-integrity = { workspace = true }
+parquet-lab-write-core = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "parquet-write-bench"
+path = "src/main.rs"

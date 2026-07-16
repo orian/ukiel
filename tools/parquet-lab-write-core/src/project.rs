@@ -15,7 +15,54 @@ use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use parquet_lab_integrity::LogicalType;
 
-use crate::spec::PhysicalType;
+/// A lossless physical-type projection target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalType {
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+    /// Millisecond timestamp, physical Arrow `Timestamp(Millisecond, None)`.
+    TimestampMillis,
+    /// Day-epoch date, physical Arrow `Date32`.
+    Date32,
+}
+
+/// Parse a physical-type projection name. An unsupported name is refused up front.
+pub fn parse_physical_type(s: &str) -> Result<PhysicalType> {
+    Ok(match s {
+        "int8" => PhysicalType::Int8,
+        "int16" => PhysicalType::Int16,
+        "int32" => PhysicalType::Int32,
+        "int64" => PhysicalType::Int64,
+        "timestamp_ms" | "timestamp_millis" => PhysicalType::TimestampMillis,
+        "date32" | "date" => PhysicalType::Date32,
+        other => bail!("unsupported physical type '{other}'"),
+    })
+}
+
+/// Compute the output Arrow schema after applying the projections.
+pub fn projected_schema(input: &Schema, projections: &BTreeMap<String, PhysicalType>) -> Schema {
+    let fields = input
+        .fields()
+        .iter()
+        .map(|f| {
+            let ty = match projections.get(f.name()) {
+                None => f.data_type().clone(),
+                Some(PhysicalType::Int8) => DataType::Int8,
+                Some(PhysicalType::Int16) => DataType::Int16,
+                Some(PhysicalType::Int32) => DataType::Int32,
+                Some(PhysicalType::Int64) => DataType::Int64,
+                Some(PhysicalType::TimestampMillis) => {
+                    DataType::Timestamp(TimeUnit::Millisecond, None)
+                }
+                Some(PhysicalType::Date32) => DataType::Date32,
+            };
+            Arc::new(Field::new(f.name(), ty, f.is_nullable()))
+        })
+        .collect::<Vec<_>>();
+    Schema::new(fields)
+}
 
 /// Validate that every requested projection is lossless and permitted, given the declared
 /// logical types. Runs once up front so a bad projection fails before any file is touched.
@@ -106,10 +153,7 @@ pub fn project_batch(
             }
         }
     }
-    Ok(RecordBatch::try_new(
-        Arc::new(Schema::new(fields)),
-        columns,
-    )?)
+    Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?)
 }
 
 fn project_column(

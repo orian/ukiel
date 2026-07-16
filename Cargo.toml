@@ -34,6 +34,13 @@ members = [
     "tools/parquet-skip-index-core",
     "tools/parquet-skip-index",
     "tools/parquet-lab-store",
+    # Plan 49 (parquet performance framework foundation). A pure Arrow-to-Parquet write
+    # core shared by the rewrite and writer-timing tools, plus single-purpose offline
+    # benches (writer throughput, raw byte I/O, direct scan) and a verified cache
+    # controller. Joined only by the versioned files in `parquet-lab-contract`; no
+    # executable package depends on another executable package.
+    "tools/parquet-lab-write-core",
+    "tools/parquet-write-bench",
 ]
 
 [workspace.package]
@@ -99,10 +106,15 @@ prod-synth-contract = { path = "tools/prod-synth-contract" }
 prod-synth-integrity = { path = "tools/prod-synth-integrity" }
 parquet-lab-contract = { path = "tools/parquet-lab-contract" }
 parquet-lab-integrity = { path = "tools/parquet-lab-integrity" }
+parquet-lab-write-core = { path = "tools/parquet-lab-write-core" }
 parquet-skip-index-core = { path = "tools/parquet-skip-index-core" }
 # Plan 45: the generator must build without a service client in the graph, so it
 # takes its CLI from `clap` and nothing else new.
 clap = { version = "4", features = ["derive"] }
+# Plan 49: getrusage (writer CPU/peak-RSS) and posix_fadvise/mincore (verified local
+# cache profiles) for the offline parquet-performance benches. Syscall shims only; no
+# service, no async runtime.
+libc = "0.2"
 
 # Optimized release build (used by `--release`, incl. the macro perf bench and
 # `ukield`). ThinLTO gives cross-crate inlining across the whole graph

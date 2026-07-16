@@ -12,6 +12,7 @@ description = "Rewrite a laboratory snapshot under one explicit variant spec int
 [dependencies]
 parquet-lab-contract = { workspace = true }
 parquet-lab-integrity = { workspace = true }
+parquet-lab-write-core = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true }
 bytes = { workspace = true }

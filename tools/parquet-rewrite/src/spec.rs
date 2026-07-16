@@ -1,5 +1,6 @@
 //! The variant spec: a versioned TOML declaration of the pinned Parquet 58.3 controls the
-//! matrix varies, resolved into concrete writer properties.
+//! matrix varies. Property *resolution* lives in the shared `parquet-lab-write-core`; this
+//! file is just the TOML shape and its up-front validation.
 //!
 //! An invalid type/encoding/codec combination is a validation error *before* any output is
 //! written — a laboratory never approximates an unsupported setting with a different one.
@@ -7,10 +8,13 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};
-use parquet::basic::{Compression, Encoding, ZstdLevel};
-use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterPropertiesBuilder};
-use parquet::schema::types::ColumnPath;
+use parquet::file::metadata::SortingColumn;
+use parquet::file::properties::WriterProperties;
+use parquet_lab_write_core::{ColumnConfig, WriterConfig};
 use serde::{Deserialize, Serialize};
+
+// The physical-type projection target now lives in the shared write core.
+pub use parquet_lab_write_core::PhysicalType;
 
 /// One variant spec, parsed from TOML.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -79,138 +83,47 @@ impl VariantSpec {
         if spec.label.trim().is_empty() {
             bail!("{path}: spec has no label");
         }
-        // Validate every codec/encoding/stats string up front, before any output.
-        parse_compression(&spec.compression)?;
-        parse_statistics(&spec.statistics)?;
-        for c in &spec.column {
-            if let Some(codec) = &c.compression {
-                parse_compression(codec)?;
-            }
-            if let Some(enc) = &c.encoding {
-                parse_encoding(enc)?;
-            }
-            if let Some(pt) = &c.physical_type {
-                parse_physical_type(pt)?;
-            }
-        }
+        // Validate every codec/encoding/stats/physical-type string up front, before output.
+        spec.to_writer_config()
+            .validate()
+            .map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
         Ok(spec)
+    }
+
+    /// Convert to the shared resolved writer configuration.
+    pub fn to_writer_config(&self) -> WriterConfig {
+        WriterConfig {
+            row_group_rows: self.row_group_rows,
+            key_boundary_flush: self.key_boundary_flush,
+            write_batch_rows: self.write_batch_rows,
+            data_page_bytes: self.data_page_bytes,
+            dictionary_page_bytes: self.dictionary_page_bytes,
+            statistics: self.statistics.clone(),
+            offset_index: self.offset_index,
+            compression: self.compression.clone(),
+            columns: self
+                .column
+                .iter()
+                .map(|c| ColumnConfig {
+                    name: c.name.clone(),
+                    encoding: c.encoding.clone(),
+                    dictionary: c.dictionary,
+                    compression: c.compression.clone(),
+                    bloom_fpp: c.bloom_fpp,
+                    bloom_ndv: c.bloom_ndv,
+                    physical_type: c.physical_type.clone(),
+                })
+                .collect(),
+        }
     }
 
     /// The physical-type projection this spec requests, by column.
     pub fn projections(&self) -> Result<BTreeMap<String, PhysicalType>> {
-        let mut m = BTreeMap::new();
-        for c in &self.column {
-            if let Some(pt) = &c.physical_type {
-                m.insert(c.name.clone(), parse_physical_type(pt)?);
-            }
-        }
-        Ok(m)
+        self.to_writer_config().projections()
     }
 
     /// Resolve to concrete Parquet writer properties.
-    pub fn writer_properties(
-        &self,
-        sorting: Vec<parquet::file::metadata::SortingColumn>,
-    ) -> Result<WriterProperties> {
-        let mut b: WriterPropertiesBuilder = WriterProperties::builder()
-            .set_max_row_group_row_count(Some(self.row_group_rows as usize))
-            .set_write_batch_size(self.write_batch_rows as usize)
-            .set_data_page_size_limit(self.data_page_bytes as usize)
-            .set_dictionary_page_size_limit(self.dictionary_page_bytes as usize)
-            .set_statistics_enabled(parse_statistics(&self.statistics)?)
-            .set_compression(parse_compression(&self.compression)?)
-            .set_offset_index_disabled(!self.offset_index)
-            .set_sorting_columns(Some(sorting));
-
-        for c in &self.column {
-            let path = ColumnPath::from(c.name.clone());
-            if let Some(enc) = &c.encoding {
-                b = b.set_column_encoding(path.clone(), parse_encoding(enc)?);
-            }
-            if let Some(dict) = c.dictionary {
-                b = b.set_column_dictionary_enabled(path.clone(), dict);
-            }
-            if let Some(codec) = &c.compression {
-                b = b.set_column_compression(path.clone(), parse_compression(codec)?);
-            }
-            if let Some(fpp) = c.bloom_fpp {
-                b = b
-                    .set_column_bloom_filter_enabled(path.clone(), true)
-                    .set_column_bloom_filter_fpp(path.clone(), fpp);
-                if let Some(ndv) = c.bloom_ndv {
-                    b = b.set_column_bloom_filter_ndv(path.clone(), ndv);
-                }
-            }
-        }
-        Ok(b.build())
+    pub fn writer_properties(&self, sorting: Vec<SortingColumn>) -> Result<WriterProperties> {
+        self.to_writer_config().writer_properties(sorting)
     }
-}
-
-/// A lossless physical-type projection target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PhysicalType {
-    Int8,
-    Int16,
-    Int32,
-    Int64,
-    /// Millisecond timestamp, physical Arrow `Timestamp(Millisecond, None)`.
-    TimestampMillis,
-    /// Day-epoch date, physical Arrow `Date32`.
-    Date32,
-}
-
-fn parse_physical_type(s: &str) -> Result<PhysicalType> {
-    Ok(match s {
-        "int8" => PhysicalType::Int8,
-        "int16" => PhysicalType::Int16,
-        "int32" => PhysicalType::Int32,
-        "int64" => PhysicalType::Int64,
-        "timestamp_ms" | "timestamp_millis" => PhysicalType::TimestampMillis,
-        "date32" | "date" => PhysicalType::Date32,
-        other => bail!("unsupported physical type '{other}'"),
-    })
-}
-
-fn parse_statistics(s: &str) -> Result<EnabledStatistics> {
-    Ok(match s {
-        "none" => EnabledStatistics::None,
-        "chunk" => EnabledStatistics::Chunk,
-        "page" => EnabledStatistics::Page,
-        other => bail!("unsupported statistics mode '{other}' (none|chunk|page)"),
-    })
-}
-
-fn parse_compression(s: &str) -> Result<Compression> {
-    let s = s.trim().to_lowercase();
-    if s == "lz4_raw" {
-        return Ok(Compression::LZ4_RAW);
-    }
-    if s == "snappy" {
-        return Ok(Compression::SNAPPY);
-    }
-    if s == "uncompressed" {
-        return Ok(Compression::UNCOMPRESSED);
-    }
-    if s == "zstd" {
-        return Ok(Compression::ZSTD(ZstdLevel::try_new(3)?));
-    }
-    if let Some(rest) = s.strip_prefix("zstd(").and_then(|r| r.strip_suffix(')')) {
-        let level: i32 = rest
-            .parse()
-            .map_err(|_| anyhow::anyhow!("bad zstd level '{rest}'"))?;
-        return Ok(Compression::ZSTD(ZstdLevel::try_new(level)?));
-    }
-    bail!("unsupported compression '{s}' (zstd(N)|lz4_raw|snappy|uncompressed)")
-}
-
-fn parse_encoding(s: &str) -> Result<Encoding> {
-    Ok(match s {
-        "plain" => Encoding::PLAIN,
-        "delta_binary_packed" => Encoding::DELTA_BINARY_PACKED,
-        "delta_length_byte_array" => Encoding::DELTA_LENGTH_BYTE_ARRAY,
-        "delta_byte_array" => Encoding::DELTA_BYTE_ARRAY,
-        "byte_stream_split" => Encoding::BYTE_STREAM_SPLIT,
-        "rle" => Encoding::RLE,
-        other => bail!("unsupported encoding '{other}'"),
-    })
 }
