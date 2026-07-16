@@ -1901,6 +1901,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "file-read-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "libc",
+ "parquet-lab-contract",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3193,6 +3207,19 @@ dependencies = [
  "tokio",
  "twox-hash",
  "zstd",
+]
+
+[[package]]
+name = "parquet-cachectl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "parquet-lab-contract",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

@@ -1,0 +1,26 @@
+[package]
+name = "file-read-bench"
+version.workspace = true
+edition.workspace = true
+description = "L2 raw byte/range read benchmark to a checksum sink (plan 49): never parses Parquet."
+
+# Offline and Parquet-blind by construction: it reads immutable file bytes and ranges into a
+# BLAKE3 checksum sink and records I/O accounting. It establishes the backend/cache ceiling
+# so a codec result is never mistaken for a disk fluctuation. No arrow, no parquet, no
+# service, no invocation of another executable.
+
+[dependencies]
+parquet-lab-contract = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+libc = { workspace = true }
+blake3 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "file-read-bench"
+path = "src/main.rs"

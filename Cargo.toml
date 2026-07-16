@@ -41,6 +41,8 @@ members = [
     # executable package depends on another executable package.
     "tools/parquet-lab-write-core",
     "tools/parquet-write-bench",
+    "tools/parquet-cachectl",
+    "tools/file-read-bench",
 ]
 
 [workspace.package]

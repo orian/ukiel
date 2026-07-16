@@ -1,0 +1,24 @@
+[package]
+name = "parquet-cachectl"
+version.workspace = true
+edition.workspace = true
+description = "Prepare and verify one local OS-page-cache profile over explicit benchmark files (plan 49)."
+
+# Offline and Parquet-blind: it never opens a Parquet footer and never invokes another
+# executable. It reads/evicts explicit files, probes page residency with mincore, and emits
+# a verified cache receipt. libc for mincore/posix_fadvise; the contract for the receipt.
+
+[dependencies]
+parquet-lab-contract = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "parquet-cachectl"
+path = "src/main.rs"
