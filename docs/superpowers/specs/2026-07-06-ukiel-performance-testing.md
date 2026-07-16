@@ -5,6 +5,12 @@ Companion to `2026-07-05-ukiel-testing-design.md` (correctness) and
 That map's rule — *every optimization ships with a number* — needs a
 methodology behind it; this document is that methodology.
 
+For experiments over Parquet physical representation, this tiering document is
+specialized by `2026-07-16-ukiel-parquet-performance-framework.md`. That
+framework separates physical bytes, raw writer, raw I/O, Parquet decode/pruning,
+SQL, and verified cache states, and requires both product and reconstruction
+controls for causal one-variable comparisons.
+
 ## Philosophy
 
 1. **Measure what users feel and what ops pays for.** User-felt: query
