@@ -9,12 +9,36 @@ already exists — it cannot generate, rewrite, index, or compact one.
 parquet-lab-bench compile --manifest SNAPSHOT.json --kind prod-synth|click-bench \
   --sql QUERIES.sql --suite-out SUITE.json
 
+# Compile the seven registered Plan-49 query classes bound onto real columns. Each class
+# carries its required columns, sink, and predicate shape so the run-time plan guard can
+# prove the optimizer measured the declared work.
+parquet-lab-bench compile-classes --manifest SNAPSHOT.json --kind prod-synth|click-bench \
+  --bindings CLASS_BINDINGS.json --suite-out SUITE.json
+
 # Run a suite over an artifact and write a result report.
 parquet-lab-bench run --manifest FILE --suite SUITE.json --result RESULT.json \
   --mode memory|local|object-store --cold-iters 1 --warm-iters 5 [--skip-manifest DIR/skip.json] \
+  [--cache-receipt DIR/cache.json] \
   [--no-page-index] [--no-pruning] [--no-pushdown-filters] [--no-reorder-filters] \
   [--no-bloom-filter-on-read]
 ```
+
+## Plan 49: query classes, the plan guard, and honest cache/session vocabulary
+
+The seven registered query classes — full numeric scan, full string scan, hot-set scan,
+all-column scan, aligned selective/narrow, scattered selective, and absent predicate — each
+declare the columns their plan must project, the sink that forces the work, and the
+predicate shape they realize. Before any timing is trusted, the **plan guard** asserts the
+optimized physical plan actually did that work: it rejects a plan that answered from
+metadata (a `count(*)` fast path projecting no columns), dropped a required projection, or
+returned the full result set where an aggregate/checksum sink was declared. `count(*)`
+survives only when explicitly labelled a metadata control.
+
+Report vocabulary names what it physically is. A fresh DataFusion session (empty metadata
+cache) is `fresh_session_ms`; a reused session is `reused_session_ms`. Neither says anything
+about the OS page cache — so an "OS cold/warm" claim is backed only by a
+`--cache-receipt` (a verified `ukiel-parquet-cache-receipt/v1`), whose digest, profile, and
+measured residency are bound into the report under `cache`. There is no `cold_ms`/`warm_ms`.
 
 ## How answers stay comparable
 

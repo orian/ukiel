@@ -138,6 +138,9 @@ fn suite() -> Suite {
             sql: "SELECT count(*) FROM events WHERE team_id = 900".into(),
             expected_result_digest: "ab".repeat(32),
             result_semantics: ResultSemantics::Ordered,
+            required_columns: vec!["team_id".into()],
+            sink: parquet_lab_contract::QuerySink::Aggregate,
+            predicate_shape: parquet_lab_contract::PredicateShape::Aligned,
         }],
         probes: vec![Probe {
             name: "eq_0.001".into(),

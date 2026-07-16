@@ -64,6 +64,41 @@ pub enum SuiteKind {
     ClickBench,
 }
 
+/// The sink a query's result flows into — the thing that forces the intended work to
+/// actually happen and stops a large result set from dominating the timing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuerySink {
+    /// A SQL aggregate (sum/count/group) that forces column decode without returning rows.
+    #[default]
+    Aggregate,
+    /// A benchmark checksum over every projected value.
+    Checksum,
+    /// A row/value count. Only a labelled metadata-path negative control may use this.
+    Count,
+    /// A full result set is intentionally materialized (a materialization scenario).
+    RowSet,
+}
+
+/// The predicate shape a query realizes, declared so the plan guard knows what to enforce.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PredicateShape {
+    /// No predicate: a full scan of the required columns.
+    #[default]
+    FullScan,
+    /// Matches concentrated in prunable row groups.
+    Aligned,
+    /// The same match count spread across every row group.
+    Scattered,
+    /// Zero matches — metadata/index rejection.
+    Absent,
+    /// A group-by aggregation.
+    GroupBy,
+    /// A metadata fast path (`count(*)`), explicitly labelled — never called a scan.
+    Metadata,
+}
+
 /// One named query. The SQL runs against the declared logical projection, so a
 /// physical-type variant answers the identical query without a rewrite.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +111,17 @@ pub struct Query {
     /// How the answer is compared. Defaults to `Ordered` (a scalar aggregate).
     #[serde(default)]
     pub result_semantics: ResultSemantics,
+    /// The columns the query's plan must actually project. The plan guard rejects a plan
+    /// that drops one of these (it would have measured the wrong work). Empty for a legacy
+    /// plan-47/48 query with no declared class.
+    #[serde(default)]
+    pub required_columns: Vec<String>,
+    /// The sink that forces the work.
+    #[serde(default)]
+    pub sink: QuerySink,
+    /// The predicate shape the query realizes.
+    #[serde(default)]
+    pub predicate_shape: PredicateShape,
 }
 
 /// A compiled probe: a structured predicate at a measured selectivity band, with its

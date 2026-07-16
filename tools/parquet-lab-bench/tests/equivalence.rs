@@ -16,6 +16,7 @@ fn params() -> RunParams {
         reader_flags: ReaderFlags::default(),
         run_order: 0,
         skip_manifest: None,
+        cache_receipt: None,
     }
 }
 

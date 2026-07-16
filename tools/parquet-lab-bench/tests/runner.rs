@@ -45,6 +45,7 @@ async fn compile_then_run_produces_a_bound_result_report() {
             reader_flags: ReaderFlags::default(),
             run_order: 0,
             skip_manifest: None,
+            cache_receipt: None,
         },
         false,
     )
@@ -62,7 +63,7 @@ async fn compile_then_run_produces_a_bound_result_report() {
     assert_eq!(queries.len(), 3);
     for q in queries {
         assert_eq!(q["expected_match"], serde_json::json!(true));
-        assert_eq!(q["warm_ms"].as_array().unwrap().len(), 5);
+        assert_eq!(q["reused_session_ms"].as_array().unwrap().len(), 5);
         assert!(
             q["plan"].as_str().unwrap().contains("Exec"),
             "a physical plan was captured"
@@ -87,6 +88,7 @@ async fn a_report_will_not_overwrite_without_replace() {
         reader_flags: ReaderFlags::default(),
         run_order: 0,
         skip_manifest: None,
+        cache_receipt: None,
     };
     parquet_lab_bench::run(&mp, &suite_out, &result, params(), false)
         .await

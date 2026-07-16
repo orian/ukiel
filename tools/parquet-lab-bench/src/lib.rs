@@ -8,6 +8,7 @@
 
 pub mod compare;
 pub mod counting_store;
+pub mod plan_guard;
 pub mod runner;
 pub mod skip;
 pub mod skip_scan;
@@ -208,16 +209,93 @@ pub async fn compile_suite(
     Ok(())
 }
 
+/// Compile a suite from the seven registered Plan-49 query classes, bound onto real columns
+/// by a class-bindings file. Each class carries its required columns, sink, and predicate
+/// shape, so the run-time plan guard can prove the optimizer measured the declared work.
+pub async fn compile_classes(
+    control_manifest_path: &Path,
+    kind: SuiteKind,
+    bindings_path: &Path,
+    suite_out: &Path,
+    replace: bool,
+) -> Result<()> {
+    if suite_out.exists() && !replace {
+        bail!("{} already exists; pass --replace", suite_out.display());
+    }
+    let snap_bytes = std::fs::read(control_manifest_path)
+        .with_context(|| format!("reading {}", control_manifest_path.display()))?;
+    let snapshot =
+        SnapshotManifest::parse(&control_manifest_path.display().to_string(), &snap_bytes)?;
+    let view_sql = suites::build_view_sql(&snapshot)?;
+
+    let bindings_bytes = std::fs::read(bindings_path)
+        .with_context(|| format!("reading {}", bindings_path.display()))?;
+    let bindings: suites::classes::ClassBindings = serde_json::from_slice(&bindings_bytes)
+        .with_context(|| format!("{}: not class bindings", bindings_path.display()))?;
+    let classes = suites::classes::seven_classes(&bindings)?;
+
+    let (artifact, _) = load_artifact(control_manifest_path)?;
+    let session = artifact
+        .session(Mode::Local, ReaderFlags::default(), &view_sql)
+        .await?;
+
+    let mut queries = Vec::with_capacity(classes.len());
+    for c in classes {
+        let run = run_query(&session, &c.sql).await?;
+        let digest = compare::result_digest(
+            &run.schema,
+            &run.batches,
+            parquet_lab_contract::ResultSemantics::Ordered,
+        )?;
+        // The plan guard must accept the control's own plan, or the class is mis-declared.
+        let plan = runner::physical_plan(&session, &c.sql).await?;
+        plan_guard::assert_physical_plan(&c.name, &plan, &c.required_columns, c.sink, c.predicate_shape)
+            .with_context(|| format!("class '{}' is mis-declared against the control", c.name))?;
+        queries.push(parquet_lab_contract::Query {
+            name: c.name,
+            sql: c.sql,
+            expected_result_digest: digest,
+            result_semantics: parquet_lab_contract::ResultSemantics::Ordered,
+            required_columns: c.required_columns,
+            sink: c.sink,
+            predicate_shape: c.predicate_shape,
+        });
+    }
+
+    let suite = Suite {
+        suite_version: parquet_lab_contract::SUITE_VERSION.to_string(),
+        kind,
+        view_sql,
+        queries,
+        probes: Vec::new(),
+        skipped_probes: Vec::new(),
+    };
+    suite.validate(&suite_out.display().to_string())?;
+    write_atomic(suite_out, &serde_json::to_vec_pretty(&suite)?)?;
+    Ok(())
+}
+
 /// The run parameters.
+///
+/// `cold_iters`/`warm_iters` name what they physically are — the number of *fresh-session*
+/// and *reused-session* samples. The report vocabulary uses those honest names; a fresh
+/// DataFusion session has an empty metadata cache but says nothing about the OS page cache,
+/// which is why a `cache_receipt` (not the word "cold") is what backs a cache-state claim.
 pub struct RunParams {
     pub mode: Mode,
+    /// Fresh-session sample count (a new session, empty metadata cache, each time).
     pub cold_iters: usize,
+    /// Reused-session sample count (one session, warm metadata cache).
     pub warm_iters: usize,
     pub reader_flags: ReaderFlags,
     pub run_order: u32,
     /// An optional experimental skip-index sidecar to price against native pruning. It is
     /// verified bound to the variant being measured before it is credited.
     pub skip_manifest: Option<std::path::PathBuf>,
+    /// The verified OS-cache profile this run executed under. Its digest and residency are
+    /// bound into the report so a cache-state claim is provable; a fresh session alone is
+    /// never called "OS cold".
+    pub cache_receipt: Option<std::path::PathBuf>,
 }
 
 /// Run a suite over an artifact and write the result report.
@@ -237,6 +315,37 @@ pub async fn run(
     let suite = Suite::parse(&suite_path.display().to_string(), &suite_bytes)?;
 
     let (artifact, identity) = load_artifact(manifest_path)?;
+
+    // Bind the verified OS-cache profile, if one was supplied. A fresh DataFusion session is
+    // never dressed up as "OS cold" without a valid, matching receipt.
+    let manifest_digest = digest_bytes(&std::fs::read(manifest_path)?);
+    let cache_binding: Option<serde_json::Value> = match &params.cache_receipt {
+        None => None,
+        Some(rp) => {
+            let rb = std::fs::read(rp).with_context(|| format!("reading {}", rp.display()))?;
+            let receipt =
+                parquet_lab_contract::CacheReceipt::parse(&rp.display().to_string(), &rb)?;
+            if !receipt.is_usable() {
+                bail!(
+                    "cache receipt {} is invalid ({:?} was not achieved); refusing to bind an \
+                     unachieved cache state to a timing",
+                    rp.display(),
+                    receipt.requested_profile
+                );
+            }
+            if receipt.target_manifest_digest != manifest_digest {
+                bail!(
+                    "cache receipt was prepared for a different artifact ({} != {manifest_digest})",
+                    receipt.target_manifest_digest
+                );
+            }
+            Some(serde_json::json!({
+                "receipt_digest": digest_bytes(&rb),
+                "profile": format!("{:?}", receipt.requested_profile),
+                "residency_after": receipt.residency_after.resident_fraction,
+            }))
+        }
+    };
 
     // A skip sidecar, if given, is bound to the variant and priced. Only a variant carries
     // the output file digests a sidecar binds to.
@@ -259,6 +368,9 @@ pub async fn run(
         sql: String,
         expected: String,
         semantics: parquet_lab_contract::ResultSemantics,
+        required_columns: Vec<String>,
+        sink: parquet_lab_contract::QuerySink,
+        predicate_shape: parquet_lab_contract::PredicateShape,
     }
     let mut runnables: Vec<Runnable> = suite
         .queries
@@ -268,6 +380,9 @@ pub async fn run(
             sql: q.sql.clone(),
             expected: q.expected_result_digest.clone(),
             semantics: q.result_semantics,
+            required_columns: q.required_columns.clone(),
+            sink: q.sink,
+            predicate_shape: q.predicate_shape,
         })
         .collect();
     for p in &suite.probes {
@@ -276,13 +391,16 @@ pub async fn run(
             sql: p.sql.clone(),
             expected: p.expected_result_digest.clone(),
             semantics: p.result_semantics,
+            required_columns: Vec::new(),
+            sink: parquet_lab_contract::QuerySink::default(),
+            predicate_shape: parquet_lab_contract::PredicateShape::default(),
         });
     }
 
     let mut query_reports = Vec::new();
     for q in &runnables {
-        // Cold iterations: a fresh session (empty metadata cache) each time.
-        let mut cold_ms = Vec::with_capacity(params.cold_iters);
+        // Fresh-session samples: a new session (empty metadata cache) each time.
+        let mut fresh_session_ms = Vec::with_capacity(params.cold_iters);
         let mut result_digest = String::new();
         let mut result_rows = 0usize;
         for _ in 0..params.cold_iters.max(1) {
@@ -292,10 +410,10 @@ pub async fn run(
             let run = run_query(&session, &q.sql).await?;
             result_digest = compare::result_digest(&run.schema, &run.batches, q.semantics)?;
             result_rows = compare::row_count(&run.batches);
-            cold_ms.push(run.elapsed_ms);
+            fresh_session_ms.push(run.elapsed_ms);
         }
 
-        // Correctness gate: the answer must equal the control's before any warm timing.
+        // Correctness gate: the answer must equal the control's before any timing is trusted.
         if !q.expected.is_empty() && result_digest != q.expected {
             bail!(
                 "query '{}' returned a different answer than the control (digest {} != {}). The \
@@ -306,28 +424,41 @@ pub async fn run(
             );
         }
 
-        // Warm iterations reuse one session.
+        // Reused-session samples reuse one session.
         let session = artifact
             .session(params.mode, params.reader_flags, &suite.view_sql)
             .await?;
-        let mut warm_ms = Vec::with_capacity(params.warm_iters);
+        let mut reused_session_ms = Vec::with_capacity(params.warm_iters);
         let mut io = None;
         for _ in 0..params.warm_iters.max(1) {
             let run = run_query(&session, &q.sql).await?;
-            warm_ms.push(run.elapsed_ms);
+            reused_session_ms.push(run.elapsed_ms);
             io = run.io;
         }
         let plan = runner::physical_plan(&session, &q.sql).await?;
 
+        // Physical-plan assertion: the optimizer must not have removed the declared work.
+        // A failure rejects the timing (a query with no declared class is a no-op here).
+        plan_guard::assert_physical_plan(
+            &q.name,
+            &plan,
+            &q.required_columns,
+            q.sink,
+            q.predicate_shape,
+        )?;
+
         query_reports.push(serde_json::json!({
             "name": q.name,
             "sql": q.sql,
-            "cold_ms": cold_ms,
-            "warm_ms": warm_ms,
-            "warm_median_ms": median(&warm_ms),
+            "fresh_session_ms": fresh_session_ms,
+            "reused_session_ms": reused_session_ms,
+            "reused_session_median_ms": median(&reused_session_ms),
             "result_digest": result_digest,
             "result_rows": result_rows,
             "expected_match": q.expected.is_empty() || result_digest == q.expected,
+            "sink": format!("{:?}", q.sink),
+            "predicate_shape": format!("{:?}", q.predicate_shape),
+            "plan_assertion_passed": true,
             "io": io,
             "plan": plan,
         }));
@@ -358,8 +489,11 @@ pub async fn run(
         body: serde_json::json!({
             "mode": match params.mode { Mode::Memory => "memory", Mode::Local => "local", Mode::ObjectStore => "object-store" },
             "reader_flags": params.reader_flags,
-            "cold_iters": params.cold_iters,
-            "warm_iters": params.warm_iters,
+            "fresh_session_samples": params.cold_iters,
+            "reused_session_samples": params.warm_iters,
+            // The OS-cache profile this run ran under, backed by a verified receipt. `null`
+            // means no cache state was pinned — an exploratory run, never an "OS cold" claim.
+            "cache": cache_binding,
             "skip_index": skip_cost,
             "queries": query_reports,
         }),

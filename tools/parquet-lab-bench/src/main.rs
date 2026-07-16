@@ -49,6 +49,20 @@ enum Command {
         #[arg(long)]
         replace: bool,
     },
+    /// Compile a suite from the seven registered Plan-49 query classes bound onto columns.
+    CompileClasses {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long, value_enum)]
+        kind: SuiteKindArg,
+        /// A JSON class-bindings file mapping the class roles onto real columns.
+        #[arg(long)]
+        bindings: PathBuf,
+        #[arg(long)]
+        suite_out: PathBuf,
+        #[arg(long)]
+        replace: bool,
+    },
     /// Compile a suite with queries AND structured selectivity probes against the control.
     CompileSuite {
         #[arg(long)]
@@ -95,6 +109,11 @@ enum Command {
         /// An experimental skip-index sidecar (`skip.json`) to price against native pruning.
         #[arg(long)]
         skip_manifest: Option<PathBuf>,
+        /// A verified `ukiel-parquet-cache-receipt/v1` pinning the OS-cache profile this run
+        /// executed under. Its digest and residency are bound into the report; a fresh
+        /// session is never called "OS cold" without one.
+        #[arg(long)]
+        cache_receipt: Option<PathBuf>,
         /// Repetition number, when driven by a run set (Task 47E). Unsupported until then.
         #[arg(long)]
         rep: Option<u32>,
@@ -143,6 +162,22 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             println!("wrote suite {}", suite_out.display());
             Ok(())
         }
+        Command::CompileClasses {
+            manifest,
+            kind,
+            bindings,
+            suite_out,
+            replace,
+        } => {
+            let kind = match kind {
+                SuiteKindArg::ProdSynth => parquet_lab_contract::SuiteKind::ProdSynth,
+                SuiteKindArg::ClickBench => parquet_lab_contract::SuiteKind::ClickBench,
+            };
+            parquet_lab_bench::compile_classes(&manifest, kind, &bindings, &suite_out, replace)
+                .await?;
+            println!("wrote class suite {}", suite_out.display());
+            Ok(())
+        }
         Command::CompileSuite {
             manifest,
             kind,
@@ -174,6 +209,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             no_reorder_filters,
             no_bloom_filter_on_read,
             skip_manifest,
+            cache_receipt,
             rep,
             seed,
             store_receipt,
@@ -208,6 +244,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 },
                 run_order,
                 skip_manifest,
+                cache_receipt,
             };
             parquet_lab_bench::run(&manifest, &suite, &result, params, replace).await?;
             println!("wrote result {}", result.display());

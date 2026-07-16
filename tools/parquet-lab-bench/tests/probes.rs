@@ -126,6 +126,7 @@ async fn compile_suite_materializes_probes_and_records_skips() {
             reader_flags: ReaderFlags::default(),
             run_order: 0,
             skip_manifest: None,
+            cache_receipt: None,
         },
         false,
     )

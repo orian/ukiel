@@ -5,6 +5,7 @@
 //! control. Queries are imported *as data* — from a `.sql` file — never by calling another
 //! executable's handler.
 
+pub mod classes;
 pub mod clickbench;
 pub mod probes;
 pub mod prod_synth;
@@ -107,5 +108,8 @@ pub fn to_query(name: String, sql: String, expected_result_digest: String) -> Qu
         sql,
         expected_result_digest,
         result_semantics: parquet_lab_contract::ResultSemantics::Ordered,
+        required_columns: Vec::new(),
+        sink: parquet_lab_contract::QuerySink::default(),
+        predicate_shape: parquet_lab_contract::PredicateShape::default(),
     }
 }

@@ -54,8 +54,8 @@ pub use snapshot::{
 };
 pub use store::{STORE_RECEIPT_VERSION, StoreObject, StoreReceipt};
 pub use suite::{
-    PROBES_VERSION, Probe, ProbeFamily, ProbeSkipReason, Query, ResultSemantics, SUITE_VERSION,
-    SkippedProbe, Suite, SuiteKind, TypedLiteral,
+    PROBES_VERSION, PredicateShape, Probe, ProbeFamily, ProbeSkipReason, Query, QuerySink,
+    ResultSemantics, SUITE_VERSION, SkippedProbe, Suite, SuiteKind, TypedLiteral,
 };
 pub use variant::{
     ColumnProperties, VARIANT_MANIFEST_VERSION, VariantFileMap, VariantManifest, WriterProperties,
