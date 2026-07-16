@@ -10,10 +10,10 @@ use anyhow::{Result, bail};
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterPropertiesBuilder};
 use parquet::schema::types::ColumnPath;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// One variant spec, parsed from TOML.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VariantSpec {
     /// A human label, unique within a matrix block.
     pub label: String,
@@ -60,7 +60,7 @@ fn default_compression() -> String {
 }
 
 /// Per-column overrides. A column absent here inherits the global properties.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ColumnSpec {
     pub name: String,
     pub encoding: Option<String>,

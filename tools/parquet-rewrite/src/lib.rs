@@ -6,6 +6,8 @@
 //! publishes the variant manifest only after the logical fingerprint over the rewritten
 //! rows equals the snapshot's — a mismatch invalidates the entire variant.
 
+pub mod config;
+pub mod reconstruct;
 pub mod rewrite;
 pub mod spec;
 pub mod types;
@@ -23,10 +25,12 @@ use parquet_lab_integrity::{LogicalColumn, LogicalRowMultiset, LogicalSchema, Lo
 use crate::rewrite::{ResolvedColumn, rewrite_file};
 use crate::spec::VariantSpec;
 
+pub use reconstruct::{run_reconstruct, run_vary};
+
 /// Build the declared logical schema (physical column order) and the name→type map from a
 /// snapshot manifest, so the rewrite folds the fingerprint under exactly the snapshot's
 /// declared types.
-fn declared_from_manifest(
+pub(crate) fn declared_from_manifest(
     manifest: &SnapshotManifest,
 ) -> Result<(LogicalSchema, BTreeMap<String, LogicalType>)> {
     let proj = manifest
@@ -206,6 +210,13 @@ fn prepare_output(output_dir: &Path, tmp_dir: &Path, replace: bool) -> Result<()
     }
     std::fs::create_dir_all(tmp_dir)?;
     Ok(())
+}
+
+pub(crate) fn merge_resolved_pub(
+    into: &mut BTreeMap<String, ResolvedColumn>,
+    from: BTreeMap<String, ResolvedColumn>,
+) {
+    merge_resolved(into, from)
 }
 
 fn merge_resolved(

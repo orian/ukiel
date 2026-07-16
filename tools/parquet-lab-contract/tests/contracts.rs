@@ -626,3 +626,293 @@ fn the_extended_report_identity_round_trips() {
     assert_eq!(back.identity.seed, Some(7));
     assert_eq!(back.identity.backend.as_deref(), Some("local"));
 }
+
+// -- Plan 49: causal experiment, scenario, and cache contracts ---------------
+
+use parquet_lab_contract::{
+    Backend, CacheProfile, CacheReceipt, ExperimentManifest, Layer, ProjectionRole,
+    ReconstructionManifest, Residency, ResolvedConfig, ResultSink, RewriteBias, RowGroupSelection,
+    SamplePolicy, ScenarioManifest, VariantDeltaManifest, WorkloadBinding, is_known_config_path,
+};
+
+fn resolved(compression: &str) -> ResolvedConfig {
+    let mut m = std::collections::BTreeMap::new();
+    m.insert("global.row_group_rows".into(), serde_json::json!(1_000_000));
+    m.insert("global.data_page_bytes".into(), serde_json::json!(1 << 20));
+    m.insert("global.statistics".into(), serde_json::json!("page"));
+    m.insert("global.compression".into(), serde_json::json!(compression));
+    ResolvedConfig::new(m)
+}
+
+fn file_map() -> VariantFileMap {
+    VariantFileMap {
+        input: FileDigest::of("product/part-00000.parquet", b"in"),
+        output: FileDigest::of("parquet/part-00000.parquet", b"out"),
+        input_rows: 100,
+        output_rows: 100,
+        footer_summary: serde_json::json!({"row_groups": 1}),
+    }
+}
+
+fn reconstruction() -> ReconstructionManifest {
+    ReconstructionManifest {
+        reconstruction_version: parquet_lab_contract::RECONSTRUCTION_VERSION.into(),
+        parent_product_digest: "prod".repeat(16),
+        baseline_spec_digest: "ba5e".repeat(16),
+        label: "reconstruction".into(),
+        requested_config: resolved("zstd(1)"),
+        resolved_config: resolved("zstd(1)"),
+        logical_projection: {
+            let mut m = serde_json::Map::new();
+            m.insert("team_id".into(), serde_json::json!("int64"));
+            m
+        },
+        sort_key: vec!["team_id".into()],
+        physical_schema: serde_json::json!({"fields": []}),
+        logical_fingerprint: logical_fp(),
+        files: vec![file_map()],
+        input_census: serde_json::json!({"total_bytes": 5000}),
+        output_census: serde_json::json!({"total_bytes": 4800}),
+        rewrite_bias: RewriteBias {
+            product_total_bytes: 5000,
+            reconstruction_total_bytes: 4800,
+            per_column: serde_json::json!({}),
+        },
+    }
+}
+
+fn zstd6_delta() -> VariantDeltaManifest {
+    let mut changes = std::collections::BTreeMap::new();
+    changes.insert("global.compression".into(), serde_json::json!("zstd(6)"));
+    VariantDeltaManifest {
+        delta_version: parquet_lab_contract::VARIANT_DELTA_VERSION.into(),
+        parent_reconstruction_digest: "reco".repeat(16),
+        label: "compression-zstd-6".into(),
+        allowed_changes: vec!["global.compression".into()],
+        changes,
+        resolved_config: resolved("zstd(6)"),
+        logical_fingerprint: logical_fp(),
+        files: vec![file_map()],
+        input_census: serde_json::json!({}),
+        output_census: serde_json::json!({}),
+    }
+}
+
+fn scenario() -> ScenarioManifest {
+    ScenarioManifest {
+        scenario_version: parquet_lab_contract::SCENARIO_VERSION.into(),
+        id: "l3-scan-wide_text-10pct_sparse".into(),
+        layer: Layer::Scan,
+        projection: Some(ProjectionRole::WideText),
+        selection: Some(RowGroupSelection::TenPercentSparse),
+        query: None,
+        sink: Some(ResultSink::Checksum),
+        backend: Backend::Local,
+        cache_profile: CacheProfile::LocalOsWarm,
+        sample_policy: SamplePolicy {
+            warm_min: 7,
+            warm_target_seconds: 3.0,
+            warm_cap: 50,
+            cold_min: 3,
+        },
+    }
+}
+
+fn cache_receipt(profile: CacheProfile, resident_after: f64, valid: bool) -> CacheReceipt {
+    CacheReceipt {
+        receipt_version: parquet_lab_contract::CACHE_RECEIPT_VERSION.into(),
+        target_manifest_digest: "reco".repeat(16),
+        target_files: vec![FileDigest::of("parquet/part-00000.parquet", b"out")],
+        requested_profile: profile,
+        preparation_method: "posix_fadvise(DONTNEED)+mincore".into(),
+        residency_before: Residency { resident_fraction: 1.0, pages_probed: 1000 },
+        residency_after: Residency { resident_fraction: resident_after, pages_probed: 1000 },
+        warm_floor: Some(0.90),
+        cold_ceiling: Some(0.10),
+        valid,
+    }
+}
+
+fn experiment() -> ExperimentManifest {
+    ExperimentManifest {
+        experiment_version: parquet_lab_contract::EXPERIMENT_VERSION.into(),
+        experiment_id: "plan49".into(),
+        workload: WorkloadBinding {
+            dataset_id: "prod-synth-30m".into(),
+            roles: {
+                let mut m = serde_json::Map::new();
+                m.insert("fixed_width_key".into(), serde_json::json!("team_id"));
+                m
+            },
+            hot_columns: vec!["team_id".into(), "timestamp".into()],
+        },
+        product_digest: "prod".repeat(16),
+        reconstruction_digest: "reco".repeat(16),
+        variant_delta_digests: vec!["z6de".repeat(16)],
+        scenario_digests: vec!["5cen".repeat(16)],
+        run_set_digest: None,
+    }
+}
+
+#[test]
+fn every_causal_contract_round_trips() {
+    let r = reconstruction();
+    assert_eq!(r, ReconstructionManifest::parse("r", &serde_json::to_vec_pretty(&r).unwrap()).unwrap());
+    let d = zstd6_delta();
+    assert_eq!(d, VariantDeltaManifest::parse("d", &serde_json::to_vec_pretty(&d).unwrap()).unwrap());
+    let s = scenario();
+    assert_eq!(s, ScenarioManifest::parse("s", &serde_json::to_vec_pretty(&s).unwrap()).unwrap());
+    let c = cache_receipt(CacheProfile::LocalOsCold, 0.05, true);
+    assert_eq!(c, CacheReceipt::parse("c", &serde_json::to_vec_pretty(&c).unwrap()).unwrap());
+    let e = experiment();
+    assert_eq!(e, ExperimentManifest::parse("e", &serde_json::to_vec_pretty(&e).unwrap()).unwrap());
+}
+
+#[test]
+fn causal_contract_versions_fail_closed() {
+    let mut v = serde_json::to_value(reconstruction()).unwrap();
+    v["reconstruction_version"] = serde_json::json!("x");
+    assert!(matches!(ReconstructionManifest::parse("r", &serde_json::to_vec(&v).unwrap()).unwrap_err(), ContractError::Version { .. }));
+    let mut v = serde_json::to_value(zstd6_delta()).unwrap();
+    v["delta_version"] = serde_json::json!("x");
+    assert!(matches!(VariantDeltaManifest::parse("d", &serde_json::to_vec(&v).unwrap()).unwrap_err(), ContractError::Version { .. }));
+    let mut v = serde_json::to_value(scenario()).unwrap();
+    v["scenario_version"] = serde_json::json!("x");
+    assert!(matches!(ScenarioManifest::parse("s", &serde_json::to_vec(&v).unwrap()).unwrap_err(), ContractError::Version { .. }));
+    let mut v = serde_json::to_value(cache_receipt(CacheProfile::LocalOsCold, 0.05, true)).unwrap();
+    v["receipt_version"] = serde_json::json!("x");
+    assert!(matches!(CacheReceipt::parse("c", &serde_json::to_vec(&v).unwrap()).unwrap_err(), ContractError::Version { .. }));
+    let mut v = serde_json::to_value(experiment()).unwrap();
+    v["experiment_version"] = serde_json::json!("x");
+    assert!(matches!(ExperimentManifest::parse("e", &serde_json::to_vec(&v).unwrap()).unwrap_err(), ContractError::Version { .. }));
+}
+
+#[test]
+fn reconstruction_binds_its_exact_product_parent() {
+    let r = reconstruction();
+    assert!(r.check_parent(&"prod".repeat(16)).is_ok());
+    assert!(matches!(r.check_parent("wrong").unwrap_err(), ContractError::ParentMismatch { .. }));
+}
+
+#[test]
+fn a_zstd6_delta_changes_only_compression_level() {
+    let d = zstd6_delta();
+    // Structurally diff against the reconstruction: only global.compression moved.
+    assert!(d.check_against_reconstruction(&"reco".repeat(16), &resolved("zstd(1)")).is_ok());
+    // Wrong parent is refused.
+    assert!(matches!(
+        d.check_against_reconstruction("other", &resolved("zstd(1)")).unwrap_err(),
+        ContractError::ParentMismatch { .. }
+    ));
+}
+
+#[test]
+fn a_delta_that_also_changes_row_group_size_is_refused() {
+    let mut d = zstd6_delta();
+    // The child's resolved config quietly moved a second axis the allowlist never permitted.
+    let mut cfg = resolved("zstd(6)");
+    cfg.fields.insert("global.row_group_rows".into(), serde_json::json!(500_000));
+    d.resolved_config = cfg;
+    let err = d
+        .check_against_reconstruction(&"reco".repeat(16), &resolved("zstd(1)"))
+        .unwrap_err();
+    assert!(matches!(err, ContractError::AllowlistViolation { .. }), "{err}");
+}
+
+#[test]
+fn a_delta_declaring_a_change_outside_its_allowlist_is_refused() {
+    let mut d = zstd6_delta();
+    // The delta changes a path it never allowed.
+    d.changes.insert("global.row_group_rows".into(), serde_json::json!(500_000));
+    assert!(matches!(d.validate("d").unwrap_err(), ContractError::AllowlistViolation { .. }));
+}
+
+#[test]
+fn an_unknown_allowlist_path_fails_closed() {
+    let mut d = zstd6_delta();
+    d.allowed_changes = vec!["global.magic_unicorn".into()];
+    d.changes.clear();
+    assert!(matches!(d.validate("d").unwrap_err(), ContractError::UnknownAllowlistPath { .. }));
+    // And per-column paths are recognised by suffix.
+    assert!(is_known_config_path("columns.team_id.physical_type"));
+    assert!(is_known_config_path("global.compression"));
+    assert!(!is_known_config_path("columns.team_id.nonsense"));
+    assert!(!is_known_config_path("global.nonsense"));
+}
+
+#[test]
+fn a_scan_scenario_must_name_a_projection_and_selection() {
+    let mut s = scenario();
+    s.selection = None;
+    assert!(matches!(s.validate("s").unwrap_err(), ContractError::IncompleteScenario { .. }));
+}
+
+#[test]
+fn a_count_sink_cannot_ride_a_scanning_selection() {
+    let mut s = scenario();
+    s.sink = Some(ResultSink::Count);
+    // Count with an `all` selection is the count(*)-is-a-scan anti-pattern.
+    s.selection = Some(RowGroupSelection::All);
+    assert!(matches!(s.validate("s").unwrap_err(), ContractError::IncompleteScenario { .. }));
+    // Count as a zero-selection metadata negative control is allowed.
+    s.selection = Some(RowGroupSelection::Zero);
+    s.projection = None;
+    s.layer = Layer::Scan;
+    // Zero selection still needs a projection under the scan layer, so use census layer here.
+    s.layer = Layer::Census;
+    assert!(s.validate("s").is_ok());
+}
+
+#[test]
+fn a_cache_receipt_cannot_launder_an_ineffective_eviction() {
+    // A cold receipt claiming validity while 60% resident is refused.
+    let bad = cache_receipt(CacheProfile::LocalOsCold, 0.60, true);
+    assert!(matches!(bad.validate("c").unwrap_err(), ContractError::CacheReceiptInconsistent { .. }));
+    // The same numbers recorded as invalid is honest and accepted.
+    let honest = cache_receipt(CacheProfile::LocalOsCold, 0.60, false);
+    assert!(honest.validate("c").is_ok());
+    assert!(!honest.is_usable());
+    // A warm receipt below its floor while claiming validity is refused.
+    let bad_warm = cache_receipt(CacheProfile::LocalOsWarm, 0.50, true);
+    assert!(matches!(bad_warm.validate("c").unwrap_err(), ContractError::CacheReceiptInconsistent { .. }));
+}
+
+#[test]
+fn sample_policy_freezes_warm_count_from_the_control() {
+    let p = SamplePolicy { warm_min: 7, warm_target_seconds: 3.0, warm_cap: 50, cold_min: 3 };
+    // Fast control -> the 3-second floor dominates.
+    assert_eq!(p.warm_count(0.05), 50.min((3.0f64 / 0.05).ceil() as u32));
+    // Slow control -> the 7-sample floor dominates.
+    assert_eq!(p.warm_count(1.0), 7);
+    // The cap bounds a pathologically fast control.
+    assert_eq!(p.warm_count(0.0001), 50);
+}
+
+#[test]
+fn an_experiment_refuses_identical_controls() {
+    let mut e = experiment();
+    e.reconstruction_digest = e.product_digest.clone();
+    assert!(matches!(e.validate("e").unwrap_err(), ContractError::DegenerateExperiment { .. }));
+    let mut e = experiment();
+    e.scenario_digests.clear();
+    assert!(matches!(e.validate("e").unwrap_err(), ContractError::DegenerateExperiment { .. }));
+}
+
+#[test]
+fn old_variant_manifests_are_never_promoted_to_the_causal_contract() {
+    // A plan-47/48 variant manifest still parses with its own reader.
+    let v = variant();
+    let bytes = serde_json::to_vec_pretty(&v).unwrap();
+    assert!(VariantManifest::parse("v", &bytes).is_ok());
+    // But it is NOT silently accepted as a causal variant-delta: the version gate refuses it.
+    assert!(matches!(
+        VariantDeltaManifest::parse("v", &bytes).unwrap_err(),
+        ContractError::Version { .. }
+    ));
+    // And a causal delta is not accepted by the old variant reader.
+    let d = serde_json::to_vec_pretty(&zstd6_delta()).unwrap();
+    assert!(matches!(
+        VariantManifest::parse("d", &d).unwrap_err(),
+        ContractError::Version { .. }
+    ));
+}

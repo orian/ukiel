@@ -25,14 +25,27 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod cache;
+pub mod experiment;
 pub mod index;
 pub mod report;
 pub mod run_set;
+pub mod scenario;
 pub mod snapshot;
 pub mod store;
 pub mod suite;
 pub mod variant;
 
+pub use cache::{CACHE_RECEIPT_VERSION, CacheReceipt, Residency};
+pub use experiment::{
+    EXPERIMENT_VERSION, ExperimentManifest, KNOWN_COLUMN_SUFFIXES, KNOWN_GLOBAL_PATHS,
+    RECONSTRUCTION_VERSION, ReconstructionManifest, ResolvedConfig, RewriteBias,
+    VARIANT_DELTA_VERSION, VariantDeltaManifest, WorkloadBinding, is_known_config_path,
+};
+pub use scenario::{
+    Backend, CacheProfile, Layer, ProjectionRole, ResultSink, RowGroupSelection, SCENARIO_VERSION,
+    SamplePolicy, ScenarioManifest,
+};
 pub use index::{IndexKind, IndexedColumn, RowGroupIndex, SKIP_MANIFEST_VERSION, SkipManifest};
 pub use report::{HostInfo, REPORT_VERSION, ReportIdentity, RunReport, ToolVersions};
 pub use run_set::{RUN_SET_VERSION, RunSet, RunSetEntry, RunSetState};
@@ -132,6 +145,35 @@ pub enum ContractError {
     MissingReport { context: String, expected: String },
     #[error("{context}: report digest '{digest}' is bound to more than one scheduled entry")]
     DuplicateReport { context: String, digest: String },
+    #[error(
+        "{context}: variant delta changes physical path '{path}', which is not in its \
+         allowed_changes allowlist — a one-variable variant may change only the axes it declares."
+    )]
+    AllowlistViolation { context: String, path: String },
+    #[error(
+        "{context}: allowed_changes lists '{path}', which is not a recognised physical config \
+         field. An unknown allowlist entry fails closed rather than becoming a silent escape hatch."
+    )]
+    UnknownAllowlistPath { context: String, path: String },
+    #[error("{context}: scenario field '{field}' is empty")]
+    EmptyScenarioField { context: String, field: String },
+    #[error("{context}: scenario '{scenario}' is not measurable — {missing}")]
+    IncompleteScenario {
+        context: String,
+        scenario: String,
+        missing: String,
+    },
+    #[error(
+        "{context}: cache receipt for profile {profile} claims validity, but its measured resident \
+         fraction {resident} does not satisfy the profile's threshold."
+    )]
+    CacheReceiptInconsistent {
+        context: String,
+        profile: String,
+        resident: f64,
+    },
+    #[error("{context}: {reason}")]
+    DegenerateExperiment { context: String, reason: String },
 }
 
 /// BLAKE3 of raw bytes, lowercase hex. Deliberately over the bytes on disk, not a
