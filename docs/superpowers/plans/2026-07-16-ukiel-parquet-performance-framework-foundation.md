@@ -4,9 +4,18 @@
 > single-purpose, run each task's focused tests before its commit, and do not
 > turn a benchmark result into a product writer change inside this plan.
 
-**Status:** Framework built and validated 2026-07-16 (Tasks 1–6, 107 passing tests). Task 7
-production confirmation (30M prod-synth + 10M ClickBench) pending dataset generation; see
+**Status:** Foundation code built 2026-07-16 (Tasks 1–6, 107 passing tests), but
+the 2026-07-17 end-to-end audit found measurement-integrity blockers in cache
+sample preparation, run-set execution/validation, analysis, causal SQL artifact
+loading, delta validation, and Plan 47 CLI compatibility. Task 7 is blocked on
+`2026-07-17-ukiel-parquet-performance-framework-remediation.md`. The remediation
+is queued behind Plan 8 and the PoC v0 feature-wide gate; see
 `docs/notes/2026-07-16-ukiel-parquet-framework-baseline.md`.
+
+The passing tests prove useful components, not a publishable end-to-end
+framework. Do not execute the 30M prod-synth + 10M ClickBench confirmation or
+change a production writer default until Plan 49R's tiny actual experiment
+passes.
 
 **Goal:** Implement the smallest trustworthy local vertical slice of
 `docs/superpowers/specs/2026-07-16-ukiel-parquet-performance-framework.md`, then

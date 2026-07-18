@@ -1,16 +1,22 @@
 # Plan 49 result: the parquet performance framework foundation
 
-**Date:** 2026-07-16. **Status:** framework implemented and validated end-to-end; the exact
-30M/10M production confirmation is the registered remaining execution step (see "What is not
-yet earned").
+**Date:** 2026-07-16. **Status amended 2026-07-17:** foundation components were
+implemented and 107 Rust tests pass, but a subsequent end-to-end audit rejected
+the “validated” claim. Cache preparation is not preserved through timing, the
+run set is not bound to execution strongly enough, the analyzer uses placeholder
+inputs, and the SQL guard cannot consume the new causal manifests. The exact
+30M/10M confirmation is blocked on
+`docs/superpowers/plans/2026-07-17-ukiel-parquet-performance-framework-remediation.md`.
+This note records the original implementation result; it is not publishable
+performance evidence.
 
 ## What was built (Tasks 1–6)
 
-Plan 49 implements the smallest trustworthy local vertical slice of the parquet performance
-framework — a reusable measurement kernel that can explain *why* a file is smaller or a query
-is faster, layer by layer, rather than reporting one blended total. Every tool is
-single-purpose and joined only by versioned files; no executable package depends on another
-executable package.
+Plan 49 implements the intended component shape of the local parquet performance
+framework. The 2026-07-17 audit found that the components are not yet joined into
+a trustworthy vertical slice; Plan 49R owns that remediation. Every tool remains
+single-purpose and joined through versioned files; no executable package depends
+on another executable package.
 
 | layer / component | what it measures or enforces | crate |
 |---|---|---|
@@ -24,20 +30,22 @@ executable package.
 | L5 SQL guard | seven registered query classes with a physical-plan assertion that rejects a metadata fast path, a dropped projection, or a full-result-set where an aggregate was declared; honest fresh-/reused-session vocabulary; cache-receipt binding | `parquet-lab-bench` |
 | orchestration | paired seeded schedule (two bracketed repetitions, ZSTD-6 paired to reconstruction, sample counts frozen from a control pilot), atomic executor, analyzer with the fixed Pareto vocabulary | `bench/parquet-perf-*.{py,sh}` |
 
-**Validation.** 107 automated tests across the eight crates pass, including genuine
+**Component validation.** 107 automated tests across the eight crates pass, including genuine
 end-to-end runs on realistic fixtures: `parquet-rewrite` reconstructs a product snapshot and
 varies it to ZSTD-6; `parquet-scan-bench` decodes a multi-file reconstruction and its
 codec-only variant and proves their checksums and row counts agree while a tampered file is
 rejected before timing; `parquet-write-bench` times a real reconstruction write and the
-byte-identity of the two write paths is characterized; the cache controller reaches its warm
-floor and leaves non-target files resident; the analyzer classifies the six spec fixtures
-(rewrite bias, opposite-direction reps, a small exact column win, a writer regression, a
-cache-only win, a true Pareto result) into the fixed vocabulary.
+byte-identity of the two write paths is characterized; and the cache controller
+reaches its warm floor and leaves non-target files resident. These tests do not
+prove the lifecycle between cache preparation and timing, execution from a
+declared run-set entry, strict report binding, or evidence-driven end-to-end
+analysis. The analyzer classification tests exercise hand-built inputs rather
+than a closed real experiment.
 
-## What the framework now answers, per workload and layer
+## What the repaired framework must answer, per workload and layer
 
-The seven Task-7 questions are now *measurable as distinct, bound quantities* — the kernel
-separates them by construction:
+After Plan 49R closes, the kernel must measure these seven Task-7 questions as
+distinct, bound quantities:
 
 1. **rewrite bias** — `parquet-census` over the product and reconstruction controls, reported
    by the analyzer as an exact total/per-column byte delta, on its own and never folded into
@@ -72,8 +80,10 @@ I/O, decode CPU, SQL, and writer cost. The config to run it is committed:
 
 ## What is not yet earned
 
-This session did **not** produce the exact six-artifact production confirmation. That run
-requires two datasets the framework consumes but does not generate:
+This session did **not** produce a trustworthy closed experiment or the exact
+six-artifact production confirmation. Plan 49R must first repair and prove the
+framework with its tiny actual fixture. The later large run also requires two
+datasets the framework consumes but does not generate:
 
 - the 30M packed, converged-L1+ prod-synth artifact (produced through the compaction
   pipeline over a profile); and

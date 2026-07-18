@@ -2,26 +2,50 @@
 
 Spec: `docs/superpowers/specs/2026-07-05-ukiel-design.md`. V1 is split into sequential plans (rows 1–7, 9–21, 27–30, 32, 34, 37, 39–43, 45–46, and 48 executed so far — per-row status below is authoritative). Each plan produces working, tested software. Detailed plans are written just-in-time (after the previous plan merges) so interfaces referenced are real, not guessed.
 
-## Current execution decision (2026-07-16)
+## Current execution decision (2026-07-17)
 
 Plan 43 is **executed** and **issue 0011 is closed** (both 2026-07-13). HA Phase 2 is delivered, the active-active compaction gate is closed, and the million-logical-table catalog claim is now *measured* rather than modeled: 1M `logical_tables` over 1M namespaces and 2,000 hypertables, parts at 10k/1M/10M, the whole admission path (`list_logical_tables` → session → plan → `live_parts_pruned`), two reps per point. **Plan 40's conclusion survives** — one primary is nowhere near the catalog wall, worst point still 26× over steady demand, zero timeouts — but the bigger fixture moved the cost: the tenant metadata is free (index probes, p99 1.0–1.3 ms at every part count, cold cache a non-event), while a *request* is capped by **DataFusion planning in the process** (8.6–8.9 of 12 driver cores vs 2.5–3.6 for Postgres), and the parts fan-out that the provider's key bitmap then discards became visible for the first time (**issue 0014**).
 
-The V1 product critical path is now **execute refreshed Plan 8**. Its plan is
+The PoC v0 product critical path is now **execute refreshed Plan 8**. Its plan is
 rebased onto Plan 42's role recovery, Plan 43's canonical operation identities,
 the current consolidated migration tree (`0002_pipelines.sql` is next), and e2e
 scenario S12. It resolves deterministic event-time bounds with stable Kafka
 metadata, makes pipeline definitions immutable in v1, creates one supervised MV
 fleet, and uses the reserved `mv` identity domain for lost-ack reconciliation.
 
-Row 49 is the independent storage-performance track. It implements the minimum
-local causal framework and uses only Plan 48's ZSTD-6 survivor across prod-synth
-and ClickBench; it does not block Plan 8 and cannot change production writer
-defaults. Row 44 is likewise independent and ready; it is a bounded JSON
-feature/baseline. Row 35 is opportunistic query work, not the product or HA
-critical path. For any untrusted production trial, row 25/issue 0001 becomes a
-release gate even if the internal-trial sequence above is unchanged. The older
-sequencing paragraphs below are retained as decision history; this section
-supersedes their recommended orders.
+Feature completion now takes priority over deeper performance work. The PoC v0
+feature-wide gate is:
+
+1. Plan 8 is merged: immutable Kafka→Parquet pipelines replace route config and
+   the supervised Parquet→Parquet MV path uses canonical mutation identities;
+2. focused unit/integration suites and workspace clippy are green;
+3. e2e S0–S12 pass against the compose stack, covering ingest/query,
+   crash/resume, compaction, deletion, GC, HA recovery/reconciliation, pipelines,
+   and MVs;
+4. `make play` still completes the README produce→query quickstart using the new
+   pipeline configuration; and
+5. obsolete `TableRoute`/event-time configuration is gone, while upload intents,
+   backpressure, metrics, health states, and graceful shutdown remain wired.
+
+Until this gate closes, do not start another broad storage candidate screen.
+Plan 44 remains an optional post-v0 JSON feature/baseline, not a condition for
+the core write→catalog→query→pipeline/MV PoC. Plans 22–26, 31, 33, 35, 38, and
+the production hardening gates retain their existing status; none should be
+silently pulled into PoC v0 feature completion.
+
+Row 49 is an independent storage-performance track and does not block PoC v0.
+Its foundation code exists, but the 2026-07-17 audit found that cache lifecycle,
+run-set execution/validation, analysis, causal SQL artifact loading, delta
+validation, and Plan 47 CLI compatibility must be repaired before its production
+confirmation is trustworthy. The bounded executable remediation is Plan 49R,
+`2026-07-17-ukiel-parquet-performance-framework-remediation.md`. Execute it only
+after the feature-wide gate above; it blocks Task 7 and a ZSTD-6 decision, not
+the current ZSTD-1 product. Row 44 is likewise independent and ready; it is a
+bounded JSON feature/baseline. Row 35 is opportunistic query work, not the
+product or HA critical path. For any untrusted production trial, row 25/issue
+0001 becomes a release gate even if the internal-trial sequence above is
+unchanged. The older sequencing paragraphs below are retained as decision
+history; this section supersedes their recommended orders.
 
 The 14-day, one-of-ten-shards ClickHouse shape is captured under
 `docs/prod-info/`, and row 45 has turned it into a deterministic `prod-synth`
@@ -41,9 +65,11 @@ Rows 47–48 delivered the Parquet laboratory and its first bounded 30M screen.
 That screen found exactly one directional candidate, ZSTD-6 at about 12%
 smaller, while narrow types, geometry, page size, and the tested Bloom did not
 earn follow-up. Row 49 replaces a direct old-harness ClickBench rerun with the
-new framework's product/reconstruction controls, isolated writer/raw-I/O/decode/
-SQL layers, and verified cache states. It remains laboratory-only: a production
-codec change still requires a focused evidence-backed issue after confirmation.
+intended framework's product/reconstruction controls and isolated
+writer/raw-I/O/decode/SQL layers. Plan 49R must repair and prove their cache and
+evidence lifecycle before confirmation. It remains laboratory-only: a
+production codec change still requires a focused evidence-backed issue after
+confirmation.
 
 ## Historical sequencing record (superseded)
 
@@ -112,7 +138,7 @@ execute issue 0011's missing million-logical-table proof before refreshing row
 | 46 | `2026-07-14-ukiel-actual-part-shape.md` | **Actual Ukiel compacted part shape**: stage the generated prod-synth rows as real Ukiel L0, run the leased/fenced compactor to convergence under packed / size-targeted / separated placement, scan the final objects for exact key cardinality, and relate it to issue-0014's filter tiers with a range-vs-filtered admission A/B | **Executed** (geometry decision; timings exploratory) — the compacted-part key count is set by tenants-active-per-day and crosses every filter tier with scale: packed day-parts hold ~285 keys at 500 tenants (filtered), ~6,000 at 10k (filtered but past the 1% point), ~80,000 at the estimated 142k (no filter, correctly). Separated keeps every part exact (1 key, no filter). Verdict: the three-tier / 8,000-key-ceiling design is confirmed appropriate — active and cheap where parts are modest, correctly dormant where dense (which under packed placement is also where over-fetch is already small). No product change. Size-targeted output shape at a byte-triggering row count and the unvacuumed/vacuumed delta left as cheap follow-ups. See `docs/notes/2026-07-14-ukiel-actual-part-shape.md` |
 | 47 | `2026-07-15-ukiel-parquet-storage-laboratory.md` | **Parquet storage laboratory**: standalone snapshot, census, rewrite, query, store, and skip-index tools over verified compacted Parquet artifacts | **Tooling and remediation executed 2026-07-15; broad measurement superseded.** Tasks 47A–47F fixed bound probes/run sets, real sidecar access plans, real local/object-store modes, safe orchestration, and like-for-like analysis. Plan 48 then executed the first valid bounded screen. Returned-byte phase attribution, verified OS cache states, dual product/reconstruction controls, isolated writer/raw-I/O/decode timing, and publishable remote claims were not completed here; Plan 49 now owns the local causal framework. Historical smoke results carry no storage conclusion |
 | 48 | `2026-07-15-ukiel-parquet-storage-minimal-measurement.md` | **Minimal Parquet storage measurement**: corrected schedule execution plus an exact 11-variant local screen over one 30M packed converged-L1+ prod-synth control | **Executed 2026-07-15.** Two seeded interleaved repetitions, distinct control brackets, control drift <1.6%, and every fingerprint/schema/census/answer gate passed. Exactly one directional candidate survived: `compression-zstd-6` (~12% smaller, no measured read penalty). Narrow types, page/row-group geometry, timestamp encoding, dictionary removal, LZ4, and the tested Bloom did not earn follow-up. Evidence: `bench/results/parquet-lab/plan48/`; result note: `docs/notes/2026-07-15-ukiel-parquet-storage-minimal-measurement.md`. This is directional prod-synth evidence, not a writer-default claim; Plan 49 owns its causal/cross-workload confirmation |
-| 49 | `2026-07-16-ukiel-parquet-performance-framework-foundation.md` | **Parquet performance framework foundation**: product plus reconstruction controls; one-variable delta validation; separate writer, raw-file, direct Parquet scan, SQL, and verified local-cache layers; exact product/reconstruction/ZSTD-6 arms on 30M prod-synth and 10M ClickBench | **Framework built and validated 2026-07-16 (Tasks 1–6); production confirmation run (Task 7) pending dataset generation.** The full local measurement kernel is implemented and covered by 107 passing tests, including genuine end-to-end reconstruct→vary→census→scan/write/read pipelines: causal contracts with a dual-control + one-variable-delta allowlist and structural diff (`parquet-lab-contract`); `parquet-rewrite reconstruct`/`vary`; a shared byte-identical write core (`parquet-lab-write-core`) feeding an isolated L1 writer bench (`parquet-write-bench`); a verified `mincore`/`posix_fadvise` cache controller (`parquet-cachectl`); an L2 raw byte/range reader (`file-read-bench`); an L3 direct Arrow/Parquet scan with explicit all/one/contiguous/sparse row-group selection (`parquet-scan-bench`); an L5 SQL guard with seven registered query classes, a physical-plan assertion, and honest fresh-/reused-session + cache-receipt vocabulary (`parquet-lab-bench`); and the paired seeded orchestration + Pareto analyzer (`bench/parquet-perf-*`). Configs committed under `bench/config/parquet-perf/`. **What is NOT yet earned:** the exact six-artifact 30M-prod-synth + 10M-ClickBench confirmation was not executed — it needs the 30M packed converged artifact (compaction pipeline) and the 10M ClickBench snapshot (full ~105-column logical schema), so ZSTD-6 has no cross-workload per-layer production verdict yet and stays Plan 48's directional prod-synth candidate. `ukiel_core::writer_props` unchanged. Result note: `docs/notes/2026-07-16-ukiel-parquet-framework-baseline.md` |
+| 49 | `2026-07-16-ukiel-parquet-performance-framework-foundation.md` | **Parquet performance framework foundation**: product plus reconstruction controls; one-variable delta validation; separate writer, raw-file, direct Parquet scan, SQL, and verified local-cache layers; exact product/reconstruction/ZSTD-6 arms on 30M prod-synth and 10M ClickBench | **Foundation code built 2026-07-16; end-to-end validation rejected by the 2026-07-17 audit.** The component decomposition and 107 passing Rust tests are useful, but cold receipts are invalidated or reused before timing, L3 local profiles decode preloaded memory, schedule entries are not executable contracts, `close` accepts unbound JSON, the analyzer uses placeholder inputs, L5 cannot load reconstruction/delta manifests, causal deltas admit no-op/type gaps, and the Plan 47 CLI regressed. **Task 7 is blocked** on Plan 49R, `2026-07-17-ukiel-parquet-performance-framework-remediation.md`, which is queued behind Plan 8 and the PoC v0 feature-wide gate. ZSTD-6 remains only Plan 48's directional candidate; `ukiel_core::writer_props` remains unchanged. Result/audit note: `docs/notes/2026-07-16-ukiel-parquet-framework-baseline.md` |
 
 Cross-plan constraints (repeat in every plan's Global Constraints):
 
