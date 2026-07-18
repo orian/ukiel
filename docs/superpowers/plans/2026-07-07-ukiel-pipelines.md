@@ -1,236 +1,599 @@
-# Ukiel Plan 8: Table Engines & Pipelines Implementation Plan
+# Ukiel Plan 8: Table Engines and Pipelines
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Execute task by task against current main. Run each
+> task's focused tests before its commit. The HA, operation-identity, upload-
+> intent, guardrail, and metrics requirements below are acceptance criteria, not
+> optional adaptations.
 
-**Goal:** Implement `docs/notes/2026-07-06-pipelines.md` v1: catalog entities `stream_tables` (engine=kafka) and `pipelines`; the **kafka→parquet pipeline** replacing `TableRoute`/`RouteIngest` (transform, filtering, partition derivation, and boundary validation move into the pipeline SELECT; the plan-19 event-time knobs are **deleted, not ported** — design doc "time-agnostic core"); and the **parquet→parquet aggregation-MV pipeline** on the existing change-feed cursor machinery with idempotency-key exactly-once. Egress (parquet→kafka) stays a follow-up (roadmap row 24).
+**Status:** Refreshed and ready to execute, 2026-07-16.
 
-**Architecture:** A pipeline is a catalog row `source (kind, id) → SQL → target (kind, id)`, executed batch-at-a-time: materialize a source batch → register it in a DataFusion `SessionContext` under the source table's name → run the SELECT → hand the result to the target's write path. A new crate **`ukiel-pipeline`** owns SQL validation and execution (DataFusion dep stays out of `ukiel-ingest`); `ukiel-ingest` keeps Kafka mechanics and gains a batch-input write path (`rows_to_batch` + `batch_to_l0_items`). Inbound exactly-once is untouched: pipeline SQL runs between decode and write, offsets still commit transactionally with parts (incl. the plan-19 CAS). The MV worker is a change-feed cursor consuming **`kind == "add"` commits only** (REPLACE outputs are rewrites of already-processed data — consuming them would double-count), writing to the target with `idempotency_key = "pipeline:{id}:through:{commit_id}"` so a crash between commit and cursor-advance replays into `AlreadyApplied`. Guardrail continuity is a hard requirement: the plan-18 backpressure decision and the plan-20 ingest metrics move to the pipeline flush path, same shapes, same names.
+**Goal:** Implement the v1 scope from
+`docs/notes/2026-07-06-pipelines.md`: catalog entities for Kafka stream tables
+and pipelines; Kafka-to-Parquet SQL pipelines replacing `TableRoute`; and
+Parquet-to-Parquet aggregation MVs consuming the catalog change feed. Egress to
+Kafka remains roadmap row 24.
 
-**Tech Stack:** DataFusion 54 (pinned; `SessionContext::register_batch`, `sql_with_options` + `SQLOptions`), rdkafka 0.39, sqlx/Postgres migration, arrow 58.3.
+This refresh supersedes the 2026-07-07 plan. It is written against the current
+tree after Plans 41–43 and the million-logical-table catalog proof. The current
+catalog migrations are consolidated into `0001_init.sql`; this plan owns
+`0002_pipelines.sql`. E2E scenarios S9–S11 are already taken; this plan owns
+S12. The canonical operation domain `mv` was reserved by Plan 43 for this work.
 
-**Prerequisites:** Written 2026-07-07 against main (plans 1–7, 9, 10, 19 executed). **Execute last, after plans 11–18 and 20**, per the roadmap's recommended order — see the adaptation constraints below for what each landed plan changes here.
+## Architecture
 
-## Global Constraints
+A pipeline is an immutable catalog definition:
 
-- Rust edition 2024, toolchain ≥ 1.96; `make test` (Docker) per task; unit tests in Tasks 2–3 pass without Docker.
-- **Migration numbering:** use the next free number at execution time (0006 if plan 17's `0005_target_file_bytes` has landed per the recommended order; renumber otherwise).
-- **Guardrail continuity (non-negotiable):**
-  - Port plan-18 backpressure into the pipeline ingest flush path: same `flush_decision(max_live_l0, deferred, total_rows, cfg)` shape, `live_l0_parts` probed on the *derived* partitions before commit; deferral keeps the raw buffer (offsets untouched → exactly-once preserved).
-  - **Delete** the plan-19 event-time knobs (`max_event_age_days`, `max_event_future_secs`, `TableRoute.max_event_age_days`) and their config surface — bounds are now per-pipeline `WHERE` predicates. Update `ukield.example.toml`, issue-0004-adjacent doc lines, and any fixtures that set them.
-  - Keep every plan-20 ingest metric emitting from the new flush path under the same names (`ingest_flush_*`, `ingest_rows_total`, `ingest_poison_messages_total`, `ingest_last_flush_event_ts_seconds`, …). `ingest_out_of_bounds_total` is deleted with the bounds (its job moves to pipeline predicates; note it in the monitoring spec).
-- **Adaptation constraints:** plan 14 (if landed): encode via the shared `ukiel_core::writer_props`/`WriteOpts` instead of ad-hoc ZSTD props. Plan 17 (if landed): L0 output is unaffected (L0 is always packed; level ladder is compactor-side). Plan 11: preserve `sorting_columns` metadata on written files if its Task 4 landed.
-- **Time-agnostic core:** nothing in this plan may interpret event time or parse partition values — derivation and validation are SQL in the pipeline row; the workers apply results opaquely.
-- Commit messages: conventional style, no Claude/AI attribution.
-- Every task ends with `cargo fmt && cargo clippy --all-targets -- -D warnings` clean.
-
----
-
-### Task 1: Catalog entities — `stream_tables`, `pipelines`
-
-**Files:**
-- Create: `crates/ukiel-catalog/migrations/000N_pipelines.sql` (N = next free)
-- Create: `crates/ukiel-core/src/pipeline.rs`; modify `crates/ukiel-core/src/lib.rs` (module + re-exports)
-- Create: `crates/ukiel-catalog/src/pipelines.rs`; modify `crates/ukiel-catalog/src/lib.rs`
-- Test: `crates/ukiel-catalog/tests/catalog_test.rs`
-
-**Interfaces (Produces):**
-
-Core types (`ukiel-core/src/pipeline.rs`):
-
-```rust
-use serde::{Deserialize, Serialize};
-
-use crate::ids::{PipelineId, StreamTableId};
-
-/// A kafka-engine table: a topic endpoint with a schema. Owns no parts;
-/// only pipelines may read it (no direct SELECT — destructive-read footgun).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct StreamTable {
-    pub id: StreamTableId,
-    pub name: String,
-    pub topic: String,
-    /// v1: "json" (JSON object per message).
-    pub format: String,
-    /// Same JSON schema shape as hypertables (`TableColumns::parse`).
-    pub table_schema: serde_json::Value,
-}
-
-/// Which catalog entity a pipeline endpoint refers to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EndpointKind {
-    Kafka,
-    Parquet,
-}
-
-/// What to do when a batch fails at runtime (SQL error, encode error).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ErrorPolicy {
-    /// Retry the same batch next tick; offsets/cursor do not advance.
-    Stall,
-    /// Advance past the batch, count it (poison-batch semantics).
-    Skip,
-}
-
-/// A SQL transform between two tables (docs/notes/2026-07-06-pipelines.md).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Pipeline {
-    pub id: PipelineId,
-    pub name: String,
-    pub source_kind: EndpointKind,
-    pub source_id: i64, // StreamTableId or HypertableId per source_kind
-    pub target_kind: EndpointKind, // v1: always Parquet
-    pub target_id: i64,
-    pub sql: String,
-    /// Outbound delivery level; stored now, consumed by the egress plan.
-    pub delivery: String,
-    pub error_policy: ErrorPolicy,
-}
+```text
+source endpoint -> deterministic DataFusion SELECT -> target endpoint
 ```
 
-Add `PipelineId` and `StreamTableId` to the id macro invocations in `ids.rs`.
+V1 supports:
 
-Migration:
+| source | target | execution |
+|---|---|---|
+| Kafka stream table | Parquet hypertable | one bounded Kafka flush at a time |
+| Parquet hypertable | Parquet hypertable | one source ADD commit at a time |
+
+`ukiel-pipeline` is a pure SQL-over-Arrow crate. Kafka ownership remains in
+`ukiel-ingest`. A new `ukiel-write` crate owns target batch-to-L0 encoding,
+upload intents, upload, and identified ADD commits without depending on Kafka
+or DataFusion. Both `ukiel-ingest` and the new change-feed worker crate
+`ukiel-mv` consume it. No query/catalog mutation code is hidden inside the pure
+SQL crate, and MV does not inherit Kafka through a convenience dependency.
+
+All role workers run under Plan 42's supervisor. A recoverable catalog failure
+drops the entire role worker and every buffer/plan/session it owned. A rebuilt
+Kafka worker reloads pipeline definitions and offsets, then re-seeks Kafka. A
+rebuilt MV worker reloads definitions and monotonic cursors. An ambiguous target
+commit carries a Plan-43 `OperationIdentity`; the supervisor remains
+`Reconciling` until `lookup_operation` answers, discards the old attempt, and
+rebuilds from authority.
+
+## Decisions fixed by this refresh
+
+### Pipeline definitions are immutable in v1
+
+There is no `UPDATE pipeline`. SQL, endpoints, error policy, delivery mode, and
+event-time output are immutable. An operator creates a new pipeline identity for
+a semantic change. Bootstrap accepts an existing definition only when every
+field matches; a same-name mismatch is a permanent startup error.
+
+This is load-bearing for deterministic replay and operation identity: a
+`PipelineId` always names one transformation. Schema/ALTER and pipeline rollout
+belong to a follow-up plan.
+
+### Deterministic event-time bounds use stable Kafka metadata
+
+The old plan said both “delete time-relative knobs” and “allow only deterministic
+SQL,” but did not provide a deterministic clock. V1 resolves that explicitly.
+
+Every Kafka source batch exposes a reserved nullable Int64 column:
+
+```text
+__ukiel_kafka_append_time_ms
+```
+
+It is populated only from broker-assigned `LogAppendTime`, which is stable when
+the same offset is replayed and is not controlled by the event producer. A
+producer `CreateTime`, unavailable timestamp, or topic not configured for
+`LogAppendTime` becomes SQL NULL; it must never masquerade as broker time.
+Stream schemas may not declare names beginning `__ukiel_`. The pipeline decides
+whether to reject NULL. The default event bound is ordinary immutable SQL:
 
 ```sql
--- Table engines & pipelines (docs/notes/2026-07-06-pipelines.md).
--- stream_tables: engine=kafka endpoints. Deliberately NOT hypertable rows —
--- packing key / placement are meaningless for a topic, and nullable-column
--- soup is how catalogs rot.
-CREATE TABLE stream_tables (
-    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
-    topic TEXT NOT NULL,
-    format TEXT NOT NULL DEFAULT 'json' CHECK (format IN ('json')),
-    table_schema JSONB NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE pipelines (
-    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
-    source_kind TEXT NOT NULL CHECK (source_kind IN ('kafka', 'parquet')),
-    source_id BIGINT NOT NULL,
-    target_kind TEXT NOT NULL CHECK (target_kind IN ('parquet')),
-    target_id BIGINT NOT NULL,
-    sql TEXT NOT NULL,
-    delivery TEXT NOT NULL DEFAULT 'at_least_once'
-        CHECK (delivery IN ('at_most_once', 'at_least_once', 'exactly_once')),
-    error_policy TEXT NOT NULL DEFAULT 'stall'
-        CHECK (error_policy IN ('stall', 'skip')),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+WHERE __ukiel_kafka_append_time_ms IS NOT NULL
+  AND ts >= __ukiel_kafka_append_time_ms - 315360000000
+  AND ts <= __ukiel_kafka_append_time_ms + 3600000
 ```
 
-Catalog CRUD (`pipelines.rs`): `create_stream_table(name, topic, format, schema) -> StreamTableId`, `get_stream_table(name)`, `get_stream_table_by_id(id)`, `create_pipeline(&Pipeline-shaped args) -> PipelineId`, `get_pipeline(name)`, `list_pipelines() -> Vec<Pipeline>` — same query/row-mapping style as `tables.rs`.
+The engine never parses partitions or knows what “old” means. The plan-19
+`max_event_age_days` and `max_event_future_secs` knobs are deleted only after
+this equivalent pipeline predicate and its regression tests land.
 
-- [ ] **Step 1 (failing test):** in `catalog_test.rs`: create a stream table + a kafka→parquet pipeline pointing at the fixture hypertable; `list_pipelines` round-trips every field; duplicate names error (unique violation surfaces as a `CatalogError`).
-- [ ] **Step 2:** migration + types + CRUD as specced. `ErrorPolicy`/`EndpointKind` map to/from the TEXT columns with exhaustive `match` (no stringly fallthrough — unknown DB value is a `CatalogError::NotFound`-style corruption error, not a default).
-- [ ] **Step 3:** verify (`cargo test -p ukiel-catalog -- --test-threads=2`), fmt, clippy, commit `"feat: stream_tables and pipelines catalog entities"`.
+An optional pipeline `event_time_column` names a target output column used only
+for the existing `ingest_last_flush_event_ts_seconds` freshness metric. This
+keeps freshness observable without making event time a hypertable-core concept.
+
+### SQL must be replay-stable
+
+Pipeline validation accepts one query with exactly one scan of the declared
+source. DDL, DML, joins, cross joins, extra table scans, and non-immutable
+functions are rejected. Inspect DataFusion function volatility and allow only
+`Immutable`; do not maintain a short denylist that misses a new clock/random
+function. Stable Kafka metadata is how a pipeline expresses time-relative
+policy without `now()`.
+
+### MV progress is one source commit at a time
+
+Each Parquet-source pipeline processes one ordered change event at a time:
+
+- `kind == "add"`: read exactly that commit's added parts, run SQL, publish one
+  idempotent target ADD, then advance the cursor;
+- `replace` or `delete`: do not run the MV and advance the cursor; those commits
+  rewrite/remove rows already represented by earlier ADD intent; and
+- an empty SQL result advances the cursor without a target commit.
+
+One-commit operations avoid batch-window ambiguity: retries always reconstruct
+the same identity. Aggregates are partial per source commit. Consumers query
+them with a final aggregation; semantic merge-state compaction is future work.
+
+Parquet-source pipeline creation initializes `worker_cursors` atomically at the
+source's current feed head. V1 MVs are therefore future-facing and never claim
+to backfill history whose objects may already have been reaped. Creating them
+before source ingestion naturally initializes at zero. Explicit historical
+backfill is a separate plan.
+
+### Active-active MV is correct before it is efficient
+
+All replicas share cursor name `mv/{pipeline_id}`. Two replicas may race the
+same source commit; canonical identity makes one target ADD durable and the
+other `AlreadyApplied`, and the monotonic cursor makes both advances safe.
+Attempt-specific uploads remain pending/orphan-covered and GC-reapable.
+
+V1 does not add a second lease subsystem. Operators should run one MV role per
+fleet until contention evidence justifies a pipeline lease. Record
+`AlreadyApplied`/duplicate-work counters so that follow-up has a trigger. Do not
+claim duplicate object work is eliminated.
+
+## Canonical operation identities
+
+Keep the existing Plan-43 ingest v1 vectors pinned. Add factories rather than
+changing their bytes:
+
+```rust
+pub struct PipelineIngestIntent<'a> {
+    pub pipeline_id: PipelineId,
+    pub ranges: &'a [IngestRange],
+    pub transformation_version: u32,
+}
+
+pub struct MvIntent {
+    pub pipeline_id: PipelineId,
+    pub source_hypertable_id: HypertableId,
+    pub source_commit_id: CommitId,
+    pub transformation_version: u32,
+}
+
+OperationIdentity::pipeline_ingest(target_hypertable_id, intent) // ingest/v2
+OperationIdentity::mv(target_hypertable_id, intent)              // mv/v1
+```
+
+The target hypertable is the identity scope. Pipeline ID names the immutable
+definition. Kafka ranges or the exact source commit name the consumed log
+prefix. Generated object paths, output bytes, process/attempt IDs, cursor value,
+wall time, and lease state are absent. Bump transformation version only when
+the same immutable definition and source input would legitimately map to
+different logical rows.
+
+## Global constraints
+
+- Rust edition 2024, toolchain >= 1.96; keep DataFusion 54 and Arrow/Parquet
+  58.3 pinned in lockstep.
+- Migration is exactly `crates/ukiel-catalog/migrations/0002_pipelines.sql` on
+  the current consolidated tree. Refuse to edit `0001_init.sql`.
+- Kafka group offsets are never committed. Catalog offsets remain atomic with
+  target parts and retain the issue-0003 CAS.
+- Every object path is registered in `pending_objects` before upload. Commit
+  clears the intent transactionally; failed attempts remain ordinary GC orphans.
+- Kafka and MV target writes use the shared L0 writer properties and
+  materialized/default-column path. No ad-hoc Parquet writer.
+- Preserve Plan-18 backpressure, Plan-20/21 metrics, Plan-27 sort validation,
+  Plan-42 role-local recovery/readiness, and Plan-43 ambiguous reconciliation.
+- `stall` never advances offsets/cursor. `skip` advances visibly and increments
+  a bounded-label counter. Creation-time errors are permanent, not skippable.
+- Unit tests run without Docker. Catalog/component tests use testcontainers.
+  S12 is ignored e2e and runs through the existing Makefile targets.
+- Conventional commits; no AI attribution.
 
 ---
 
-### Task 2: Batch-input write path in ukiel-ingest
-
-**Files:** `crates/ukiel-ingest/src/writer.rs` (+ its tests)
-
-**Interfaces (Produces):**
-- `pub fn rows_to_batch(cols: &TableColumns, rows: Vec<serde_json::Value>) -> Result<RecordBatch, IngestError>` — extracted from the body of `encode_rows` (the JSON→Arrow step that already exists inside it); `encode_rows` becomes a thin wrapper (rows_to_batch → defaults/materialized → sort → encode) so its signature and every existing test stay unchanged.
-- `pub fn batch_to_l0_items(batch: &RecordBatch, cols: &TableColumns, partition_columns: &[String], packing_key: &str, sort_key: &[String]) -> Result<Vec<(serde_json::Value, EncodedPart)>, IngestError>` — the pipeline write path: apply defaults/materialized (`ukiel_expr::apply_defaults_and_materialized`), lexsort by `sort_key`, split into contiguous groups per distinct `partition_columns` value-tuple (group rows by the partition values, then slice), and encode each group as one L0 `EncodedPart` with its `{"col": value, ...}` partition JSON. Partition column values are read from the batch opaquely (Int64/Utf8 → JSON scalar) — no date logic anywhere.
-
-- [ ] **Step 1 (failing tests, no Docker):** `rows_to_batch` produces the same batch `encode_rows` would encode (assert column values for a 3-row fixture); `batch_to_l0_items` on a batch with a `day` utf8 column holding two distinct values returns two items with correct `partition_values` JSON, per-item `key_min/max`, rows sorted by `(tenant_id, ts)` within each item, total rows preserved.
-- [ ] **Step 2:** implement by extraction + the grouping described; encoding goes through the same props path `encode_rows` uses at execution time (plan-14-aware per the adaptation constraint).
-- [ ] **Step 3:** verify `cargo test -p ukiel-ingest --lib` (all existing writer tests green — extraction is behavior-preserving), fmt, clippy, commit `"feat: batch-input L0 write path (rows_to_batch, batch_to_l0_items)"`.
-
----
-
-### Task 3: `ukiel-pipeline` crate — validate & run pipeline SQL
+### Task 1: Catalog entities and immutable bootstrap contract
 
 **Files:**
-- Create: `crates/ukiel-pipeline/` (Cargo.toml: datafusion workspace dep, arrow, ukiel-core, thiserror; add to workspace members)
-- Create: `src/lib.rs`, `src/sql.rs`, `src/error.rs`
 
-**Interfaces (Produces):**
-- `pub fn validate_pipeline_sql(sql: &str, source_name: &str, source_schema: &Schema, target: &TargetContract) -> Result<(), PipelineError>` where `TargetContract { required_columns: Vec<String> }` (target's packing key + sort columns + partition columns). Validation: register an **empty** `RecordBatch` under `source_name`, plan via `sql_with_options` with DDL/DML/statements disallowed, check the output schema contains every required column, and walk the logical plan rejecting volatile functions (denylist: `now`, `current_date`, `current_time`, `current_timestamp`, `random`, `uuid` — the full-SQL analog of `ukiel-expr`'s determinism rule; extend the denylist if clippy of DataFusion 54's function set surfaces more volatile names).
-- `pub async fn run_pipeline_sql(sql: &str, source_name: &str, batch: RecordBatch) -> Result<RecordBatch, PipelineError>` — fresh single-use `SessionContext`, `register_batch`, plan with the same `SQLOptions`, `collect`, `concat_batches` to one output batch (empty result = empty batch with the planned schema).
+- Create: `crates/ukiel-catalog/migrations/0002_pipelines.sql`
+- Create: `crates/ukiel-core/src/pipeline.rs`
+- Modify: `crates/ukiel-core/src/{ids,lib}.rs`
+- Create: `crates/ukiel-catalog/src/pipelines.rs`
+- Modify: `crates/ukiel-catalog/src/lib.rs`
+- Modify: `crates/ukiel-catalog/tests/catalog_test.rs`
 
-- [ ] **Step 1 (failing tests, no Docker):** the pipelines-note example SELECT over a 3-row source batch produces derived `day` + filtered rows; a SELECT missing the packing key fails validation naming the column; `SELECT now()` fails validation as non-deterministic; `INSERT` fails via `SQLOptions`.
-- [ ] **Step 2:** implement; keep the crate free of catalog/kafka deps (pure SQL-over-batches).
-- [ ] **Step 3:** verify `cargo test -p ukiel-pipeline`, fmt, clippy, commit `"feat: ukiel-pipeline crate - validated batch-at-a-time SQL execution"`.
+Add `PipelineId`, `StreamTableId`, `EndpointKind`, `ErrorPolicy`, `Delivery`,
+`StreamTable`, and `Pipeline`. The pipeline carries source/target endpoint refs,
+SQL, delivery, error policy, and optional `event_time_column`.
 
----
+Migration tables:
 
-### Task 4: kafka→parquet pipeline worker (replaces `RouteIngest`)
+- `stream_tables`: identity, unique name, unique topic for v1, `format = json`,
+  JSONB schema, created timestamp;
+- `pipelines`: identity, unique name, typed source/target kind+id, SQL, delivery,
+  error policy, optional event-time output, created timestamp; and
+- a unique `(source_kind, source_id, target_kind, target_id)` definition.
 
-**Files:** `crates/ukiel-ingest/Cargo.toml` (add `ukiel-pipeline`), `crates/ukiel-ingest/src/consumer.rs`, `crates/ukiel-ingest/src/config.rs`, tests in `crates/ukiel-ingest/tests/consumer_test.rs`
+V1 target kind is Parquet. Catalog creation validates that polymorphic endpoint
+IDs exist in the correct table inside one transaction. For a Parquet source it
+also inserts `worker_cursors(worker = 'mv/{id}', hypertable_id = source_id,
+last_commit_id = current feed head)` in that transaction. No update/delete API.
 
-**Interfaces:**
-- `PipelineIngest` replaces `RouteIngest`: constructed from a `Pipeline` + its `StreamTable` + target `Hypertable`. The Kafka mechanics are unchanged (explicit assignment from catalog offsets, poison rows counted and skipped at decode, `max_buffer_rows` early flush). The buffer becomes a single `Vec<serde_json::Value>` (no per-day map — partition derivation is post-SQL now) plus the offset ranges and `max_event_ts_ms` tracker (plan 20).
-- Flush path: `rows_to_batch(source_cols, rows)` → `run_pipeline_sql` → `batch_to_l0_items(result, target_cols, partition_columns, packing_key, sort_key)` → **backpressure check** (plan-18 `flush_decision` over `live_l0_parts` of the derived partitions; `Defer` keeps the raw row buffer and returns) → `Flusher::flush(hypertable, items, offsets)` (exactly-once + CAS unchanged) → plan-20 metrics + freshness gauge.
-- Runtime failure (SQL error, encode error) honors `pipeline.error_policy`: `Stall` = log error + return without draining (same batch retries next tick); `Skip` = offset-only flush (drop the rows, advance offsets — the existing offsets-without-parts path), `counter!("pipeline_batches_skipped_total", "pipeline" => name)`.
-- `IngestConfig.tables: Vec<TableRoute>` and everything only it used (`ts_column`, the plan-19 bounds knobs) are **deleted**; the worker enumerates kafka-sourced pipelines from the catalog at startup.
+Expose exact-match create/get/list methods and filtered
+`list_pipelines_by_source_kind`. Unknown TEXT enum values are catalog corruption
+errors, never defaults.
 
-- [ ] **Step 1 (failing component test):** rewrite the existing consumer tests' fixtures to create a stream table + pipeline (SELECT with a `WHERE` filter and a derived `day`) instead of a `TableRoute`; assert produce→query round trip, the filter's effect, exactly-once crash/resume (the existing test's shape, now through the pipeline), and error-policy `Skip` on a pipeline whose SQL fails at runtime for a poisoned batch (offsets advance, no parts).
-- [ ] **Step 2:** implement `PipelineIngest`; delete `TableRoute`, `RouteIngest`, the bounds knobs and their config surface. Creation-time validation runs in Task 6's bootstrap (`validate_pipeline_sql`), not here.
-- [ ] **Step 3:** verify `cargo test -p ukiel-ingest -- --test-threads=2`, fmt, clippy, commit `"feat: kafka pipelines replace table routes; event-time knobs deleted"`.
+- [ ] Failing tests: round trip every field; duplicate names/topics/pairs;
+  missing/wrong-kind endpoints; reserved stream column; exact-match idempotent
+  create; same-name mismatch; MV cursor initialized to current head atomically.
+- [ ] Implement migration, core types, CRUD, structural validation, and exports.
+- [ ] Verify and commit:
 
----
+```bash
+cargo test -p ukiel-core -p ukiel-catalog -- --test-threads=2
+cargo clippy -p ukiel-core -p ukiel-catalog --all-targets -- -D warnings
+git commit -m "feat: add immutable stream tables and pipelines"
+```
 
-### Task 5: parquet→parquet aggregation-MV worker
+### Task 2: Canonical pipeline-ingest and MV identities
 
-**Files:** `crates/ukiel-pipeline/src/mv.rs` (worker; add catalog/object_store deps to this crate for the worker module only), test `crates/ukiel-pipeline/tests/mv_test.rs`
+**Files:**
 
-**Interfaces:**
-- `MvWorker { catalog, store, pipeline, poll_interval_ms }::run(shutdown)` ticking `run_once`:
-  1. `events = changes_since(source_ht, cursor("pipeline:{name}"), limit)`; take parts from `event.added` **where `event.kind == "add"` only** (REPLACE outputs are rewrites of data already processed — consuming them double-counts; DELETE events are ignored: v1 MVs are append-only, documented caveat).
-  2. Read those parts to one batch (a local `read_parts_to_batch` mirroring the compactor's ~30-line reader + schema-adapt; deliberate small duplication, noted, until a shared home exists).
-  3. `run_pipeline_sql` → `batch_to_l0_items` → `catalog.commit(target_ht, Add, Some("pipeline:{id}:through:{last_commit_id}"))` — the **existing idempotency-key machinery** makes this exactly-once: crash after commit, before cursor-advance → replay returns `AlreadyApplied`, then the cursor advances.
-  4. `set_cursor("pipeline:{name}", source_ht, last_commit_id)` — a real `worker_cursors` row, which also makes the MV a first-class GC fence (a stalled MV blocks reaping of its unread parts, by design).
-  - Empty result batches still advance the cursor (commit only when there are items). `error_policy` as in Task 4 (`Stall` = don't advance; `Skip` = advance cursor past the batch, count it).
-- [ ] **Step 1 (failing component test):** events hypertable + `daily_counts` target hypertable + pipeline `SELECT tenant_id, day, count(*) AS n FROM events GROUP BY tenant_id, day`; commit two ADD batches, run to quiescence, assert target contents equal the per-batch aggregates; run a compactor REPLACE on the source, run the MV again, assert **no double-count**; kill-and-rerun between commit and cursor-advance (drive `run_once` manually) asserts `AlreadyApplied` idempotency.
-- [ ] **Step 2:** implement; document the partial-aggregate caveat (per-batch `GROUP BY` yields partial aggregates; the aggregating-placement compactor mode is future work) in the module doc.
-- [ ] **Step 3:** verify, fmt, clippy, commit `"feat: parquet-to-parquet aggregation MV pipelines on the change feed"`.
+- Modify: `crates/ukiel-core/src/operation.rs`
+- Modify: `crates/ukiel-core/src/lib.rs`
+- Modify: `crates/ukiel-catalog/tests/catalog_test.rs`
 
----
+Implement the `ingest/v2` and `mv/v1` factories above with the existing
+type-tagged, length-delimited canonical encoder. Reject empty ranges, duplicate
+or invalid IDs/commits, and out-of-scope identities. Preserve every existing
+ingest/compaction/delete pinned vector byte-for-byte.
 
-### Task 6: ukield — config, bootstrap, roles, example
+The catalog needs no new reconciliation API: both identities travel through
+`commit`/`commit_with_offsets`, `AmbiguousMutation`, supervisor
+`lookup_operation`, and the fingerprint collision check already shipped.
 
-**Files:** `crates/ukield/src/config.rs`, `bootstrap.rs`, `run.rs`, `main.rs` (role enum if needed), `ukield.example.toml`, `crates/ukield/tests/bootstrap_test.rs`
+- [ ] Pinned-vector tests for both new domains; ordering normalization for Kafka
+  ranges; every semantic input changes the fingerprint; attempt details cannot
+  be supplied.
+- [ ] Catalog tests: same key+fingerprint is `AlreadyApplied`; forged
+  fingerprint is a permanent collision; before/after-COMMIT fault lookup returns
+  Absent/Committed for both domains.
+- [ ] Verify and commit:
 
-**Interfaces:**
-- `[[tables]]` keeps only hypertable concerns (schema, packing/sort/partition columns, placement/target_file_mb, namespaces) — `topic`/`ts_column` deleted.
-- New `[[stream_tables]]` (`name`, `topic`, columns) and `[[pipelines]]` (`name`, `from`, `to`, `sql`, optional `error_policy`) sections; bootstrap creates both idempotently and runs `validate_pipeline_sql` (source schema from the stream table / source hypertable; `TargetContract` from the target hypertable) — a config with invalid pipeline SQL refuses to start.
-- Roles: `ingest` runs one `PipelineIngest` per kafka-sourced pipeline; new role `mv` runs one `MvWorker` per parquet-sourced pipeline (default role set gains `mv`).
-- `ukield.example.toml` rewritten accordingly — the events pipeline carries the pipelines-note SELECT including a `WHERE ts` predicate with a comment: this is where the deleted plan-19 bounds live now, and a migration backfill is the same pipeline with a different predicate.
+```bash
+cargo test -p ukiel-core operation
+cargo test -p ukiel-catalog --features fault-injection -- --test-threads=2
+cargo clippy -p ukiel-core -p ukiel-catalog --all-targets -- -D warnings
+git commit -m "feat: identify pipeline ingest and mv mutations"
+```
 
-- [ ] Steps: failing bootstrap test (stream table + pipeline created idempotently; invalid SQL refused with a naming error) → implement → `cargo test -p ukield` + `make test` → commit `"feat: pipeline bootstrap and mv role in ukield"`.
+### Task 3: Pure deterministic SQL-over-batches crate
 
----
+**Files:**
 
-### Task 7: e2e adaptation + S9 (MV scenario)
+- Create: `crates/ukiel-pipeline/{Cargo.toml,src/{lib,error,validate,execute}.rs}`
+- Create: `crates/ukiel-pipeline/tests/{validation,execution,boundary}.rs`
+- Modify: root `Cargo.toml`
 
-**Files:** `crates/ukiel-e2e/src/lib.rs` (stack bootstraps stream table + pipeline instead of a route), scenario module for S9, `docs/superpowers/specs/2026-07-05-ukiel-testing-design.md` (S9 row)
+Interfaces:
 
-- [ ] Adapt the `Stack` harness to the pipeline config shape; all existing scenarios (S0–S8) must pass unmodified in their assertions — they prove the pipeline path preserves ingest semantics end-to-end.
-- [ ] Add **S9 — MV equivalence**: S1-style load; an aggregation pipeline into `daily_counts`; after quiescence (ingest + MV + compactor), the MV contents equal the oracle model's aggregation, including after a compaction pass on the source (no double-count — the `kind == "add"` rule under fire).
-- [ ] `make e2e` green; add the S9 row to the testing design's scenario table; commit `"test: e2e on pipelines; S9 MV equivalence scenario"`.
+```rust
+pub struct TargetContract { /* writable fields, required fields, target schema */ }
+pub struct PreparedPipeline { /* validated SQL/logical contract */ }
 
----
+pub async fn prepare_pipeline(
+    pipeline: &Pipeline,
+    source_schema: SchemaRef,
+    target: &TargetContract,
+) -> Result<PreparedPipeline, PipelineError>;
 
-### Task 8: Docs
+pub async fn execute_pipeline(
+    prepared: &PreparedPipeline,
+    input: RecordBatch,
+) -> Result<Vec<RecordBatch>, PipelineError>;
+```
 
-- [ ] Pipelines note: status header → implemented (v1 scope), egress still follow-up.
-- [ ] Design doc: Pipelines section marked implemented; "Backfills & migrations" updated (the per-table knob escape hatch is replaced by per-pipeline predicates — simplify the paragraph); MV bullet in the architecture diagram section now real.
-- [ ] Monitoring spec: `ingest_out_of_bounds_total` row replaced by a note (bounds are pipeline predicates now; skipped batches surface as `pipeline_batches_skipped_total{pipeline}` — add that row); README crate list (`ukiel-pipeline`) and quickstart updated to the pipeline config.
-- [ ] Roadmap row 8 → **Executed**; remove the "write after 18" note; row 23 (feed horizon) becomes writable — flip its gate note.
-- [ ] Full `make test` + `make e2e` first; commit `"docs: pipelines v1 shipped"`.
+Register only the declared source. Walk the logical expressions and reject any
+function whose volatility is not immutable. Reject joins/cross joins/multiple
+table scans and every DDL/DML/statement class outside one SELECT. Validate the
+output against the full writable target contract: required non-default fields,
+packing/sort/partition columns, compatible types, no alias writes, no unknown
+extra fields, and a valid optional event-time column.
 
----
+Execution uses a fresh single-use DataFusion context per input batch. The input
+schema and prepared schema must match exactly. Empty output retains the planned
+schema. This crate has no catalog, Kafka, object-store, Ukiel worker, or CLI
+dependency.
 
-## Self-review notes
+- [ ] Tests: filter/rename/derived partition; aggregation; missing key; wrong
+  type; alias/extra output; immutable function accepted; `now`, random, DDL,
+  DML, join, self-join, and second scan rejected; Kafka metadata predicate is
+  replay-stable.
+- [ ] Boundary test enforces the dependency rule.
+- [ ] Verify and commit:
 
-- **Note coverage:** engines (T1), no-direct-SELECT (kafka tables are not in the query provider's namespace resolution — nothing to do, they're a different entity), kafka→parquet incl. exactly-once and knob deletion (T4), parquet→parquet MV with add-only consumption + idempotency (T5), delivery column stored for egress (T1), error policy stall/skip (T1/T4/T5), creation-time validation incl. determinism and required-columns contract (T3/T6), fan-out explicitly deferred (one pipeline per topic→table in v1 — bootstrap rejects duplicates per source topic), joins rejected naturally (single registered table; anything else fails planning).
-- **Guardrail continuity:** backpressure port (T4), metrics continuity incl. freshness (T4), bounds deleted with doc trail (T4/T8), offset CAS untouched (flusher path reused verbatim).
-- **Double-count proof:** the S9 + T5 tests both exercise REPLACE-during-MV; the `kind == "add"` rule is load-bearing and tested twice.
-- **Type consistency:** `batch_to_l0_items` (T2) is consumed by both T4 and T5 with the same signature; `validate_pipeline_sql`'s `TargetContract` is built identically in T6 bootstrap and T3 tests; cursor/idempotency string formats (`pipeline:{name}` / `pipeline:{id}:through:{commit}`) are stated once and reused.
+```bash
+cargo test -p ukiel-pipeline
+cargo clippy -p ukiel-pipeline --all-targets -- -D warnings
+git commit -m "feat: validate and execute deterministic pipeline sql"
+```
+
+### Task 4: Shared batch-to-L0 publication path
+
+**Files:**
+
+- Create: `crates/ukiel-write/{Cargo.toml,src/{lib,error,writer,publisher}.rs}`
+- Create: `crates/ukiel-write/tests/{writer,publisher,boundary}.rs`
+- Modify: `crates/ukiel-ingest/src/{writer,flusher,lib,error}.rs`
+- Modify: `crates/ukiel-ingest/tests/consumer_test.rs`
+- Modify: root `Cargo.toml`
+
+Extract target writing without changing existing output. Source JSON decoding
+remains in `ukiel-ingest`:
+
+```rust
+pub fn rows_to_batch(..., rows: Vec<Value>) -> Result<RecordBatch, IngestError>;
+```
+
+`ukiel-write` exposes:
+
+```rust
+pub fn batches_to_l0_items(
+    batches: &[RecordBatch],
+    target: &Hypertable,
+) -> Result<Vec<FlushItem>, WriteError>;
+
+pub enum AddCommit<'a> {
+    Ingest { offsets: &'a [OffsetRange], identity: &'a OperationIdentity },
+    Plain { identity: &'a OperationIdentity, metric_role: &'static str },
+}
+
+pub async fn publish_add(
+    &self,
+    target: &Hypertable,
+    items: Vec<FlushItem>,
+    commit: AddCommit<'_>,
+) -> Result<CommitResult, WriteError>;
+```
+
+`batches_to_l0_items` applies defaults/materialized columns, sorts by the
+target sort key, groups by declared partition columns, and uses the shared L0
+writer properties. `publish_add` assigns paths, registers every pending object
+before upload, uploads, then calls `commit_with_offsets` or `commit`. It accepts
+a prebuilt identity so callers prove intent before object work. Empty ingest
+items still allow an offset-only ADD; empty MV output does not call it.
+
+Keep ingest metrics at the ingest caller boundary; `ukiel-write` emits
+catalog/object failure metrics with bounded `metric_role` only. The object-store
+wrapper continues to own cache prewarming. `ukiel-write` has no rdkafka,
+DataFusion, query-server, worker-supervisor, or CLI dependency.
+
+- [ ] Characterization tests prove existing ingest Parquet bytes, stats,
+  materialized columns, upload-intent ordering, offset CAS, and result are
+  unchanged.
+- [ ] Plain ADD test proves pending intents clear on success, survive failed
+  commit, and ambiguous errors carry the caller's identity.
+- [ ] Boundary test proves both ingest and MV can consume `ukiel-write` without
+  either depending on the other's source runtime.
+- [ ] Verify and commit:
+
+```bash
+cargo test -p ukiel-write -p ukiel-ingest -- --test-threads=2
+cargo clippy -p ukiel-write -p ukiel-ingest --all-targets -- -D warnings
+git commit -m "refactor: share idempotent l0 publication"
+```
+
+### Task 5: Kafka-to-Parquet pipeline worker
+
+**Files:**
+
+- Modify: `crates/ukiel-ingest/Cargo.toml`
+- Modify: `crates/ukiel-ingest/src/{config,consumer,flusher,error}.rs`
+- Modify: `crates/ukiel-ingest/tests/consumer_test.rs`
+
+Replace `TableRoute`/`RouteIngest` with catalog-loaded Kafka pipeline tasks
+inside one `IngestWorker`. A role rebuild creates a fresh worker, lists current
+immutable definitions, prepares SQL, creates fresh consumers, reloads catalog
+offsets, and explicitly seeks Kafka. Readiness fires only after every pipeline
+has prepared and positioned itself.
+
+Each buffered row includes the stable reserved Kafka broker append time. Flush:
+
+1. decode source JSON plus reserved metadata;
+2. execute prepared SQL;
+3. encode/sort/group target L0 items;
+4. run Plan-18 backpressure against the derived target partitions;
+5. build `OperationIdentity::pipeline_ingest` before any upload;
+6. publish parts and offsets atomically; and
+7. emit existing ingest/freshness metrics plus pipeline outcome metrics.
+
+`stall` retains rows and ranges. `skip` publishes an empty ADD with offsets and
+canonical identity, increments `pipeline_batches_skipped_total`, and drops the
+buffer only after commit/AlreadyApplied. Poison JSON remains the current visible
+per-message skip. No Kafka group offset is committed.
+
+Delete `TableRoute`, hardcoded day grouping, and the age/future knobs only in
+the same commit that lands the stable-metadata bounds tests. Keep generic flush,
+backpressure, and partition-spread settings.
+
+- [ ] Component tests: derived partition/filter; stable append-time predicate;
+  `LogAppendTime` accepted; `CreateTime`/unavailable become NULL; crash/rebuild
+  seeks catalog offsets; exact replay returns AlreadyApplied; changed pipeline
+  identity hits OffsetRace rather than double-applying; slowdown/stop/memory
+  valve; stall/skip; poison; readiness.
+- [ ] Verify and commit:
+
+```bash
+cargo test -p ukiel-ingest -- --test-threads=2
+cargo clippy -p ukiel-ingest --all-targets -- -D warnings
+git commit -m "feat: ingest through kafka sql pipelines"
+```
+
+### Task 6: Parquet-to-Parquet MV fleet
+
+**Files:**
+
+- Create: `crates/ukiel-mv/{Cargo.toml,src/{lib,error,reader,worker}.rs}`
+- Create: `crates/ukiel-mv/tests/{mv,recovery,boundary}.rs`
+- Modify: root `Cargo.toml`
+
+One `MvFleet` owns all catalog-listed Parquet-source pipelines under one
+supervised role. On every construction/rebuild it reloads definitions, target
+contracts, prepared SQL, and `mv/{pipeline_id}` cursors. Ready fires only after
+all are reconstructed from authority.
+
+`ukiel-mv` depends on `ukiel-pipeline` for transformation and `ukiel-write` for
+target publication. It does not depend on `ukiel-ingest`.
+
+For each pipeline, read ordered `changes_since(source, cursor, limit)` but
+process one event at a time. For ADD, read exactly `event.added` with schema
+adaptation, execute SQL, encode target items, build `OperationIdentity::mv`, and
+call shared `publish_add(Plain)`. Only after Committed/AlreadyApplied advance the
+monotonic cursor. For REPLACE/DELETE or empty output, advance without target
+mutation. `stall` preserves cursor; `skip` advances and counts.
+
+The cursor row created with the pipeline is the GC fence that keeps unread ADD
+objects alive even if compaction tombstones them. Never infer completion from
+object-store state. A target commit followed by a lost cursor acknowledgement
+is safe: rebuild either sees the advanced cursor or replays the same source
+commit into AlreadyApplied, then advances.
+
+Use bounded one-commit input and DataFusion's configured memory/spill behavior;
+record input rows/bytes, output rows/bytes, duration, feed lag, errors,
+AlreadyApplied, and skipped batches. Do not duplicate the ingest upload-intent
+path. No Kafka dependency in `ukiel-mv`.
+
+- [ ] Tests: two ADDs yield correct partial aggregates; source REPLACE and
+  DELETE do not double-count; cursor fence blocks GC; empty output; stall/skip;
+  crash after target commit before cursor; before/after-COMMIT ambiguity;
+  collision permanent; two workers converge exactly once while duplicate work
+  is counted honestly.
+- [ ] Boundary test enforces no Kafka and no query-server dependency.
+- [ ] Verify and commit:
+
+```bash
+cargo test -p ukiel-mv -p ukiel-gc -- --test-threads=2
+cargo clippy -p ukiel-mv --all-targets -- -D warnings
+git commit -m "feat: consume parquet changes into mv pipelines"
+```
+
+### Task 7: ukield configuration, bootstrap, recovery, health, and metrics
+
+**Files:**
+
+- Modify: `crates/ukield/src/{config,bootstrap,run,health,collector}.rs`
+- Modify: `crates/ukield/tests/{bootstrap_test,health_metrics_test,startup_recovery_test}.rs`
+- Modify: `ukield.example.toml`
+
+Configuration:
+
+- `[[tables]]` retains hypertable schema, packing/sort/partition/placement and
+  namespaces; remove `topic` and the ingest age/future knobs;
+- add `[[stream_tables]]` with name/topic/format/columns;
+- add `[[pipelines]]` with name/from/to/sql, optional delivery/error policy, and
+  optional `event_time_column`; and
+- add bounded MV poll/feed settings.
+
+Bootstrap order under `with_catalog_recovery` is hypertables, stream tables,
+then validated exact-match pipelines. Validate SQL before creating a new
+Parquet-source pipeline so its initial cursor is not installed for an invalid
+definition. Existing mismatch is permanent.
+
+Add `Role::Mv`, health label, default role membership, `WorkerUp`, readiness,
+and one `spawn_supervised` rebuild closure for `MvFleet`. Ingest and MV build
+closures must load definitions inside the new worker future on every attempt;
+capturing boot-time definitions across recovery is forbidden. The collector
+derives Kafka lag sources from Kafka pipelines and continues reporting catalog
+feed lag from `worker_cursors`.
+
+- [ ] Config/bootstrap tests: exact idempotency, mismatch refusal, invalid SQL
+  leaves no pipeline/cursor, role defaults, reserved metadata, example parses.
+- [ ] Recovery tests: ingest and MV each pass
+  Starting→Healthy→Degraded→Reconciling→Healthy independently; siblings stay
+  healthy; unknown/permanent errors fail the process.
+- [ ] Metrics tests cover bounded role/outcome labels and no operation key as a
+  metric label.
+- [ ] Verify and commit:
+
+```bash
+cargo test -p ukield -- --test-threads=2
+cargo clippy -p ukield --all-targets -- -D warnings
+git commit -m "feat: supervise pipeline ingest and mv roles"
+```
+
+### Task 8: End-to-end S12 and compatibility suite
+
+**Files:**
+
+- Modify: `crates/ukiel-e2e/src/lib.rs`
+- Modify: existing `crates/ukiel-e2e/tests/s0_*.rs` through `s11_*.rs` fixtures
+  as required; preserve their assertions
+- Create: `crates/ukiel-e2e/tests/s12_pipelines.rs`
+- Modify: `Makefile`
+- Modify: `docs/superpowers/specs/2026-07-05-ukiel-testing-design.md`
+
+Move the shared e2e stack from table routes to one stream table plus Kafka
+pipeline. S0–S11 must keep their existing semantic assertions, including S10
+catalog outage and S11 lost-ack recovery.
+
+S12 has two arms:
+
+1. **Pipeline/MV equivalence:** pipeline filtering and derived partitioning;
+   two source ADD commits; target partial aggregates re-aggregated to the oracle;
+   source compaction REPLACE causes no target change.
+2. **MV lost acknowledgement:** arm the existing commit-boundary seam for an MV
+   target ADD; before/after-COMMIT cases make the role Reconciling, rebuild from
+   cursor/feed authority, converge exactly once, and perform no second durable
+   target mutation. A collision fails permanently.
+
+The normal arm runs under `make e2e`; the fault arm joins `make e2e-ha`. Do not
+renumber S9–S11 or reuse their files.
+
+- [ ] Focused S12 passes repeatedly, then `make e2e-ha` passes at least eight
+  consecutive runs without process exit or duplicate logical target rows.
+- [ ] Full `make test` and `make e2e` pass.
+- [ ] Commit:
+
+```bash
+git commit -m "test: prove pipeline and mv recovery end to end"
+```
+
+### Task 9: Documentation and roadmap close-out
+
+**Files:**
+
+- Modify: `docs/notes/2026-07-06-pipelines.md`
+- Modify: `docs/superpowers/specs/2026-07-05-ukiel-design.md`
+- Modify: `docs/superpowers/specs/2026-07-06-ukiel-monitoring.md`
+- Modify: `README.md`
+- Modify: `docs/superpowers/plans/2026-07-05-ukiel-v1-roadmap.md`
+
+Mark v1 implemented; document immutable definitions, stable Kafka metadata,
+future-facing MV creation, partial aggregate semantics, shared-cursor
+active-active correctness/duplicate-work limitation, role recovery, config, and
+metrics. Remove the old age/future knob documentation only after its replacement
+is live. Keep egress, backfill, pipeline updates, aggregating compaction, and MV
+leases explicit follow-ups.
+
+Roadmap row 8 becomes Executed. Row 23 becomes ready to plan because all cursor
+consumers now exist; rows 24 and 26 become writable after this interface lands.
+
+- [ ] Documentation examples parse and names match the shipped metrics/config.
+- [ ] Final `cargo fmt --check`, full tests, and doc-link checks pass.
+- [ ] Commit separately from code:
+
+```bash
+git commit -m "docs: record pipelines v1 delivery"
+```
+
+## Final acceptance
+
+Plan 8 is complete only when:
+
+- Kafka routing is represented by immutable catalog pipelines, not `TableRoute`;
+- retries execute deterministic SQL over the same stable source metadata;
+- parts+offsets and MV target ADDs carry canonical operation identities;
+- every upload is intent-covered and every cursor is monotonic/GC-fencing;
+- ingest and MV reconstruct independently under the Plan-42 supervisor;
+- ambiguous MV commits reconcile through Plan 43 before rebuild;
+- REPLACE/DELETE never double-count an append-derived MV;
+- Plan-18/20/21 guardrails and observability remain live;
+- S0–S11 still pass and S12 proves ordinary plus lost-ack behavior; and
+- no claim is made that v1 supports historical MV backfill, in-place pipeline
+  updates, semantic aggregate merging, egress, or duplicate-work-free MV HA.
