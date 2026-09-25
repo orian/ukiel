@@ -42,13 +42,13 @@ pub use experiment::{
     RECONSTRUCTION_VERSION, ReconstructionManifest, ResolvedConfig, RewriteBias,
     VARIANT_DELTA_VERSION, VariantDeltaManifest, WorkloadBinding, is_known_config_path,
 };
+pub use index::{IndexKind, IndexedColumn, RowGroupIndex, SKIP_MANIFEST_VERSION, SkipManifest};
+pub use report::{HostInfo, REPORT_VERSION, ReportIdentity, RunReport, ToolVersions};
+pub use run_set::{RUN_SET_VERSION, RunSet, RunSetEntry, RunSetState};
 pub use scenario::{
     Backend, CacheProfile, Layer, ProjectionRole, ResultSink, RowGroupSelection, SCENARIO_VERSION,
     SamplePolicy, ScenarioManifest,
 };
-pub use index::{IndexKind, IndexedColumn, RowGroupIndex, SKIP_MANIFEST_VERSION, SkipManifest};
-pub use report::{HostInfo, REPORT_VERSION, ReportIdentity, RunReport, ToolVersions};
-pub use run_set::{RUN_SET_VERSION, RunSet, RunSetEntry, RunSetState};
 pub use snapshot::{
     LogicalProjection, SNAPSHOT_MANIFEST_VERSION, SnapshotFile, SnapshotManifest, SourceKind,
 };

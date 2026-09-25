@@ -16,7 +16,7 @@ pub use project::{
     PhysicalType, parse_physical_type, project_batch, projected_schema, validate_projections,
 };
 pub use write::{
-    ColumnConfig, ResolvedColumn, WriteOutcome, WriterConfig, decode_batches, input_schema_and_rows,
-    out_schema_for, parse_compression, parse_encoding, parse_statistics, project_batches,
-    resolve_footer, sorting_columns, write_prepared, write_projected,
+    ColumnConfig, ResolvedColumn, WriteOutcome, WriterConfig, decode_batches,
+    input_schema_and_rows, out_schema_for, parse_compression, parse_encoding, parse_statistics,
+    project_batches, resolve_footer, sorting_columns, write_prepared, write_projected,
 };

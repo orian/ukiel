@@ -78,7 +78,11 @@ fn aggregate_residency(paths: &[std::path::PathBuf]) -> Result<Residency> {
         resident += r;
         total += t;
     }
-    let fraction = if total == 0 { 1.0 } else { resident as f64 / total as f64 };
+    let fraction = if total == 0 {
+        1.0
+    } else {
+        resident as f64 / total as f64
+    };
     Ok(Residency {
         resident_fraction: fraction,
         pages_probed: total,
@@ -96,7 +100,10 @@ pub fn prepare(
     replace: bool,
 ) -> Result<(CacheReceipt, bool)> {
     if receipt_path.exists() && !replace {
-        bail!("receipt {} already exists; pass --replace", receipt_path.display());
+        bail!(
+            "receipt {} already exists; pass --replace",
+            receipt_path.display()
+        );
     }
     let dir = manifest_path.parent().unwrap_or(Path::new("."));
     let bytes = std::fs::read(manifest_path)
@@ -178,8 +185,14 @@ fn unavailable_receipt(
         target_files: files.iter().map(|(_, fd)| fd.clone()).collect(),
         requested_profile: profile,
         preparation_method: reason.to_string(),
-        residency_before: Residency { resident_fraction: 0.0, pages_probed: 0 },
-        residency_after: Residency { resident_fraction: 0.0, pages_probed: 0 },
+        residency_before: Residency {
+            resident_fraction: 0.0,
+            pages_probed: 0,
+        },
+        residency_after: Residency {
+            resident_fraction: 0.0,
+            pages_probed: 0,
+        },
         warm_floor: None,
         cold_ceiling: None,
         valid: false,

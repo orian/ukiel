@@ -36,14 +36,22 @@ async fn the_seven_classes_compile_and_pass_the_plan_guard() {
     let tmp = tempfile::tempdir().unwrap();
     let mp = common::write_snapshot(tmp.path(), false, 0, 400);
     let bindings = tmp.path().join("bindings.json");
-    std::fs::write(&bindings, serde_json::to_vec_pretty(&bindings_json()).unwrap()).unwrap();
+    std::fs::write(
+        &bindings,
+        serde_json::to_vec_pretty(&bindings_json()).unwrap(),
+    )
+    .unwrap();
 
     let suite_out = tmp.path().join("classes-suite.json");
     parquet_lab_bench::compile_classes(&mp, SuiteKind::ProdSynth, &bindings, &suite_out, false)
         .await
         .unwrap();
 
-    let suite = Suite::parse(&suite_out.display().to_string(), &std::fs::read(&suite_out).unwrap()).unwrap();
+    let suite = Suite::parse(
+        &suite_out.display().to_string(),
+        &std::fs::read(&suite_out).unwrap(),
+    )
+    .unwrap();
     assert_eq!(suite.queries.len(), 7);
     // Every class declares required columns, a sink, and a predicate shape.
     assert!(suite.queries.iter().all(|q| !q.required_columns.is_empty()));
@@ -81,7 +89,11 @@ async fn the_seven_classes_compile_and_pass_the_plan_guard() {
     .await
     .unwrap();
 
-    let report = RunReport::parse(&result.display().to_string(), &std::fs::read(&result).unwrap()).unwrap();
+    let report = RunReport::parse(
+        &result.display().to_string(),
+        &std::fs::read(&result).unwrap(),
+    )
+    .unwrap();
     let queries = report.body["queries"].as_array().unwrap();
     assert_eq!(queries.len(), 7);
     for q in queries {

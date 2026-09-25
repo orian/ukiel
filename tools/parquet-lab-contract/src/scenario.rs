@@ -114,7 +114,10 @@ impl CacheProfile {
     /// as opposed to *low* (cold). `decode-resident` preloads its own memory
     /// artifact and does not constrain the OS page cache.
     pub fn requires_warm(&self) -> bool {
-        matches!(self, CacheProfile::LocalOsWarm | CacheProfile::LocalReaderWarm)
+        matches!(
+            self,
+            CacheProfile::LocalOsWarm | CacheProfile::LocalReaderWarm
+        )
     }
 
     /// Whether this profile requires the OS page cache to be *evicted* (cold).
@@ -203,9 +206,7 @@ impl ScenarioManifest {
                 field: "id".to_string(),
             });
         }
-        if self.layer == Layer::Scan
-            && (self.projection.is_none() || self.selection.is_none())
-        {
+        if self.layer == Layer::Scan && (self.projection.is_none() || self.selection.is_none()) {
             return Err(ContractError::IncompleteScenario {
                 context: path.to_string(),
                 scenario: self.id.clone(),

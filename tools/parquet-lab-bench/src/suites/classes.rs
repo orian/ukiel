@@ -68,7 +68,10 @@ pub struct ClassQuery {
 }
 
 fn join_terms(cols: &[ClassColumn]) -> String {
-    cols.iter().map(|c| c.agg_term()).collect::<Vec<_>>().join(" + ")
+    cols.iter()
+        .map(|c| c.agg_term())
+        .collect::<Vec<_>>()
+        .join(" + ")
 }
 
 /// Generate the seven registered query classes for a binding.

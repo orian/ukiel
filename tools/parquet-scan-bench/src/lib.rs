@@ -74,16 +74,33 @@ pub struct ScanBenchReport {
 
 fn artifact_files(bytes: &[u8], path: &str) -> Result<Vec<(String, FileDigest)>> {
     if let Ok(r) = ReconstructionManifest::parse(path, bytes) {
-        return Ok(r.files.into_iter().map(|f| (f.output.path.clone(), f.output)).collect());
+        return Ok(r
+            .files
+            .into_iter()
+            .map(|f| (f.output.path.clone(), f.output))
+            .collect());
     }
     if let Ok(v) = VariantDeltaManifest::parse(path, bytes) {
-        return Ok(v.files.into_iter().map(|f| (f.output.path.clone(), f.output)).collect());
+        return Ok(v
+            .files
+            .into_iter()
+            .map(|f| (f.output.path.clone(), f.output))
+            .collect());
     }
     if let Ok(s) = SnapshotManifest::parse(path, bytes) {
         return Ok(s
             .files
             .into_iter()
-            .map(|f| (f.path.clone(), FileDigest { path: f.path, bytes: f.bytes, digest: f.digest }))
+            .map(|f| {
+                (
+                    f.path.clone(),
+                    FileDigest {
+                        path: f.path,
+                        bytes: f.bytes,
+                        digest: f.digest,
+                    },
+                )
+            })
             .collect());
     }
     bail!("{path}: not a reconstruction, variant-delta, or snapshot manifest")
@@ -199,7 +216,9 @@ pub fn run_scan(
         .with_context(|| format!("{}: not a workload binding", workload_path.display()))?;
 
     let scenario_digest = match scenario_path {
-        Some(p) => Some(digest_bytes(&std::fs::read(p).with_context(|| format!("reading {}", p.display()))?)),
+        Some(p) => Some(digest_bytes(
+            &std::fs::read(p).with_context(|| format!("reading {}", p.display()))?,
+        )),
         None => None,
     };
     let cache_receipt_digest = match cache_receipt_path {
@@ -207,7 +226,10 @@ pub fn run_scan(
             let rb = std::fs::read(p).with_context(|| format!("reading {}", p.display()))?;
             let receipt = CacheReceipt::parse(&p.display().to_string(), &rb)?;
             if !receipt.is_usable() {
-                bail!("cache receipt {} is invalid; refusing to time under an unachieved state", p.display());
+                bail!(
+                    "cache receipt {} is invalid; refusing to time under an unachieved state",
+                    p.display()
+                );
             }
             if receipt.target_manifest_digest != artifact_digest {
                 bail!("cache receipt was prepared for a different artifact");
@@ -294,8 +316,9 @@ pub fn run_scan(
     let mut out = Vec::with_capacity(samples as usize);
     let mut checksum = String::new();
     for i in 0..samples {
-        let (result, timing) =
-            measure::time(|| decode_once(&metas, &selected_indices, &projected_schema, &per_file_rgs));
+        let (result, timing) = measure::time(|| {
+            decode_once(&metas, &selected_indices, &projected_schema, &per_file_rgs)
+        });
         let (s, rows) = result?;
         if i == 0 {
             checksum = s.checksum();
@@ -314,9 +337,21 @@ pub fn run_scan(
             row_groups_opened,
             pages_opened: None,
             compressed_bytes: Some(compressed_bytes),
-            rows_per_second: if timing.wall_seconds > 0.0 { rows as f64 / timing.wall_seconds } else { 0.0 },
-            values_per_second: if timing.wall_seconds > 0.0 { s.values as f64 / timing.wall_seconds } else { 0.0 },
-            mib_per_second: if timing.wall_seconds > 0.0 { mib / timing.wall_seconds } else { 0.0 },
+            rows_per_second: if timing.wall_seconds > 0.0 {
+                rows as f64 / timing.wall_seconds
+            } else {
+                0.0
+            },
+            values_per_second: if timing.wall_seconds > 0.0 {
+                s.values as f64 / timing.wall_seconds
+            } else {
+                0.0
+            },
+            mib_per_second: if timing.wall_seconds > 0.0 {
+                mib / timing.wall_seconds
+            } else {
+                0.0
+            },
             max_rss_bytes: timing.max_rss_bytes,
         });
     }

@@ -51,7 +51,11 @@ async fn events_are_queryable_within_the_freshness_sla() {
     // The spec's real freshness knob: 10s flush interval, SLA <= 20s.
     let ingest = stack.spawn_ingest_with(&table, 10_000).await;
 
-    const N: usize = 12;
+    // Nearest-rank p95 is the maximum below 20 samples, which turns this into
+    // an accidental max-latency assertion and makes one polling-quantized
+    // observation fail the percentile SLO. Keep enough samples for p95 to
+    // exclude the slowest observation.
+    const N: usize = 20;
     let mut produced: HashMap<String, Instant> = HashMap::new();
     let mut latency: HashMap<String, Duration> = HashMap::new();
 

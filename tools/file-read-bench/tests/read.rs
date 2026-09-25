@@ -4,16 +4,18 @@
 
 use std::path::Path;
 
+use file_read_bench::ranges::Plan;
 use parquet_lab_contract::{
     CacheProfile, CacheReceipt, FileDigest, Fingerprint, ReconstructionManifest, Residency,
     ResolvedConfig, RewriteBias, VariantFileMap, digest_bytes,
 };
-use file_read_bench::ranges::Plan;
 
 fn write_file(dir: &Path, rel: &str, kib: usize) -> (FileDigest, Vec<u8>) {
     let path = dir.join(rel);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let bytes: Vec<u8> = (0..kib * 1024).map(|i| (i.wrapping_mul(31) % 253) as u8).collect();
+    let bytes: Vec<u8> = (0..kib * 1024)
+        .map(|i| (i.wrapping_mul(31) % 253) as u8)
+        .collect();
     std::fs::write(&path, &bytes).unwrap();
     (FileDigest::of(rel, &bytes), bytes)
 }
@@ -103,8 +105,14 @@ fn a_bound_cache_receipt_must_match_the_artifact() {
         target_files: vec![f0.clone()],
         requested_profile: CacheProfile::LocalOsWarm,
         preparation_method: "read-all-ranges+mincore".into(),
-        residency_before: Residency { resident_fraction: 1.0, pages_probed: 10 },
-        residency_after: Residency { resident_fraction: 1.0, pages_probed: 10 },
+        residency_before: Residency {
+            resident_fraction: 1.0,
+            pages_probed: 10,
+        },
+        residency_after: Residency {
+            resident_fraction: 1.0,
+            pages_probed: 10,
+        },
         warm_floor: Some(0.90),
         cold_ceiling: None,
         valid: true,
@@ -123,7 +131,10 @@ fn a_bound_cache_receipt_must_match_the_artifact() {
     assert!(err.to_string().contains("different artifact"), "{err}");
 
     // A receipt correctly bound to this artifact is accepted and its digest recorded.
-    let right = CacheReceipt { target_manifest_digest: artifact_digest, ..wrong };
+    let right = CacheReceipt {
+        target_manifest_digest: artifact_digest,
+        ..wrong
+    };
     let right_path = tmp.path().join("right-receipt.json");
     std::fs::write(&right_path, serde_json::to_vec_pretty(&right).unwrap()).unwrap();
     let report = file_read_bench::run_bench(
@@ -154,22 +165,22 @@ fn an_invalid_cache_receipt_is_refused() {
         target_files: vec![f0],
         requested_profile: CacheProfile::LocalOsCold,
         preparation_method: "posix_fadvise(DONTNEED)+mincore".into(),
-        residency_before: Residency { resident_fraction: 1.0, pages_probed: 10 },
-        residency_after: Residency { resident_fraction: 0.9, pages_probed: 10 },
+        residency_before: Residency {
+            resident_fraction: 1.0,
+            pages_probed: 10,
+        },
+        residency_after: Residency {
+            resident_fraction: 0.9,
+            pages_probed: 10,
+        },
         warm_floor: None,
         cold_ceiling: Some(0.10),
         valid: false,
     };
     let p = tmp.path().join("invalid.json");
     std::fs::write(&p, serde_json::to_vec_pretty(&invalid).unwrap()).unwrap();
-    let err = file_read_bench::run_bench(
-        &mp,
-        Plan::All,
-        0.1,
-        1,
-        Some(&p),
-        &tmp.path().join("r.json"),
-    )
-    .unwrap_err();
+    let err =
+        file_read_bench::run_bench(&mp, Plan::All, 0.1, 1, Some(&p), &tmp.path().join("r.json"))
+            .unwrap_err();
     assert!(err.to_string().contains("invalid"), "{err}");
 }

@@ -54,7 +54,8 @@ pub fn page_residency(path: &Path) -> Result<(u64, u64)> {
 
 /// Pull a file's bytes into the OS page cache by reading it end to end.
 pub fn warm(path: &Path) -> Result<u64> {
-    let bytes = std::fs::read(path).map_err(|e| anyhow::anyhow!("warming {}: {e}", path.display()))?;
+    let bytes =
+        std::fs::read(path).map_err(|e| anyhow::anyhow!("warming {}: {e}", path.display()))?;
     Ok(bytes.len() as u64)
 }
 
@@ -68,7 +69,10 @@ pub fn evict(path: &Path) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("opening {} to evict: {e}", path.display()))?;
     let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
     if rc != 0 {
-        bail!("posix_fadvise(DONTNEED) on {} returned {rc}", path.display());
+        bail!(
+            "posix_fadvise(DONTNEED) on {} returned {rc}",
+            path.display()
+        );
     }
     Ok(())
 }

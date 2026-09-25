@@ -19,13 +19,25 @@ use parquet_lab_integrity::{LogicalColumn, LogicalRowMultiset, LogicalSchema, Lo
 fn built_closure(package: &str) -> HashSet<String> {
     let out = Command::new(env!("CARGO"))
         .args([
-            "tree", "-p", package, "-e", "normal", "--prefix", "none", "--format", "{lib}",
+            "tree",
+            "-p",
+            package,
+            "-e",
+            "normal",
+            "--prefix",
+            "none",
+            "--format",
+            "{lib}",
             "--manifest-path",
             concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
         ])
         .output()
         .expect("cargo tree");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout)
         .unwrap()
         .lines()
@@ -68,18 +80,39 @@ fn schema() -> Arc<Schema> {
 
 fn logical_schema() -> LogicalSchema {
     LogicalSchema::new(vec![
-        LogicalColumn { name: "team_id".into(), logical: LogicalType::SignedInt },
-        LogicalColumn { name: "timestamp".into(), logical: LogicalType::TimestampMillis },
-        LogicalColumn { name: "name".into(), logical: LogicalType::Utf8 },
-        LogicalColumn { name: "value".into(), logical: LogicalType::Float64 },
+        LogicalColumn {
+            name: "team_id".into(),
+            logical: LogicalType::SignedInt,
+        },
+        LogicalColumn {
+            name: "timestamp".into(),
+            logical: LogicalType::TimestampMillis,
+        },
+        LogicalColumn {
+            name: "name".into(),
+            logical: LogicalType::Utf8,
+        },
+        LogicalColumn {
+            name: "value".into(),
+            logical: LogicalType::Float64,
+        },
     ])
 }
 
 fn batch(n: usize) -> RecordBatch {
     let teams: Vec<i64> = (0..n as i64).map(|i| i / 4).collect();
-    let ts: Vec<i64> = (0..n as i64).map(|i| 1_782_864_000_000 + i * 1000).collect();
-    let names: Vec<Option<String>> =
-        (0..n).map(|i| if i % 5 == 0 { None } else { Some(format!("evt-{i}")) }).collect();
+    let ts: Vec<i64> = (0..n as i64)
+        .map(|i| 1_782_864_000_000 + i * 1000)
+        .collect();
+    let names: Vec<Option<String>> = (0..n)
+        .map(|i| {
+            if i % 5 == 0 {
+                None
+            } else {
+                Some(format!("evt-{i}"))
+            }
+        })
+        .collect();
     let vals: Vec<Option<f64>> = (0..n).map(|i| Some(i as f64 * 1.25)).collect();
     RecordBatch::try_new(
         schema(),
@@ -176,12 +209,23 @@ fn the_bench_times_a_write_and_binds_the_artifact() {
     assert_eq!(report.samples.len(), 4);
     assert_eq!(report.total_rows, 400);
     assert_eq!(report.compression, "zstd(1)");
-    assert!(report.samples.iter().all(|s| s.output_bytes > 0 && s.rows == 400));
-    assert_eq!(report.artifact_digest, digest_bytes(&std::fs::read(&mp).unwrap()));
+    assert!(
+        report
+            .samples
+            .iter()
+            .all(|s| s.output_bytes > 0 && s.rows == 400)
+    );
+    assert_eq!(
+        report.artifact_digest,
+        digest_bytes(&std::fs::read(&mp).unwrap())
+    );
     // The report is on disk and re-parses.
     let back: parquet_write_bench::WriterBenchReport =
         serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
-    assert_eq!(back.report_version, parquet_write_bench::WRITE_BENCH_VERSION);
+    assert_eq!(
+        back.report_version,
+        parquet_write_bench::WRITE_BENCH_VERSION
+    );
 }
 
 #[test]

@@ -33,8 +33,9 @@ pub fn execute(files: &[std::path::PathBuf], plan_ranges: &[Range]) -> Result<Re
         requested += r.length;
         let file = &files[r.file];
         if handles[r.file].is_none() {
-            handles[r.file] =
-                Some(std::fs::File::open(file).with_context(|| format!("opening {}", file.display()))?);
+            handles[r.file] = Some(
+                std::fs::File::open(file).with_context(|| format!("opening {}", file.display()))?,
+            );
         }
         let fh = handles[r.file].as_mut().unwrap();
         fh.seek(SeekFrom::Start(r.offset))
@@ -42,9 +43,9 @@ pub fn execute(files: &[std::path::PathBuf], plan_ranges: &[Range]) -> Result<Re
         let mut remaining = r.length as usize;
         while remaining > 0 {
             let want = remaining.min(buf.len());
-            let n = fh.read(&mut buf[..want]).with_context(|| {
-                format!("reading {} at {}", file.display(), r.offset)
-            })?;
+            let n = fh
+                .read(&mut buf[..want])
+                .with_context(|| format!("reading {} at {}", file.display(), r.offset))?;
             reads += 1;
             if n == 0 {
                 bail!(

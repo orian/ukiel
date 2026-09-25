@@ -26,10 +26,21 @@ pub fn schema() -> Arc<Schema> {
 fn batch(base: i64, n: usize) -> RecordBatch {
     let teams: Vec<i64> = (0..n as i64).map(|i| base + i).collect();
     let urls: Vec<Option<String>> = (0..n)
-        .map(|i| if i % 9 == 0 { None } else { Some(format!("http://h/{}/{i}", base)) })
+        .map(|i| {
+            if i % 9 == 0 {
+                None
+            } else {
+                Some(format!("http://h/{}/{i}", base))
+            }
+        })
         .collect();
     let body: Vec<Option<String>> = (0..n)
-        .map(|i| Some(format!("body text number {} for row {i} lorem ipsum", base + i as i64)))
+        .map(|i| {
+            Some(format!(
+                "body text number {} for row {i} lorem ipsum",
+                base + i as i64
+            ))
+        })
         .collect();
     RecordBatch::try_new(
         schema(),

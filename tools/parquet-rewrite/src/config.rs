@@ -19,10 +19,19 @@ use crate::spec::{ColumnSpec, VariantSpec};
 pub fn spec_to_config(spec: &VariantSpec) -> ResolvedConfig {
     let mut m: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     m.insert("global.row_group_rows".into(), spec.row_group_rows.into());
-    m.insert("global.key_boundary_flush".into(), spec.key_boundary_flush.into());
-    m.insert("global.write_batch_rows".into(), spec.write_batch_rows.into());
+    m.insert(
+        "global.key_boundary_flush".into(),
+        spec.key_boundary_flush.into(),
+    );
+    m.insert(
+        "global.write_batch_rows".into(),
+        spec.write_batch_rows.into(),
+    );
     m.insert("global.data_page_bytes".into(), spec.data_page_bytes.into());
-    m.insert("global.dictionary_page_bytes".into(), spec.dictionary_page_bytes.into());
+    m.insert(
+        "global.dictionary_page_bytes".into(),
+        spec.dictionary_page_bytes.into(),
+    );
     m.insert("global.statistics".into(), spec.statistics.clone().into());
     m.insert("global.offset_index".into(), spec.offset_index.into());
     m.insert("global.compression".into(), spec.compression.clone().into());
@@ -90,15 +99,17 @@ pub fn config_to_spec(label: &str, config: &ResolvedConfig) -> Result<VariantSpe
         let Some((name, suffix)) = rest.rsplit_once('.') else {
             bail!("malformed column config path '{path}'");
         };
-        let col = columns.entry(name.to_string()).or_insert_with(|| ColumnSpec {
-            name: name.to_string(),
-            encoding: None,
-            dictionary: None,
-            compression: None,
-            bloom_fpp: None,
-            bloom_ndv: None,
-            physical_type: None,
-        });
+        let col = columns
+            .entry(name.to_string())
+            .or_insert_with(|| ColumnSpec {
+                name: name.to_string(),
+                encoding: None,
+                dictionary: None,
+                compression: None,
+                bloom_fpp: None,
+                bloom_ndv: None,
+                physical_type: None,
+            });
         match suffix {
             "encoding" => col.encoding = value.as_str().map(str::to_string),
             "dictionary" => col.dictionary = value.as_bool(),

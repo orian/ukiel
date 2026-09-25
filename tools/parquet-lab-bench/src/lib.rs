@@ -249,8 +249,14 @@ pub async fn compile_classes(
         )?;
         // The plan guard must accept the control's own plan, or the class is mis-declared.
         let plan = runner::physical_plan(&session, &c.sql).await?;
-        plan_guard::assert_physical_plan(&c.name, &plan, &c.required_columns, c.sink, c.predicate_shape)
-            .with_context(|| format!("class '{}' is mis-declared against the control", c.name))?;
+        plan_guard::assert_physical_plan(
+            &c.name,
+            &plan,
+            &c.required_columns,
+            c.sink,
+            c.predicate_shape,
+        )
+        .with_context(|| format!("class '{}' is mis-declared against the control", c.name))?;
         queries.push(parquet_lab_contract::Query {
             name: c.name,
             sql: c.sql,

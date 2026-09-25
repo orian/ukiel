@@ -8,13 +8,25 @@ use std::process::Command;
 fn built_closure(package: &str) -> HashSet<String> {
     let out = Command::new(env!("CARGO"))
         .args([
-            "tree", "-p", package, "-e", "normal", "--prefix", "none", "--format", "{lib}",
+            "tree",
+            "-p",
+            package,
+            "-e",
+            "normal",
+            "--prefix",
+            "none",
+            "--format",
+            "{lib}",
             "--manifest-path",
             concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
         ])
         .output()
         .expect("cargo tree");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout)
         .unwrap()
         .lines()
@@ -37,7 +49,10 @@ fn the_cache_controller_parses_no_parquet_and_reaches_no_service() {
         "file-read-bench",
         "parquet-rewrite",
     ] {
-        assert!(!deps.contains(forbidden), "parquet-cachectl must not reach {forbidden}");
+        assert!(
+            !deps.contains(forbidden),
+            "parquet-cachectl must not reach {forbidden}"
+        );
     }
     assert!(deps.contains("libc"));
     assert!(deps.contains("parquet-lab-contract"));

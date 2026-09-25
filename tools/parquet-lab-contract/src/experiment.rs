@@ -161,7 +161,12 @@ impl ReconstructionManifest {
                 path: path.to_string(),
                 source,
             })?;
-        check_version(path, &value, RECONSTRUCTION_VERSION, "reconstruction_version")?;
+        check_version(
+            path,
+            &value,
+            RECONSTRUCTION_VERSION,
+            "reconstruction_version",
+        )?;
         let m: ReconstructionManifest =
             serde_json::from_value(value).map_err(|source| ContractError::Parse {
                 path: path.to_string(),

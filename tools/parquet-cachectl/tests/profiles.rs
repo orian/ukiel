@@ -77,10 +77,17 @@ fn warm_reaches_its_floor_and_the_receipt_binds_the_file() {
         false,
     )
     .unwrap();
-    assert!(valid, "warm should reach its floor, got {}", receipt.residency_after.resident_fraction);
+    assert!(
+        valid,
+        "warm should reach its floor, got {}",
+        receipt.residency_after.resident_fraction
+    );
     assert_eq!(receipt.target_files.len(), 1);
     assert_eq!(receipt.target_files[0].digest, fd.digest);
-    assert_eq!(receipt.target_manifest_digest, digest_bytes(&std::fs::read(&mp).unwrap()));
+    assert_eq!(
+        receipt.target_manifest_digest,
+        digest_bytes(&std::fs::read(&mp).unwrap())
+    );
 }
 
 #[test]
@@ -90,8 +97,15 @@ fn eviction_reaches_the_cold_ceiling_or_is_reported_unavailable() {
     let mp = manifest_over(tmp.path(), fd);
     // Warm it first so there is something to evict.
     let warm_receipt = tmp.path().join("warm.json");
-    parquet_cachectl::prepare(&mp, CacheProfile::LocalOsWarm, &warm_receipt, 0.90, 0.10, false)
-        .unwrap();
+    parquet_cachectl::prepare(
+        &mp,
+        CacheProfile::LocalOsWarm,
+        &warm_receipt,
+        0.90,
+        0.10,
+        false,
+    )
+    .unwrap();
 
     let cold_receipt = tmp.path().join("cold.json");
     let (receipt, valid) = parquet_cachectl::prepare(
@@ -112,11 +126,9 @@ fn eviction_reaches_the_cold_ceiling_or_is_reported_unavailable() {
         assert!(!receipt.valid);
     }
     // The receipt on disk re-parses (its validity is self-consistent).
-    let back = parquet_lab_contract::CacheReceipt::parse(
-        "cold",
-        &std::fs::read(&cold_receipt).unwrap(),
-    )
-    .unwrap();
+    let back =
+        parquet_lab_contract::CacheReceipt::parse("cold", &std::fs::read(&cold_receipt).unwrap())
+            .unwrap();
     assert_eq!(back.requested_profile, CacheProfile::LocalOsCold);
 }
 
@@ -130,8 +142,14 @@ fn a_forced_ineffective_cold_receipt_is_refused_by_the_contract() {
         target_files: vec![FileDigest::of("x", b"x")],
         requested_profile: CacheProfile::LocalOsCold,
         preparation_method: "posix_fadvise(DONTNEED)+mincore".into(),
-        residency_before: parquet_lab_contract::Residency { resident_fraction: 1.0, pages_probed: 10 },
-        residency_after: parquet_lab_contract::Residency { resident_fraction: 0.8, pages_probed: 10 },
+        residency_before: parquet_lab_contract::Residency {
+            resident_fraction: 1.0,
+            pages_probed: 10,
+        },
+        residency_after: parquet_lab_contract::Residency {
+            resident_fraction: 0.8,
+            pages_probed: 10,
+        },
         warm_floor: None,
         cold_ceiling: Some(0.10),
         valid: true,
@@ -170,6 +188,9 @@ fn other_files_are_not_evicted() {
     let _ = &bystander;
     if total > 0 {
         let frac = resident as f64 / total as f64;
-        assert!(frac > 0.5, "the bystander file should remain resident, got {frac}");
+        assert!(
+            frac > 0.5,
+            "the bystander file should remain resident, got {frac}"
+        );
     }
 }

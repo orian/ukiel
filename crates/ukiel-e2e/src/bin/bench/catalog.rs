@@ -25,6 +25,8 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 
+type PartTruthSample = (Vec<i64>, Option<serde_json::Value>, Option<Vec<u8>>);
+
 // ---------------------------------------------------------------------------
 // Demand model
 // ---------------------------------------------------------------------------
@@ -796,7 +798,7 @@ async fn verify_via_product_api(
     // The stored bitmap must decode back to the very keys the part declares. This
     // is the one the old fixture failed: it wrote one constant blob, unrelated to
     // anything, so the provider's exact filter was being tested against fiction.
-    let sample: Vec<(Vec<i64>, Option<serde_json::Value>, Option<Vec<u8>>)> = sqlx::query_as(
+    let sample: Vec<PartTruthSample> = sqlx::query_as(
         "SELECT packing_keys, column_stats, key_filter FROM parts
          WHERE deleted_by_commit IS NULL AND packing_keys IS NOT NULL
            AND column_stats ? 'packing_keys'

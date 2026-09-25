@@ -67,7 +67,10 @@ fn main() -> ExitCode {
     ) {
         Ok(r) => {
             if r.metadata_only {
-                println!("wrote {} (zero-selection metadata control)", cli.report.display());
+                println!(
+                    "wrote {} (zero-selection metadata control)",
+                    cli.report.display()
+                );
             } else {
                 println!(
                     "wrote {} ({} / {}, median {:.4}s, {:.1} MiB/s)",

@@ -41,19 +41,33 @@ pub fn build(plan: Plan, file_lengths: &[u64], fraction: f64) -> Vec<Range> {
             .iter()
             .enumerate()
             .filter(|&(_, &l)| l > 0)
-            .map(|(file, &length)| Range { file, offset: 0, length })
+            .map(|(file, &length)| Range {
+                file,
+                offset: 0,
+                length,
+            })
             .collect(),
         Plan::One => file_lengths
             .iter()
             .enumerate()
             .find(|&(_, &l)| l > 0)
-            .map(|(file, &length)| vec![Range { file, offset: 0, length }])
+            .map(|(file, &length)| {
+                vec![Range {
+                    file,
+                    offset: 0,
+                    length,
+                }]
+            })
             .unwrap_or_default(),
         Plan::Contiguous => file_lengths
             .iter()
             .enumerate()
             .filter(|&(_, &l)| l > 0)
-            .map(|(file, &len)| Range { file, offset: 0, length: budget(len, fraction) })
+            .map(|(file, &len)| Range {
+                file,
+                offset: 0,
+                length: budget(len, fraction),
+            })
             .collect(),
         Plan::Sparse => {
             let mut out = Vec::new();
@@ -77,7 +91,11 @@ pub fn build(plan: Plan, file_lengths: &[u64], fraction: f64) -> Vec<Range> {
                     if offset + length > len {
                         offset = len - length;
                     }
-                    out.push(Range { file, offset, length });
+                    out.push(Range {
+                        file,
+                        offset,
+                        length,
+                    });
                 }
             }
             out

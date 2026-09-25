@@ -100,7 +100,8 @@ fn product_snapshot(tmp: &std::path::Path) -> std::path::PathBuf {
     common::write_snapshot(&product_dir, &[common::event_batch(200, 1)])
 }
 
-const BASELINE: &str = "label = \"reconstruction\"\nrow_group_rows = 131072\ncompression = \"zstd(1)\"\n";
+const BASELINE: &str =
+    "label = \"reconstruction\"\nrow_group_rows = 131072\ncompression = \"zstd(1)\"\n";
 
 const ZSTD6_DELTA: &str = r#"
 version = "ukiel-parquet-variant-delta/v1"
@@ -119,7 +120,10 @@ fn product_bytes_cannot_be_rewritten_in_place() {
     // Output == the product's own directory: refused before any file is opened.
     let product_dir = mp.parent().unwrap().to_path_buf();
     let err = parquet_rewrite::run_reconstruct(&mp, &baseline, &product_dir).unwrap_err();
-    assert!(err.to_string().contains("immutable control directory"), "{err}");
+    assert!(
+        err.to_string().contains("immutable control directory"),
+        "{err}"
+    );
     // A file inside the product directory is equally refused.
     let inside = product_dir.join("reconstruction");
     let err = parquet_rewrite::run_reconstruct(&mp, &baseline, &inside).unwrap_err();
@@ -140,7 +144,10 @@ fn reconstruction_binds_its_exact_product_parent_and_preserves_the_fingerprint()
     )
     .unwrap();
     assert!(reco.check_parent(&product_digest).is_ok());
-    assert_eq!(reco.resolved_config.fields["global.compression"], serde_json::json!("zstd(1)"));
+    assert_eq!(
+        reco.resolved_config.fields["global.compression"],
+        serde_json::json!("zstd(1)")
+    );
     assert_eq!(reco.files[0].output_rows, 200);
 }
 
@@ -160,8 +167,14 @@ fn a_zstd6_delta_reconstructs_then_varies_only_compression() {
         &std::fs::read(&variant_path).unwrap(),
     )
     .unwrap();
-    assert_eq!(variant.allowed_changes, vec!["global.compression".to_string()]);
-    assert_eq!(variant.resolved_config.fields["global.compression"], serde_json::json!("zstd(6)"));
+    assert_eq!(
+        variant.allowed_changes,
+        vec!["global.compression".to_string()]
+    );
+    assert_eq!(
+        variant.resolved_config.fields["global.compression"],
+        serde_json::json!("zstd(6)")
+    );
     // Row count and membership preserved.
     assert_eq!(variant.files[0].output_rows, 200);
 
@@ -197,8 +210,12 @@ compression = "zstd(6)"
 row_group_rows = 64
 "#;
     let delta = common::write_spec(tmp.path(), "bad.toml", bad);
-    let err = parquet_rewrite::run_vary(&reco_manifest, &delta, &tmp.path().join("bad")).unwrap_err();
-    assert!(err.to_string().contains("allowed_changes") || err.to_string().contains("allowlist"), "{err}");
+    let err =
+        parquet_rewrite::run_vary(&reco_manifest, &delta, &tmp.path().join("bad")).unwrap_err();
+    assert!(
+        err.to_string().contains("allowed_changes") || err.to_string().contains("allowlist"),
+        "{err}"
+    );
     assert!(!tmp.path().join("bad").join("manifest.json").exists());
 }
 
@@ -219,7 +236,8 @@ allowed_changes = ["global.magic_unicorn"]
 compression = "zstd(6)"
 "#;
     let delta = common::write_spec(tmp.path(), "bad.toml", bad);
-    let err = parquet_rewrite::run_vary(&reco_manifest, &delta, &tmp.path().join("bad2")).unwrap_err();
+    let err =
+        parquet_rewrite::run_vary(&reco_manifest, &delta, &tmp.path().join("bad2")).unwrap_err();
     // The change (global.compression) is not in the (unknown) allowlist, so it fails —
     // either as an allowlist violation or an unknown allowlist path.
     assert!(err.to_string().contains("allow"), "{err}");
