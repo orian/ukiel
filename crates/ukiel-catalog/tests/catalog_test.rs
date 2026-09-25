@@ -3325,7 +3325,10 @@ async fn the_key_filter_agrees_between_rust_and_sql() {
     // *in* a part is ever pruned away from it.
     for (keys, (path, _)) in sets.iter().zip(&expected) {
         for key in keys {
-            let got = catalog.live_parts_pruned(ht, Some(*key), &[]).await.unwrap();
+            let got = catalog
+                .live_parts_pruned(ht, Some(*key), &[])
+                .await
+                .unwrap();
             assert!(
                 got.iter().any(|p| p.meta.path == *path),
                 "{path} holds key {key} and the catalog did not return it"

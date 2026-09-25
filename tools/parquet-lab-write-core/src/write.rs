@@ -123,9 +123,9 @@ impl WriterConfig {
         let u64_of = |k: &str, d: u64| -> Result<u64> {
             match f.get(k) {
                 None => Ok(d),
-                Some(v) => v
-                    .as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("config field '{k}' is not an unsigned integer")),
+                Some(v) => v.as_u64().ok_or_else(|| {
+                    anyhow::anyhow!("config field '{k}' is not an unsigned integer")
+                }),
             }
         };
         let bool_of = |k: &str, d: bool| -> Result<bool> {
@@ -153,10 +153,12 @@ impl WriterConfig {
             let Some((name, suffix)) = rest.rsplit_once('.') else {
                 bail!("malformed column config path '{path}'");
             };
-            let col = columns.entry(name.to_string()).or_insert_with(|| ColumnConfig {
-                name: name.to_string(),
-                ..Default::default()
-            });
+            let col = columns
+                .entry(name.to_string())
+                .or_insert_with(|| ColumnConfig {
+                    name: name.to_string(),
+                    ..Default::default()
+                });
             match suffix {
                 "encoding" => col.encoding = value.as_str().map(str::to_string),
                 "dictionary" => col.dictionary = value.as_bool(),
@@ -270,7 +272,10 @@ pub fn project_batches(
     batches: &[arrow::array::RecordBatch],
     projections: &BTreeMap<String, PhysicalType>,
 ) -> Result<Vec<arrow::array::RecordBatch>> {
-    batches.iter().map(|b| project_batch(b, projections)).collect()
+    batches
+        .iter()
+        .map(|b| project_batch(b, projections))
+        .collect()
 }
 
 /// Write already-decoded, already-projected batches to a sink under `props`. This is the

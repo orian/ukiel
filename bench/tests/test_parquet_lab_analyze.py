@@ -44,11 +44,13 @@ def write_run(dirpath, reps, seed=7, control_end=None):
         bp = os.path.join(rd, "bench", f"{rid}.json")
         with open(bp, "w") as fh:
             json.dump(rep_report, fh)
+        with open(bp, "rb") as fh:
+            report_digest = hashlib.sha256(fh.read()).hexdigest()
         schedule.append({
             "repetition": r, "order_index": order, "artifact_kind": kind, "label": label,
             "report_id": rid, "spec_path": "", "artifact_digest": "", "spec_digest": "",
             "expected_report_id": f"rep{r}/{rid}",
-            "report_digest": hashlib.sha256(open(bp, "rb").read()).hexdigest(),
+            "report_digest": report_digest,
         })
 
     for r, labels in enumerate(reps):

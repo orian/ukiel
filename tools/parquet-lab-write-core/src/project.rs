@@ -153,7 +153,10 @@ pub fn project_batch(
             }
         }
     }
-    Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?)
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?)
 }
 
 fn project_column(

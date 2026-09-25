@@ -129,8 +129,8 @@ impl RowMultiset {
         for (a, b) in self.xor.iter_mut().zip(&digest) {
             *a ^= *b;
         }
-        for (lane, chunk) in self.sum.iter_mut().zip(digest.chunks_exact(8)) {
-            let v = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+        for (lane, chunk) in self.sum.iter_mut().zip(digest.as_chunks::<8>().0) {
+            let v = u64::from_le_bytes(*chunk);
             *lane = lane.wrapping_add(v);
         }
     }

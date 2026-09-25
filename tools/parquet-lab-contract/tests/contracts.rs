@@ -728,8 +728,14 @@ fn cache_receipt(profile: CacheProfile, resident_after: f64, valid: bool) -> Cac
         target_files: vec![FileDigest::of("parquet/part-00000.parquet", b"out")],
         requested_profile: profile,
         preparation_method: "posix_fadvise(DONTNEED)+mincore".into(),
-        residency_before: Residency { resident_fraction: 1.0, pages_probed: 1000 },
-        residency_after: Residency { resident_fraction: resident_after, pages_probed: 1000 },
+        residency_before: Residency {
+            resident_fraction: 1.0,
+            pages_probed: 1000,
+        },
+        residency_after: Residency {
+            resident_fraction: resident_after,
+            pages_probed: 1000,
+        },
         warm_floor: Some(0.90),
         cold_ceiling: Some(0.10),
         valid,
@@ -760,51 +766,88 @@ fn experiment() -> ExperimentManifest {
 #[test]
 fn every_causal_contract_round_trips() {
     let r = reconstruction();
-    assert_eq!(r, ReconstructionManifest::parse("r", &serde_json::to_vec_pretty(&r).unwrap()).unwrap());
+    assert_eq!(
+        r,
+        ReconstructionManifest::parse("r", &serde_json::to_vec_pretty(&r).unwrap()).unwrap()
+    );
     let d = zstd6_delta();
-    assert_eq!(d, VariantDeltaManifest::parse("d", &serde_json::to_vec_pretty(&d).unwrap()).unwrap());
+    assert_eq!(
+        d,
+        VariantDeltaManifest::parse("d", &serde_json::to_vec_pretty(&d).unwrap()).unwrap()
+    );
     let s = scenario();
-    assert_eq!(s, ScenarioManifest::parse("s", &serde_json::to_vec_pretty(&s).unwrap()).unwrap());
+    assert_eq!(
+        s,
+        ScenarioManifest::parse("s", &serde_json::to_vec_pretty(&s).unwrap()).unwrap()
+    );
     let c = cache_receipt(CacheProfile::LocalOsCold, 0.05, true);
-    assert_eq!(c, CacheReceipt::parse("c", &serde_json::to_vec_pretty(&c).unwrap()).unwrap());
+    assert_eq!(
+        c,
+        CacheReceipt::parse("c", &serde_json::to_vec_pretty(&c).unwrap()).unwrap()
+    );
     let e = experiment();
-    assert_eq!(e, ExperimentManifest::parse("e", &serde_json::to_vec_pretty(&e).unwrap()).unwrap());
+    assert_eq!(
+        e,
+        ExperimentManifest::parse("e", &serde_json::to_vec_pretty(&e).unwrap()).unwrap()
+    );
 }
 
 #[test]
 fn causal_contract_versions_fail_closed() {
     let mut v = serde_json::to_value(reconstruction()).unwrap();
     v["reconstruction_version"] = serde_json::json!("x");
-    assert!(matches!(ReconstructionManifest::parse("r", &serde_json::to_vec(&v).unwrap()).unwrap_err(), ContractError::Version { .. }));
+    assert!(matches!(
+        ReconstructionManifest::parse("r", &serde_json::to_vec(&v).unwrap()).unwrap_err(),
+        ContractError::Version { .. }
+    ));
     let mut v = serde_json::to_value(zstd6_delta()).unwrap();
     v["delta_version"] = serde_json::json!("x");
-    assert!(matches!(VariantDeltaManifest::parse("d", &serde_json::to_vec(&v).unwrap()).unwrap_err(), ContractError::Version { .. }));
+    assert!(matches!(
+        VariantDeltaManifest::parse("d", &serde_json::to_vec(&v).unwrap()).unwrap_err(),
+        ContractError::Version { .. }
+    ));
     let mut v = serde_json::to_value(scenario()).unwrap();
     v["scenario_version"] = serde_json::json!("x");
-    assert!(matches!(ScenarioManifest::parse("s", &serde_json::to_vec(&v).unwrap()).unwrap_err(), ContractError::Version { .. }));
+    assert!(matches!(
+        ScenarioManifest::parse("s", &serde_json::to_vec(&v).unwrap()).unwrap_err(),
+        ContractError::Version { .. }
+    ));
     let mut v = serde_json::to_value(cache_receipt(CacheProfile::LocalOsCold, 0.05, true)).unwrap();
     v["receipt_version"] = serde_json::json!("x");
-    assert!(matches!(CacheReceipt::parse("c", &serde_json::to_vec(&v).unwrap()).unwrap_err(), ContractError::Version { .. }));
+    assert!(matches!(
+        CacheReceipt::parse("c", &serde_json::to_vec(&v).unwrap()).unwrap_err(),
+        ContractError::Version { .. }
+    ));
     let mut v = serde_json::to_value(experiment()).unwrap();
     v["experiment_version"] = serde_json::json!("x");
-    assert!(matches!(ExperimentManifest::parse("e", &serde_json::to_vec(&v).unwrap()).unwrap_err(), ContractError::Version { .. }));
+    assert!(matches!(
+        ExperimentManifest::parse("e", &serde_json::to_vec(&v).unwrap()).unwrap_err(),
+        ContractError::Version { .. }
+    ));
 }
 
 #[test]
 fn reconstruction_binds_its_exact_product_parent() {
     let r = reconstruction();
     assert!(r.check_parent(&"prod".repeat(16)).is_ok());
-    assert!(matches!(r.check_parent("wrong").unwrap_err(), ContractError::ParentMismatch { .. }));
+    assert!(matches!(
+        r.check_parent("wrong").unwrap_err(),
+        ContractError::ParentMismatch { .. }
+    ));
 }
 
 #[test]
 fn a_zstd6_delta_changes_only_compression_level() {
     let d = zstd6_delta();
     // Structurally diff against the reconstruction: only global.compression moved.
-    assert!(d.check_against_reconstruction(&"reco".repeat(16), &resolved("zstd(1)")).is_ok());
+    assert!(
+        d.check_against_reconstruction(&"reco".repeat(16), &resolved("zstd(1)"))
+            .is_ok()
+    );
     // Wrong parent is refused.
     assert!(matches!(
-        d.check_against_reconstruction("other", &resolved("zstd(1)")).unwrap_err(),
+        d.check_against_reconstruction("other", &resolved("zstd(1)"))
+            .unwrap_err(),
         ContractError::ParentMismatch { .. }
     ));
 }
@@ -814,20 +857,28 @@ fn a_delta_that_also_changes_row_group_size_is_refused() {
     let mut d = zstd6_delta();
     // The child's resolved config quietly moved a second axis the allowlist never permitted.
     let mut cfg = resolved("zstd(6)");
-    cfg.fields.insert("global.row_group_rows".into(), serde_json::json!(500_000));
+    cfg.fields
+        .insert("global.row_group_rows".into(), serde_json::json!(500_000));
     d.resolved_config = cfg;
     let err = d
         .check_against_reconstruction(&"reco".repeat(16), &resolved("zstd(1)"))
         .unwrap_err();
-    assert!(matches!(err, ContractError::AllowlistViolation { .. }), "{err}");
+    assert!(
+        matches!(err, ContractError::AllowlistViolation { .. }),
+        "{err}"
+    );
 }
 
 #[test]
 fn a_delta_declaring_a_change_outside_its_allowlist_is_refused() {
     let mut d = zstd6_delta();
     // The delta changes a path it never allowed.
-    d.changes.insert("global.row_group_rows".into(), serde_json::json!(500_000));
-    assert!(matches!(d.validate("d").unwrap_err(), ContractError::AllowlistViolation { .. }));
+    d.changes
+        .insert("global.row_group_rows".into(), serde_json::json!(500_000));
+    assert!(matches!(
+        d.validate("d").unwrap_err(),
+        ContractError::AllowlistViolation { .. }
+    ));
 }
 
 #[test]
@@ -835,7 +886,10 @@ fn an_unknown_allowlist_path_fails_closed() {
     let mut d = zstd6_delta();
     d.allowed_changes = vec!["global.magic_unicorn".into()];
     d.changes.clear();
-    assert!(matches!(d.validate("d").unwrap_err(), ContractError::UnknownAllowlistPath { .. }));
+    assert!(matches!(
+        d.validate("d").unwrap_err(),
+        ContractError::UnknownAllowlistPath { .. }
+    ));
     // And per-column paths are recognised by suffix.
     assert!(is_known_config_path("columns.team_id.physical_type"));
     assert!(is_known_config_path("global.compression"));
@@ -847,7 +901,10 @@ fn an_unknown_allowlist_path_fails_closed() {
 fn a_scan_scenario_must_name_a_projection_and_selection() {
     let mut s = scenario();
     s.selection = None;
-    assert!(matches!(s.validate("s").unwrap_err(), ContractError::IncompleteScenario { .. }));
+    assert!(matches!(
+        s.validate("s").unwrap_err(),
+        ContractError::IncompleteScenario { .. }
+    ));
 }
 
 #[test]
@@ -856,7 +913,10 @@ fn a_count_sink_cannot_ride_a_scanning_selection() {
     s.sink = Some(ResultSink::Count);
     // Count with an `all` selection is the count(*)-is-a-scan anti-pattern.
     s.selection = Some(RowGroupSelection::All);
-    assert!(matches!(s.validate("s").unwrap_err(), ContractError::IncompleteScenario { .. }));
+    assert!(matches!(
+        s.validate("s").unwrap_err(),
+        ContractError::IncompleteScenario { .. }
+    ));
     // Count as a zero-selection metadata negative control is allowed.
     s.selection = Some(RowGroupSelection::Zero);
     s.projection = None;
@@ -870,19 +930,30 @@ fn a_count_sink_cannot_ride_a_scanning_selection() {
 fn a_cache_receipt_cannot_launder_an_ineffective_eviction() {
     // A cold receipt claiming validity while 60% resident is refused.
     let bad = cache_receipt(CacheProfile::LocalOsCold, 0.60, true);
-    assert!(matches!(bad.validate("c").unwrap_err(), ContractError::CacheReceiptInconsistent { .. }));
+    assert!(matches!(
+        bad.validate("c").unwrap_err(),
+        ContractError::CacheReceiptInconsistent { .. }
+    ));
     // The same numbers recorded as invalid is honest and accepted.
     let honest = cache_receipt(CacheProfile::LocalOsCold, 0.60, false);
     assert!(honest.validate("c").is_ok());
     assert!(!honest.is_usable());
     // A warm receipt below its floor while claiming validity is refused.
     let bad_warm = cache_receipt(CacheProfile::LocalOsWarm, 0.50, true);
-    assert!(matches!(bad_warm.validate("c").unwrap_err(), ContractError::CacheReceiptInconsistent { .. }));
+    assert!(matches!(
+        bad_warm.validate("c").unwrap_err(),
+        ContractError::CacheReceiptInconsistent { .. }
+    ));
 }
 
 #[test]
 fn sample_policy_freezes_warm_count_from_the_control() {
-    let p = SamplePolicy { warm_min: 7, warm_target_seconds: 3.0, warm_cap: 50, cold_min: 3 };
+    let p = SamplePolicy {
+        warm_min: 7,
+        warm_target_seconds: 3.0,
+        warm_cap: 50,
+        cold_min: 3,
+    };
     // Fast control -> the 3-second floor dominates.
     assert_eq!(p.warm_count(0.05), 50.min((3.0f64 / 0.05).ceil() as u32));
     // Slow control -> the 7-sample floor dominates.
@@ -895,10 +966,16 @@ fn sample_policy_freezes_warm_count_from_the_control() {
 fn an_experiment_refuses_identical_controls() {
     let mut e = experiment();
     e.reconstruction_digest = e.product_digest.clone();
-    assert!(matches!(e.validate("e").unwrap_err(), ContractError::DegenerateExperiment { .. }));
+    assert!(matches!(
+        e.validate("e").unwrap_err(),
+        ContractError::DegenerateExperiment { .. }
+    ));
     let mut e = experiment();
     e.scenario_digests.clear();
-    assert!(matches!(e.validate("e").unwrap_err(), ContractError::DegenerateExperiment { .. }));
+    assert!(matches!(
+        e.validate("e").unwrap_err(),
+        ContractError::DegenerateExperiment { .. }
+    ));
 }
 
 #[test]

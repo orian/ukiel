@@ -14,7 +14,13 @@ fn every_role_and_selection_decodes() {
     let mp = common::write_reconstruction(&dir, 2, 400, 64, "zstd(1)");
     let wl = common::write_workload(&dir);
 
-    let roles = ["fixed_width_key", "high_cardinality_string", "wide_text", "hot_set", "all_columns"];
+    let roles = [
+        "fixed_width_key",
+        "high_cardinality_string",
+        "wide_text",
+        "hot_set",
+        "all_columns",
+    ];
     let selections = ["all", "one", "ten_percent_contiguous", "ten_percent_sparse"];
     let mut n = 0;
     for role in roles {
@@ -64,5 +70,8 @@ fn the_zero_selection_is_an_untimed_metadata_control() {
     .unwrap();
     assert!(r.metadata_only);
     assert!(r.checksum.is_none());
-    assert!(r.samples.is_empty(), "zero selection must not time a decode");
+    assert!(
+        r.samples.is_empty(),
+        "zero selection must not time a decode"
+    );
 }

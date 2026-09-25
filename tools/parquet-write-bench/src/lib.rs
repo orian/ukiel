@@ -66,13 +66,14 @@ pub struct WriterBenchReport {
 
 /// Extract a `resolved_config` from a manifest JSON (reconstruction or variant delta).
 fn resolved_config_from(bytes: &[u8], path: &str) -> Result<ResolvedConfig> {
-    let value: serde_json::Value = serde_json::from_slice(bytes)
-        .with_context(|| format!("{path}: not JSON"))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).with_context(|| format!("{path}: not JSON"))?;
     let rc = value
         .get("resolved_config")
         .cloned()
         .with_context(|| format!("{path}: no resolved_config field"))?;
-    serde_json::from_value(rc).with_context(|| format!("{path}: resolved_config is not a config map"))
+    serde_json::from_value(rc)
+        .with_context(|| format!("{path}: resolved_config is not a config map"))
 }
 
 /// Build the declared logical schema (physical column order + declared types) from a
@@ -180,13 +181,21 @@ fn one_sample(prepared: &Prepared) -> Result<WriterSample> {
     let mut sink: Vec<u8> = Vec::new();
 
     let (rows_result, timing) = measure::time(|| {
-        write_prepared(&mut sink, &prepared.batches, prepared.out_schema.clone(), props)
+        write_prepared(
+            &mut sink,
+            &prepared.batches,
+            prepared.out_schema.clone(),
+            props,
+        )
     });
     let rows = rows_result?;
 
     // Validation — outside the clock.
     if rows != prepared.total_rows {
-        bail!("write produced {rows} rows, expected {}", prepared.total_rows);
+        bail!(
+            "write produced {rows} rows, expected {}",
+            prepared.total_rows
+        );
     }
     let outcome = resolve_footer(&sink)?;
     if outcome.output_rows != prepared.total_rows {
@@ -221,11 +230,7 @@ fn one_sample(prepared: &Prepared) -> Result<WriterSample> {
 
 fn median_f64(mut xs: Vec<f64>) -> f64 {
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    if xs.is_empty() {
-        0.0
-    } else {
-        xs[xs.len() / 2]
-    }
+    if xs.is_empty() { 0.0 } else { xs[xs.len() / 2] }
 }
 
 fn median_u64(mut xs: Vec<u64>) -> u64 {

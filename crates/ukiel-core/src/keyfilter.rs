@@ -342,7 +342,11 @@ mod tests {
                     .map(|i| i * stride + off)
                     .collect();
                 let filter = build(&keys).unwrap();
-                assert_eq!(filter.len(), 1 + tier.bytes, "the tier must be the one sized");
+                assert_eq!(
+                    filter.len(),
+                    1 + tier.bytes,
+                    "the tier must be the one sized"
+                );
 
                 // Probes disjoint from every key set above, so none is truly present.
                 let n = 50_000i64;
@@ -374,7 +378,11 @@ mod tests {
         assert!(maybe_contains(&filter[..64], 7), "unknown size");
         assert!(maybe_contains(&filter, -1), "a negative key proves nothing");
 
-        assert_eq!(build(&[-5, 1, 2]), None, "a negative key poisons the filter");
+        assert_eq!(
+            build(&[-5, 1, 2]),
+            None,
+            "a negative key poisons the filter"
+        );
         assert_eq!(build(&[]), None, "no keys is not an empty filter");
         assert_eq!(
             build(&[7]),
@@ -398,7 +406,9 @@ mod tests {
         assert_eq!(encoded_len_for(dense.len()), 0, "and it costs nothing");
 
         // Right at the edge, a filter is still stored and still bounded.
-        let edge: Vec<i64> = (0..MAX_KEYS_WORTH_FILTERING as i64).map(|i| i * 7 + 3).collect();
+        let edge: Vec<i64> = (0..MAX_KEYS_WORTH_FILTERING as i64)
+            .map(|i| i * 7 + 3)
+            .collect();
         let filter = build(&edge).expect("still worth filtering");
         assert_eq!(
             filter.len(),
@@ -422,7 +432,10 @@ mod tests {
         );
         let sql = sql_predicate("key_filter", 3);
         for i in 3..3 + binds.len() {
-            assert!(sql.contains(&format!("${i}")), "the predicate must read ${i}");
+            assert!(
+                sql.contains(&format!("${i}")),
+                "the predicate must read ${i}"
+            );
         }
 
         // And the offsets must find set bits in a filter that holds the key — at
@@ -431,7 +444,10 @@ mod tests {
             let mut keys: Vec<i64> = (0..n as i64).map(|i| i * 13 + 1).collect();
             keys.push(4_242);
             let filter = build(&keys).unwrap();
-            let tier = TIERS.iter().position(|t| filter.len() == 1 + t.bytes).unwrap();
+            let tier = TIERS
+                .iter()
+                .position(|t| filter.len() == 1 + t.bytes)
+                .unwrap();
             for pair in binds[tier * PROBES * 2..(tier + 1) * PROBES * 2].chunks(2) {
                 assert!(
                     filter[pair[0] as usize] & pair[1] as u8 != 0,

@@ -10,16 +10,25 @@ use parquet_scan_bench::selection::parse_selection;
 
 /// Rewrite a reconstruction's files under a different codec, preserving rows/order — a
 /// stand-in for a variant `vary` would produce. Returns the variant manifest path.
-fn rewrite_codec(reco_mp: &std::path::Path, out_dir: &std::path::Path, compression: &str) -> std::path::PathBuf {
-    let reco: parquet_lab_contract::ReconstructionManifest = parquet_lab_contract::ReconstructionManifest::parse(
-        &reco_mp.display().to_string(),
-        &std::fs::read(reco_mp).unwrap(),
-    )
-    .unwrap();
+fn rewrite_codec(
+    reco_mp: &std::path::Path,
+    out_dir: &std::path::Path,
+    compression: &str,
+) -> std::path::PathBuf {
+    let reco: parquet_lab_contract::ReconstructionManifest =
+        parquet_lab_contract::ReconstructionManifest::parse(
+            &reco_mp.display().to_string(),
+            &std::fs::read(reco_mp).unwrap(),
+        )
+        .unwrap();
     let reco_dir = reco_mp.parent().unwrap();
     let codec = match compression {
         c if c.starts_with("zstd") => {
-            let lvl: i32 = c.trim_start_matches("zstd(").trim_end_matches(')').parse().unwrap_or(3);
+            let lvl: i32 = c
+                .trim_start_matches("zstd(")
+                .trim_end_matches(')')
+                .parse()
+                .unwrap_or(3);
             parquet::basic::Compression::ZSTD(parquet::basic::ZstdLevel::try_new(lvl).unwrap())
         }
         _ => parquet::basic::Compression::SNAPPY,
@@ -60,7 +69,9 @@ fn rewrite_codec(reco_mp: &std::path::Path, out_dir: &std::path::Path, compressi
     }
     let variant = parquet_lab_contract::VariantDeltaManifest {
         delta_version: parquet_lab_contract::VARIANT_DELTA_VERSION.into(),
-        parent_reconstruction_digest: parquet_lab_contract::digest_bytes(&std::fs::read(reco_mp).unwrap()),
+        parent_reconstruction_digest: parquet_lab_contract::digest_bytes(
+            &std::fs::read(reco_mp).unwrap(),
+        ),
         label: "compression-zstd-6".into(),
         allowed_changes: vec!["global.compression".into()],
         changes: {
@@ -92,16 +103,31 @@ fn control_and_codec_variant_agree_on_checksum_and_rows() {
 
     for (role, sel) in [("all_columns", "all"), ("wide_text", "ten_percent_sparse")] {
         let a = parquet_scan_bench::run_scan(
-            &reco_mp, &wl, parse_role(role).unwrap(), parse_selection(sel).unwrap(), 1, None, None,
+            &reco_mp,
+            &wl,
+            parse_role(role).unwrap(),
+            parse_selection(sel).unwrap(),
+            1,
+            None,
+            None,
             &reco_dir.join(format!("a-{role}-{sel}.json")),
         )
         .unwrap();
         let b = parquet_scan_bench::run_scan(
-            &var_mp, &wl, parse_role(role).unwrap(), parse_selection(sel).unwrap(), 1, None, None,
+            &var_mp,
+            &wl,
+            parse_role(role).unwrap(),
+            parse_selection(sel).unwrap(),
+            1,
+            None,
+            None,
             &var_dir.join(format!("b-{role}-{sel}.json")),
         )
         .unwrap();
-        assert_eq!(a.checksum, b.checksum, "codec change must not alter decoded values ({role}/{sel})");
+        assert_eq!(
+            a.checksum, b.checksum,
+            "codec change must not alter decoded values ({role}/{sel})"
+        );
         assert_eq!(a.samples[0].rows_decoded, b.samples[0].rows_decoded);
     }
 }
@@ -122,9 +148,18 @@ fn a_tampered_file_is_rejected_before_timing() {
     std::fs::write(&data, &bytes).unwrap();
 
     let err = parquet_scan_bench::run_scan(
-        &mp, &wl, parse_role("all_columns").unwrap(), parse_selection("all").unwrap(), 1, None, None,
+        &mp,
+        &wl,
+        parse_role("all_columns").unwrap(),
+        parse_selection("all").unwrap(),
+        1,
+        None,
+        None,
         &dir.join("scan.json"),
     )
     .unwrap_err();
-    assert!(err.to_string().contains("digest mismatch") || err.to_string().contains("modified"), "{err}");
+    assert!(
+        err.to_string().contains("digest mismatch") || err.to_string().contains("modified"),
+        "{err}"
+    );
 }

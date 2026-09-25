@@ -71,8 +71,7 @@ pub fn assert_physical_plan(
             );
         }
     }
-    if matches!(sink, QuerySink::Aggregate | QuerySink::Checksum)
-        && !plan.contains("AggregateExec")
+    if matches!(sink, QuerySink::Aggregate | QuerySink::Checksum) && !plan.contains("AggregateExec")
     {
         bail!(
             "query '{query_name}' declares an {sink:?} sink but its physical plan has no \

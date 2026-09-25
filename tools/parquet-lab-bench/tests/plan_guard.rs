@@ -41,7 +41,10 @@ fn a_metadata_fast_path_is_rejected_for_a_declared_scan() {
         PredicateShape::FullScan,
     )
     .unwrap_err();
-    assert!(err.to_string().contains("does not project required column"), "{err}");
+    assert!(
+        err.to_string().contains("does not project required column"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -68,7 +71,10 @@ fn an_aggregate_sink_without_an_aggregate_exec_is_rejected() {
         PredicateShape::FullScan,
     )
     .unwrap_err();
-    assert!(err.to_string().contains("no \n") || err.to_string().contains("AggregateExec"), "{err}");
+    assert!(
+        err.to_string().contains("no \n") || err.to_string().contains("AggregateExec"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -90,8 +96,14 @@ fn a_labelled_metadata_control_is_exempt() {
 fn a_legacy_query_with_no_class_is_never_guarded() {
     // Empty required columns => no class declared => guard is a no-op even on a bare plan.
     assert!(
-        assert_physical_plan("legacy_q", "AnythingExec", &[], QuerySink::Aggregate, PredicateShape::FullScan)
-            .is_ok()
+        assert_physical_plan(
+            "legacy_q",
+            "AnythingExec",
+            &[],
+            QuerySink::Aggregate,
+            PredicateShape::FullScan
+        )
+        .is_ok()
     );
 }
 

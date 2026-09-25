@@ -76,16 +76,33 @@ pub struct ReadBenchReport {
 
 fn artifact_files(bytes: &[u8], path: &str) -> Result<Vec<(String, FileDigest)>> {
     if let Ok(r) = ReconstructionManifest::parse(path, bytes) {
-        return Ok(r.files.into_iter().map(|f| (f.output.path.clone(), f.output)).collect());
+        return Ok(r
+            .files
+            .into_iter()
+            .map(|f| (f.output.path.clone(), f.output))
+            .collect());
     }
     if let Ok(v) = VariantDeltaManifest::parse(path, bytes) {
-        return Ok(v.files.into_iter().map(|f| (f.output.path.clone(), f.output)).collect());
+        return Ok(v
+            .files
+            .into_iter()
+            .map(|f| (f.output.path.clone(), f.output))
+            .collect());
     }
     if let Ok(s) = SnapshotManifest::parse(path, bytes) {
         return Ok(s
             .files
             .into_iter()
-            .map(|f| (f.path.clone(), FileDigest { path: f.path, bytes: f.bytes, digest: f.digest }))
+            .map(|f| {
+                (
+                    f.path.clone(),
+                    FileDigest {
+                        path: f.path,
+                        bytes: f.bytes,
+                        digest: f.digest,
+                    },
+                )
+            })
             .collect());
     }
     bail!("{path}: not a reconstruction, variant-delta, or snapshot manifest")
@@ -184,7 +201,11 @@ pub fn run_bench(
             returned_bytes: outcome.returned_bytes,
             ranges: outcome.ranges,
             reads: outcome.reads,
-            mib_per_second: if timing.wall_seconds > 0.0 { mib / timing.wall_seconds } else { 0.0 },
+            mib_per_second: if timing.wall_seconds > 0.0 {
+                mib / timing.wall_seconds
+            } else {
+                0.0
+            },
             max_rss_bytes: timing.max_rss_bytes,
         });
     }

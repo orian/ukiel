@@ -21,7 +21,10 @@ fn batch(n: usize) -> RecordBatch {
     let s: Vec<Option<String>> = (0..n).map(|i| Some(format!("row-{i}"))).collect();
     RecordBatch::try_new(
         schema(),
-        vec![Arc::new(Int64Array::from(k)), Arc::new(StringArray::from(s))],
+        vec![
+            Arc::new(Int64Array::from(k)),
+            Arc::new(StringArray::from(s)),
+        ],
     )
     .unwrap()
 }
@@ -81,5 +84,8 @@ fn more_work_inside_the_clock_grows_the_measured_interval() {
 #[test]
 fn peak_rss_is_observed_on_this_platform() {
     let r = measure::rusage();
-    assert!(r.max_rss_bytes.unwrap_or(0) > 0, "expected a peak RSS reading on Linux");
+    assert!(
+        r.max_rss_bytes.unwrap_or(0) > 0,
+        "expected a peak RSS reading on Linux"
+    );
 }

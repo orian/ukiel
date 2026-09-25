@@ -26,23 +26,43 @@ fn schema() -> Arc<Schema> {
 
 fn logical_schema() -> LogicalSchema {
     LogicalSchema::new(vec![
-        LogicalColumn { name: "team_id".into(), logical: LogicalType::SignedInt },
-        LogicalColumn { name: "name".into(), logical: LogicalType::Utf8 },
+        LogicalColumn {
+            name: "team_id".into(),
+            logical: LogicalType::SignedInt,
+        },
+        LogicalColumn {
+            name: "name".into(),
+            logical: LogicalType::Utf8,
+        },
     ])
 }
 
 fn source_bytes() -> Vec<u8> {
     let teams: Vec<i64> = (0..500).map(|i| i / 3).collect();
-    let names: Vec<Option<String>> =
-        (0..500).map(|i| if i % 7 == 0 { None } else { Some(format!("n-{i}")) }).collect();
+    let names: Vec<Option<String>> = (0..500)
+        .map(|i| {
+            if i % 7 == 0 {
+                None
+            } else {
+                Some(format!("n-{i}"))
+            }
+        })
+        .collect();
     let b = RecordBatch::try_new(
         schema(),
-        vec![Arc::new(Int64Array::from(teams)), Arc::new(StringArray::from(names))],
+        vec![
+            Arc::new(Int64Array::from(teams)),
+            Arc::new(StringArray::from(names)),
+        ],
     )
     .unwrap();
     let mut buf = Vec::new();
-    let mut w = ArrowWriter::try_new(&mut buf, schema(), Some(WriterProperties::builder().build()))
-        .unwrap();
+    let mut w = ArrowWriter::try_new(
+        &mut buf,
+        schema(),
+        Some(WriterProperties::builder().build()),
+    )
+    .unwrap();
     w.write(&b).unwrap();
     w.close().unwrap();
     buf
@@ -94,5 +114,8 @@ fn write_projected_and_write_prepared_agree_byte_for_byte() {
     )
     .unwrap();
 
-    assert_eq!(a, b, "the rewrite and bench write paths must produce identical bytes");
+    assert_eq!(
+        a, b,
+        "the rewrite and bench write paths must produce identical bytes"
+    );
 }
