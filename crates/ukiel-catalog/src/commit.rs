@@ -182,6 +182,18 @@ impl PostgresCatalog {
 
         let mut tx = self.pool.begin().await?;
 
+        // Feed publication barrier (issue 0015). Writers share this lock, but
+        // must acquire it BEFORE the identity sequence allocates a commit ID.
+        // A feed reader takes the exclusive counterpart, waits for all older
+        // writers to commit/roll back, then reads a complete prefix. Negative
+        // one-bigint advisory keys are reserved for this protocol (see feed.rs).
+        // The implicit FK lock during INSERT cannot establish this barrier:
+        // defaults, including nextval, have already been evaluated by then.
+        sqlx::query("SELECT pg_advisory_xact_lock_shared(~$1::bigint)")
+            .bind(hypertable_id.0)
+            .execute(&mut *tx)
+            .await?;
+
         if let Some(lease) = lease {
             // Ordering, deliberately: a replay of an operation that already
             // landed is *reconciled* before a lost lease is called a failure.

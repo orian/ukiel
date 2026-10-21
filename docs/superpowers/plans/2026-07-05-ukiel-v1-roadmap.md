@@ -146,3 +146,16 @@ Cross-plan constraints (repeat in every plan's Global Constraints):
 - Workspace deps pinned in root `Cargo.toml`: tokio 1.52 · sqlx 0.9 · serde_json 1 · thiserror 2 · chrono 0.4 · testcontainers-modules 0.15 · datafusion 54 · **arrow/parquet 58.3 and object_store 0.13** (the versions DataFusion 54 links against — never bump independently) · rdkafka 0.39 · axum 0.8
 - No Claude/AI attribution in commit messages
 - Integration tests use testcontainers (Docker required); unit tests must pass without Docker
+
+## Potential improvements
+
+- **Durable feed publication watermark** — optional follow-up to
+  [issue 0015](../../issues/0015-change-feed-cursor-can-skip-late-commits.md#potential-improvement-a-durable-publication-watermark).
+  The implemented shared-writer/exclusive-reader barrier with bounded lock waits
+  fixes correctness. If measured contention warrants it, evaluate a durable
+  published prefix or transactional outbox so feed polling can return immediately
+  without stopping catalog writers. The design must prove allocation/publication
+  ordering, publisher fencing and crash recovery, and adapt feed positions,
+  cursors, bootstrap and GC together. Compare latency, throughput and publication
+  backlog against the current barrier before adopting it. This is a future
+  investigation, not an additional PoC v0 or Plan 8 gate.

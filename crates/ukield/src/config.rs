@@ -66,6 +66,9 @@ pub struct CatalogConfig {
     /// on purpose: it is what turns "the database is gone" into a prompt,
     /// classifiable failure instead of a request hanging until its own deadline.
     pub acquire_timeout_ms: u64,
+    /// Maximum server-side wait per PostgreSQL lock acquisition, including
+    /// feed barriers. A timeout is retryable; this is not a transaction deadline.
+    pub lock_timeout_ms: u64,
     pub idle_timeout_secs: u64,
     pub max_lifetime_secs: u64,
     /// Check a connection before handing it out. After a failover the pool holds
@@ -92,6 +95,7 @@ impl Default for CatalogConfig {
             max_connections: ukiel_catalog::PostgresCatalog::DEFAULT_POOL_SIZE,
             min_connections: 0,
             acquire_timeout_ms: 2_000,
+            lock_timeout_ms: 2_000,
             idle_timeout_secs: 600,
             max_lifetime_secs: 1_800,
             test_before_acquire: true,
@@ -111,6 +115,7 @@ impl CatalogConfig {
             max_connections: self.max_connections,
             min_connections: self.min_connections,
             acquire_timeout: Duration::from_millis(self.acquire_timeout_ms),
+            lock_timeout: Duration::from_millis(self.lock_timeout_ms),
             idle_timeout: Some(Duration::from_secs(self.idle_timeout_secs)),
             max_lifetime: Some(Duration::from_secs(self.max_lifetime_secs)),
             test_before_acquire: self.test_before_acquire,
@@ -241,6 +246,7 @@ fn validate_catalog(cat: &CatalogConfig) -> anyhow::Result<()> {
     }
     for (name, value) in [
         ("acquire_timeout_ms", cat.acquire_timeout_ms),
+        ("lock_timeout_ms", cat.lock_timeout_ms),
         ("retry_base_ms", cat.retry_base_ms),
         ("retry_max_ms", cat.retry_max_ms),
         ("recovery_probe_timeout_ms", cat.recovery_probe_timeout_ms),
@@ -249,6 +255,9 @@ fn validate_catalog(cat: &CatalogConfig) -> anyhow::Result<()> {
         if value == 0 {
             anyhow::bail!("catalog.{name} must be > 0");
         }
+    }
+    if cat.lock_timeout_ms > i32::MAX as u64 {
+        anyhow::bail!("catalog.lock_timeout_ms must be <= {}", i32::MAX);
     }
     if cat.retry_base_ms > cat.retry_max_ms {
         anyhow::bail!(
@@ -644,6 +653,7 @@ mod tests {
         assert_eq!(c.max_connections, 16);
         assert_eq!(c.min_connections, 0);
         assert_eq!(c.acquire_timeout_ms, 2_000);
+        assert_eq!(c.lock_timeout_ms, 2_000);
         assert!(
             c.test_before_acquire,
             "a failover leaves dead connections in the pool"
@@ -658,6 +668,7 @@ mod tests {
         let pool = c.pool_config();
         assert_eq!(pool.max_connections, 16);
         assert_eq!(pool.acquire_timeout, Duration::from_millis(2_000));
+        assert_eq!(pool.lock_timeout, Duration::from_millis(2_000));
         assert_eq!(pool.max_lifetime, Some(Duration::from_secs(1_800)));
     }
 
@@ -667,6 +678,11 @@ mod tests {
             ("min_connections = 32", "min > max"),
             ("max_connections = 0", "zero pool"),
             ("acquire_timeout_ms = 0", "zero acquire timeout"),
+            ("lock_timeout_ms = 0", "disabled lock timeout"),
+            (
+                "lock_timeout_ms = 2147483648",
+                "lock timeout out of PostgreSQL range",
+            ),
             ("retry_base_ms = 9000", "base > max"),
             ("retry_jitter_ratio = 1.5", "jitter out of range"),
             ("retry_jitter_ratio = -0.1", "negative jitter"),

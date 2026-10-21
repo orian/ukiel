@@ -39,8 +39,8 @@ pub struct PostgresCatalog {
     pub(crate) faults: faults::CommitFaults,
 }
 
-/// SQLx pool lifecycle, as a deployment concern rather than a constant (plan
-/// 42). The defaults reproduce today's behavior; what they add is the ability to
+/// SQLx pool lifecycle and PostgreSQL lock-wait budget (plans 42 / issue 0015).
+/// The pool settings provide the ability to
 /// survive a managed writer failover — `test_before_acquire` so a promoted
 /// endpoint does not hand out dead connections, and `max_lifetime` so the pool
 /// eventually stops holding connections to an old primary.
@@ -52,6 +52,10 @@ pub struct CatalogPoolConfig {
     /// is the knob that turns "the database is gone" into a prompt, classifiable
     /// `PoolTimedOut` instead of a request that hangs until its own deadline.
     pub acquire_timeout: Duration,
+    /// Server-side deadline for each lock acquisition on a catalog connection,
+    /// including shared/exclusive feed barriers. Whole milliseconds, 1..=i32::MAX.
+    /// This does not bound execution, transaction duration, or network stalls.
+    pub lock_timeout: Duration,
     pub idle_timeout: Option<Duration>,
     pub max_lifetime: Option<Duration>,
     pub test_before_acquire: bool,
@@ -63,6 +67,7 @@ impl Default for CatalogPoolConfig {
             max_connections: PostgresCatalog::DEFAULT_POOL_SIZE,
             min_connections: 0,
             acquire_timeout: Duration::from_millis(2_000),
+            lock_timeout: Duration::from_millis(2_000),
             idle_timeout: Some(Duration::from_secs(600)),
             max_lifetime: Some(Duration::from_secs(1_800)),
             test_before_acquire: true,
@@ -71,6 +76,25 @@ impl Default for CatalogPoolConfig {
 }
 
 impl CatalogPoolConfig {
+    fn connect_options(&self, url: &str) -> Result<PgConnectOptions, CatalogError> {
+        let millis = self.lock_timeout.as_millis();
+        if millis == 0
+            || millis > i32::MAX as u128
+            || self.lock_timeout != Duration::from_millis(millis as u64)
+        {
+            return Err(CatalogError::InvalidLockTimeout(format!(
+                "{:?}; expected whole milliseconds in 1..={}",
+                self.lock_timeout,
+                i32::MAX
+            )));
+        }
+        let options: PgConnectOptions = url.parse()?;
+        // A startup option applies to every newly opened/replacement connection
+        // in eager and lazy pools. No extra per-commit round trip or session SET
+        // that could be lost after a reconnect. Explicit config wins over URL options.
+        Ok(options.options([("lock_timeout", format!("{millis}ms"))]))
+    }
+
     fn options(&self) -> PgPoolOptions {
         PgPoolOptions::new()
             .max_connections(self.max_connections)
@@ -121,7 +145,10 @@ impl PostgresCatalog {
         url: &str,
         config: &CatalogPoolConfig,
     ) -> Result<Self, CatalogError> {
-        let pool = config.options().connect(url).await?;
+        let pool = config
+            .options()
+            .connect_with(config.connect_options(url)?)
+            .await?;
         Ok(Self::from_pool(pool))
     }
 
@@ -137,7 +164,7 @@ impl PostgresCatalog {
         url: &str,
         config: &CatalogPoolConfig,
     ) -> Result<Self, CatalogError> {
-        let options: PgConnectOptions = url.parse()?;
+        let options = config.connect_options(url)?;
         Ok(Self::from_pool(config.options().connect_lazy_with(options)))
     }
 

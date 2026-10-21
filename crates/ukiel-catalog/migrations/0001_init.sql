@@ -34,7 +34,10 @@ CREATE TABLE logical_tables (
 );
 
 CREATE TABLE commits (
-    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    -- Feed prefix barriers rely on sequential allocation across connections.
+    -- CACHE > 1 can hand a connection an ID below an already published head.
+    -- Gaps from rollback or idempotency conflicts are legal; reuse is not.
+    id BIGINT GENERATED ALWAYS AS IDENTITY (CACHE 1) PRIMARY KEY,
     hypertable_id BIGINT NOT NULL REFERENCES hypertables(id),
     kind TEXT NOT NULL CHECK (kind IN ('add', 'replace', 'delete')),
     idempotency_key TEXT,

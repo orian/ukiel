@@ -4,36 +4,60 @@ use crate::parts::{PART_COLUMNS, PartRow};
 use crate::{CatalogError, PostgresCatalog};
 
 impl PostgresCatalog {
-    /// Newest commit id for this hypertable (0 when it has none) — the feed
-    /// prefix a worker can declare observed. One index probe on
-    /// `commits_feed_idx`, unlike `changes_since`, which materializes every
-    /// commit's parts; workers that plan from live state want this instead.
+    /// A complete committed feed prefix (0 when the hypertable has none).
+    /// Waits for in-flight catalog writers on this hypertable; other hypertables
+    /// and ordinary queries remain independent. A stalled writer can delay this
+    /// call until the configured catalog lock timeout (a retryable error).
+    /// Uses `commits_feed_idx` without materializing any part metadata.
     pub async fn feed_head(&self, hypertable_id: HypertableId) -> Result<CommitId, CatalogError> {
+        // Writers take a shared advisory lock before allocating IDs and hold it
+        // through transaction completion. The exclusive lock drains those writers and
+        // prevents new ID allocations until we have captured the safe prefix.
+        // READ COMMITTED and a SEPARATE SELECT are essential: a snapshot taken
+        // before waiting could still omit a writer that committed during the
+        // wait. Sequence CACHE 1 is also part of the contract (see the schema).
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+            .await?;
+        // Reserve negative one-bigint advisory keys for feed barriers: bitwise
+        // NOT maps positive hypertable IDs injectively, without i64 overflow.
+        // Use advisory locks rather than the hypertable row: repeated KEY SHARE
+        // lockers can starve a queued FOR UPDATE reader under sustained writes.
+        sqlx::query("SELECT pg_advisory_xact_lock(~$1::bigint)")
+            .bind(hypertable_id.0)
+            .execute(&mut *tx)
+            .await?;
         let head: Option<i64> =
             sqlx::query_scalar("SELECT max(id) FROM commits WHERE hypertable_id = $1")
                 .bind(hypertable_id.0)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *tx)
                 .await?;
+        tx.commit().await?;
         Ok(CommitId(head.unwrap_or(0)))
     }
 
     /// Ordered change feed: commits with id > `after`, oldest first.
-    /// Consumers persist the last processed commit id as their cursor.
+    /// Only returns events inside a complete committed prefix. Consumers persist
+    /// the last processed commit id as their cursor. IDs can have gaps and are
+    /// ordered for delivery, not necessarily by wall-clock transaction commit.
     pub async fn changes_since(
         &self,
         hypertable_id: HypertableId,
         after: CommitId,
         limit: i64,
     ) -> Result<Vec<ChangeEvent>, CatalogError> {
+        let head = self.feed_head(hypertable_id).await?;
         let commits: Vec<(i64, String)> = sqlx::query_as(
             "SELECT id, kind FROM commits
-             WHERE hypertable_id = $1 AND id > $2
+             WHERE hypertable_id = $1 AND id > $2 AND id <= $4
              ORDER BY id
              LIMIT $3",
         )
         .bind(hypertable_id.0)
         .bind(after.0)
         .bind(limit)
+        .bind(head.0)
         .fetch_all(&self.pool)
         .await?;
 

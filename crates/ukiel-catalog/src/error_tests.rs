@@ -40,6 +40,10 @@ fn every_semantic_variant_has_a_stable_class() {
             PermanentInput,
         ),
         (CatalogError::InvalidLeaseTtl("zero".into()), PermanentInput),
+        (
+            CatalogError::InvalidLockTimeout("zero".into()),
+            PermanentInput,
+        ),
         (CatalogError::NotFound("events".into()), AbsentResource),
     ];
     for (err, want) in cases {
@@ -94,7 +98,7 @@ fn sqlstate_mapping_covers_the_failover_signatures() {
         );
     }
     // PostgreSQL explicitly inviting a retry of the transaction.
-    for code in ["40001", "40P01"] {
+    for code in ["40001", "40P01", "55P03"] {
         assert_eq!(
             class_for_sqlstate(code),
             CatalogErrorClass::RetryableDatabase,
@@ -219,4 +223,31 @@ fn an_operation_key_collision_is_permanent_input() {
         mutation: 2,
     };
     assert_eq!(err.class(), CatalogErrorClass::PermanentInput);
+}
+
+#[tokio::test]
+async fn invalid_lock_timeouts_are_rejected_before_connecting() {
+    use std::time::Duration;
+    for lock_timeout in [
+        Duration::ZERO,
+        Duration::from_nanos(1),
+        Duration::from_micros(1_500),
+        Duration::from_millis(i32::MAX as u64 + 1),
+    ] {
+        let config = crate::CatalogPoolConfig {
+            lock_timeout,
+            ..Default::default()
+        };
+        let url = "postgres://u:p@127.0.0.1:1/db";
+        for result in [
+            crate::PostgresCatalog::connect_lazy_with_config(url, &config),
+            crate::PostgresCatalog::connect_with_config(url, &config).await,
+        ] {
+            let Err(error) = result else {
+                panic!("invalid timeout {lock_timeout:?} built a pool");
+            };
+            assert!(matches!(error, CatalogError::InvalidLockTimeout(_)));
+            assert_eq!(error.class(), CatalogErrorClass::PermanentInput);
+        }
+    }
 }

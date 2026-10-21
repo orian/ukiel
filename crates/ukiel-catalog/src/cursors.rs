@@ -30,6 +30,8 @@ impl PostgresCatalog {
     /// Several processes may share one cursor name: the row then means "the
     /// fleet has observed this feed prefix", never "every derived rewrite
     /// completed" — durable completion is the live part set, not this number.
+    /// Feed consumers may only persist a processed event from `changes_since`
+    /// or a prefix from `feed_head`; an arbitrary visible `max(id)` is unsafe.
     pub async fn set_cursor(
         &self,
         worker: &str,
@@ -54,6 +56,9 @@ impl PostgresCatalog {
     /// Feed lag per `(worker, hypertable)`: head commit id minus the worker's
     /// cursor, floored at 0 — the `catalog_feed_lag` gauge (metrics P2).
     /// `commits_feed_idx (hypertable_id, id)` serves the per-hypertable max.
+    /// This is observational ID distance (including gaps and other hypertables'
+    /// IDs), not an event count or a safe prefix for advancing cursors. It does
+    /// not wait for the feed publication barrier.
     pub async fn feed_lags(&self) -> Result<Vec<(String, HypertableId, i64)>, CatalogError> {
         let rows: Vec<(String, i64, i64)> = sqlx::query_as(
             "SELECT c.worker, c.hypertable_id,

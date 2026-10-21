@@ -16,6 +16,8 @@ max_connections = 16
 min_connections = 0
 acquire_timeout_ms = 2000  # short: turns "the database is gone" into a prompt,
                            # classifiable failure instead of a hung request
+lock_timeout_ms = 2000     # maximum wait per PostgreSQL lock, including feed
+                           # barriers; retryable failure, not a transaction deadline
 idle_timeout_secs = 600
 max_lifetime_secs = 1800   # so the pool eventually stops holding connections to
                            # a primary that has been replaced

@@ -19,7 +19,7 @@ pub enum CatalogErrorClass {
     /// but for a mutation the outcome is *unknown*, not "did not happen".
     Transport,
     /// PostgreSQL asked us to try the transaction again (serialization failure,
-    /// deadlock). Safe to retry the whole transaction.
+    /// deadlock, or lock timeout). Safe to retry the whole transaction.
     RetryableDatabase,
     /// Everything else, including every error we have not classified. The
     /// default is permanent on purpose: an unknown failure treated as transient
@@ -49,12 +49,12 @@ impl CatalogErrorClass {
 /// - `08*` connection exception, `57P01/02/03` admin shutdown / crash shutdown /
 ///   cannot connect now (exactly what a managed failover emits), `53300` too
 ///   many connections → transport: the server is going away or unreachable.
-/// - `40001` serialization failure, `40P01` deadlock detected → retryable: the
-///   database is explicitly inviting a retry of the transaction.
+/// - `40001` serialization failure, `40P01` deadlock detected, `55P03` lock
+///   unavailable/timeout → retryable: abort and retry the whole transaction.
 /// - anything else → permanent. Unknown means permanent, always.
 pub(crate) fn class_for_sqlstate(code: &str) -> CatalogErrorClass {
     match code {
-        "40001" | "40P01" => CatalogErrorClass::RetryableDatabase,
+        "40001" | "40P01" | "55P03" => CatalogErrorClass::RetryableDatabase,
         "57P01" | "57P02" | "57P03" | "53300" => CatalogErrorClass::Transport,
         _ if code.starts_with("08") => CatalogErrorClass::Transport,
         _ => CatalogErrorClass::PermanentDatabase,
@@ -73,6 +73,7 @@ impl CatalogError {
             | CatalogError::SortKey(_)
             | CatalogError::LeasePartitionMismatch { .. }
             | CatalogError::InvalidLeaseTtl(_)
+            | CatalogError::InvalidLockTimeout(_)
             | CatalogError::OperationKeyCollision { .. }
             | CatalogError::OperationHypertableMismatch { .. } => CatalogErrorClass::PermanentInput,
             // The outcome is unknown, and the connection is why: recovery must
@@ -172,6 +173,12 @@ pub enum CatalogError {
     /// milliseconds). Caught in Rust: an unusable interval must not reach SQL.
     #[error("invalid lease ttl: {0}")]
     InvalidLeaseTtl(String),
+
+    /// Zero disables PostgreSQL's lock timeout; sub-millisecond or oversized
+    /// values cannot represent the required bounded wait. Refuse them before
+    /// creating a pool, including a lazy pool that has not contacted PostgreSQL.
+    #[error("invalid catalog lock timeout: {0}")]
+    InvalidLockTimeout(String),
 
     #[error("not found: {0}")]
     NotFound(String),

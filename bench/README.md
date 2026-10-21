@@ -213,6 +213,55 @@ bench catalog connections [--pools N] [--connections-per-pool N]
 bench --help
 ```
 
+### Feed publication and lock timeouts (issue 0015)
+
+These manual, ignored tests create and remove their own disposable PostgreSQL 17
+containers. They need Docker, without an existing compose stack. They measure
+catalog metadata operations; paths in the fixture do not name uploaded objects.
+The correctness contract and results are recorded in
+[issue 0015](../docs/issues/0015-change-feed-cursor-can-skip-late-commits.md).
+
+Normal load measures one or 16 writers, one or eight hypertables, and optional
+feed-head polling with a 20 ms pause between scans. Each write is an unkeyed ADD
+of one part. Both arms prewarm the same 64 connections. The default is three
+two-second trials; use five-second trials for a longer comparison:
+
+```bash
+rtk proxy env UKIEL_FEED_BENCH_SECONDS=5 UKIEL_FEED_BENCH_TRIALS=1 UKIEL_FEED_BENCH_DISABLE_LOCK_TIMEOUT=0 cargo test -p ukiel-catalog --test feed_ordering_test feed_publication_benchmark -- --ignored --nocapture --test-threads=1
+rtk proxy env UKIEL_FEED_BENCH_SECONDS=5 UKIEL_FEED_BENCH_TRIALS=1 UKIEL_FEED_BENCH_DISABLE_LOCK_TIMEOUT=1 cargo test -p ukiel-catalog --test feed_ordering_test feed_publication_benchmark -- --ignored --nocapture --test-threads=1
+```
+
+Repeat the pair three times, alternating execution order, and retain each raw
+log. `UKIEL_FEED_BENCH_SECONDS` accepts 1–60; `UKIEL_FEED_BENCH_TRIALS` accepts
+1–10. The disable flag is a **benchmark-only control**: it sets `lock_timeout=0`
+on the disposable pool's sessions, while retaining the same safe publication
+barrier. Application configuration still requires a nonzero timeout. Each run
+prints the actual server version, timeout setting, pool size and duration.
+
+The stalled-writer experiment uses explicit database barriers to pause writer A
+after ID allocation, queue a feed reader behind A, then queue writer B behind
+the reader. It holds A for three seconds and compares 2,000 ms and 10,000 ms
+budgets for the reader and writer B, with three trials per arm. Writer A has a
+fixed ten-second budget so it survives the controlled stall:
+
+```bash
+rtk proxy cargo test -p ukiel-catalog --test feed_ordering_test feed_barrier_stall_benchmark -- --ignored --nocapture --test-threads=1
+```
+
+The report includes feed/writer outcomes and latency, whether B finished before
+A was released, unrelated-hypertable write latency, ordinary catalog-read
+latency, and feed latency after recovery. It verifies unchanged cursors during
+the stall and delivery of every committed event afterward. A timeout is reported
+as a failure outcome, rather than excluded from the latency result.
+
+These are local debug-build, closed-loop experiments. Normal-load throughput is
+completed calls divided by elapsed time including the final in-flight drain.
+Per-trial p99 values are sample percentiles; report their median across trials,
+not a pooled p99. Results do not establish production capacity, open-loop SLOs,
+object-store performance, or immunity to shared-pool exhaustion. Keep raw logs
+and a source/environment receipt under ignored `bench/results/issue-0015/`;
+put the interpretation and limitations in the issue write-up.
+
 ### Catalog scalability (plan 40)
 
 **Catalog only.** These write rows to Postgres and call the catalog API. They never
