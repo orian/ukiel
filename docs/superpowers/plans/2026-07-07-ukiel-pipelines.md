@@ -5,8 +5,12 @@
 > intent, guardrail, and metrics requirements below are acceptance criteria, not
 > optional adaptations.
 
-**Status:** Under revision, 2026-10-21. R1–R2 are resolved in the plan; R3–R7 remain
-open. Implementation and acceptance tests are still pending.
+**Status:** MV implementation complete, 2026-10-22. The Parquet-to-Parquet worker,
+shared writer, immutable catalog definitions, and opt-in daemon role are
+implemented. Kafka-to-Parquet SQL routing and physical topic identity (R4) are
+still pending. R5's strict reader/in-flight memory accounting remains a hardening
+item; the implemented limits and temporary-memory boundary are explicit below.
+R6 and the operational handoff in R7 are resolved.
 
 **Goal:** Add catalog entities for Kafka stream tables and pipelines;
 Kafka-to-Parquet SQL pipelines replacing `TableRoute`; and
@@ -16,6 +20,57 @@ egress is outside v1.
 The current catalog migrations are consolidated into `0001_init.sql`; this
 plan owns `0002_pipelines.sql`. E2E scenarios S9–S11 already exist; this plan
 adds S12. MV publication uses the canonical operation domain `mv`.
+
+## Implementation checkpoint — 2026-10-22
+
+The MV implementation adds:
+
+- `ukiel-pipeline`: SQL over a sequence of Arrow batches representing one
+  logical input, fresh execution context for every attempt, clock/random and
+  order-sensitive SQL support, and explicit input/output/operator-memory limits.
+  Spilling is disabled in this initial execution API; oversized work fails
+  without publication. The MV reader checks retained input bytes during decode,
+  reads one part at a time, and decodes 8192-row batches. Reader/Arrow temporaries
+  are outside these retained-byte limits; this is not a process RSS cap (R5).
+- `ukiel-expr`: executable clock/random defaults and materialized expressions;
+  compaction and deletion preserve stored columns and backfill only columns
+  absent from the original file, including preservation of stored NULLs.
+  Compaction/deletion transformation versions are now 2 for this semantic change.
+- `ukiel-core`: `PipelineId`, `MvIntent`, and the pinned `mv/v1` identity factory.
+  Source work determines the identity; output values and empty/non-empty outcomes
+  do not enter its fingerprint. Existing identity vectors remain unchanged.
+- Catalog integration coverage for empty/non-empty outcome races, late replay
+  after cursor advancement, and commit-boundary acknowledgement loss, using the
+  existing transactional publication API. Empty completion needs no schema
+  migration or new outcome table.
+
+- `0002_pipelines.sql`: immutable catalog entities, cycle-checked graph bootstrap,
+  strict cursor reads, and first registration under the source feed barrier.
+- `ukiel-write`: one L0 encoding/publication path shared with existing ingest,
+  preserving its stats/writer properties and upload-intent protocol. It uses
+  `ukiel-expr`; no direct SQL session, query server, or Kafka dependency.
+- `ukiel-mv`: one ADD per SQL execution, first-committed-result publication,
+  empty/skip completion records, monotonic progress, and reconciliation of
+  superseded reads after peer progress/GC. REPLACE/DELETE do not rerun SQL.
+- `ukield`: explicit opt-in `mv` role, `[mv]` selection/limits, `[[pipelines]]`
+  bootstrap, role-local catalog recovery, readiness, metrics, and graceful drain.
+  Initial registration precedes local ingest and GC startup. Existing default
+  roles and Kafka `TableRoute` ingestion remain compatible.
+
+Runtime/operations documentation:
+[materialized views](../../notes/2026-10-22-materialized-views.md). Component
+coverage includes multi-file HAVING, clocks, empty/skip chains, stall isolation,
+before/after-COMMIT faults, required missing input, budgets, GC fences, actual GC
+during slow reads, handoff, and shutdown. The daemon test runs Kafka -> MV -> HTTP
+queries. Compose-based S12 runs two MV replicas against Kafka/PostgreSQL/MinIO
+and checks publication cardinality and results after compaction. Kafka SQL
+pipeline migration remains pending.
+
+Validation: the full workspace suite passed with 692 tests and 17 ignored;
+subsequently added bootstrap/dependency checks passed (5 tests), as did S12
+against an isolated fresh database/bucket. Clippy with warnings denied passes
+for all affected runtime crates and the e2e harness. Formatting, diff whitespace,
+and documentation file links are checked before commit.
 
 ## Review findings — 2026-10-21
 
@@ -30,7 +85,8 @@ it does not mean the implementation or tests have been completed.
   the exclusive source feed barrier, fresh head, insert-if-absent, durable cursor
   read, and commit. Never initialize with the public standalone `feed_head()`
   followed by `set_cursor()`. Concurrency, rollback, timeout, retry, and GC
-  acceptance tests are specified; their implementation remains pending.
+  acceptance tests are implemented in catalog/MV component suites; role wiring
+  uses the same registration API on startup and rebuild.
 
 - [x] **R2 [P1]: Protect slower MV replicas when a peer advances the shared
   cursor (Tasks 1 and 6 and the active-active contract).** Resolved by
@@ -41,25 +97,22 @@ it does not mean the implementation or tests have been completed.
   completion. A committed target operation also permits advancing that event's
   cursor. Missing input without either proof remains an error, never an implicit
   skip. No reader leases or GC grace increase are required. Acceptance tests
-  include actual GC during a paused read, empty/skip outcomes, and catalog
-  outages; implementation remains pending.
+  include actual GC during a paused read and empty/skip outcomes. The worker and
+  role recovery integration are implemented; further fault combinations remain
+  listed under Task 6.
 
-- [ ] **R3 [P1]: Define replay stability beyond function immutability (Tasks 3
-  and 4).** One source scan and immutable functions still admit unordered
-  `LIMIT`/`OFFSET` and other order-sensitive operations. The same Kafka ranges
-  can arrive in a different cross-partition order, and Arrow batch boundaries
-  and DataFusion scheduling can change on replay. Reject unsupported operators
-  or require a stable total ordering, including tie handling. DataFusion
-  explicitly documents the ordering requirement for
-  [LIMIT and OFFSET](https://datafusion.apache.org/user-guide/sql/select.html#limit-and-offset-clauses).
-  Validate the entire transformation, including target defaults and materialized
-  expressions: the current
-  [`ukiel-expr` validator](../../../crates/ukiel-expr/src/lib.rs) rejects
-  `Volatile` functions but accepts `Stable`; a schema default of
-  `CAST(now() AS BIGINT)` passed a validation probe. That probe establishes a
-  validation gap, not successful execution of the default. Require early
-  rejection of disallowed expressions and replay tests with reordered inputs,
-  different batch boundaries, and tied sort keys.
+- [x] **R3 [P1]: Use first-committed-result semantics instead of requiring
+  deterministic replay (Tasks 2–6).** The original finding assumed identical
+  output across attempts was required. The chosen contract is
+  [one durable outcome per source operation](#sql-execution-uses-first-committed-result-semantics):
+  read the input, run SQL, write output, and publish under the canonical source
+  identity. `now()`, random functions, and order-sensitive SQL do not need a
+  replay-determinism restriction. Attempts may differ; the first committed
+  outcome wins. Empty results and allowed skips must also publish an identified
+  empty ADD before advancing progress, preventing a late attempt from publishing
+  a different result. Tests cover differing results, empty/non-empty races,
+  write-time expressions, and lost acknowledgements. Runtime integration is
+  recorded in the checkpoint above.
 
 - [ ] **R4 [P1]: Persist physical Kafka topic identity to detect recreation
   (Tasks 1 and 5).** The proposed stream-table row stores a topic name, but
@@ -75,8 +128,8 @@ it does not mean the implementation or tests have been completed.
   Test delete-and-recreate with the old offset still valid in the new log.
 
 - [ ] **R5 [P1]: Reconcile one logical source commit with the single-batch SQL
-  interface (Tasks 3 and 6).** `execute_pipeline(prepared, input: RecordBatch)`
-  and a fresh context per input batch conflict with executing SQL once over an
+  interface (Tasks 3 and 6).** The original single-RecordBatch interface
+  and a fresh context per input batch conflicted with executing SQL once over an
   entire ADD commit containing multiple files and batches. For the same key,
   values 1 and 2 in separate batches should pass `HAVING SUM(value) > 2` when
   processed together, but neither batch passes independently. Concatenating an
@@ -86,34 +139,41 @@ it does not mean the implementation or tests have been completed.
   in-flight budgets and defined spill/cancellation behavior. Test a multi-part
   ADD with aggregation and HAVING under different batch boundaries, plus the
   behavior when an input exceeds its budget.
+  The R3 foundation now accepts a batch sequence, runs one SQL execution, and
+  enforces input/output/operator-memory limits with spilling disabled. MV file
+  reading now checks retained decoded bytes before SQL execution, and normal
+  role shutdown drains owned work. Strict accounting for reader/Arrow temporary
+  allocations remains open; documented limits do not claim a process RSS cap.
 
-- [ ] **R6 [P2]: Resolve the shared writer's expression-engine dependency
+- [x] **R6 [P2]: Resolve the shared writer's expression-engine dependency
   (Task 4 and Architecture).** The writer is required to apply defaults and
   materialized expressions while also having no DataFusion dependency. The
   existing writer calls `ukiel_expr::apply_defaults_and_materialized`, and
   [`ukiel-expr`](../../../crates/ukiel-expr/Cargo.toml) depends on DataFusion.
-  Decide whether the shared writer may depend on that expression engine or
-  whether callers evaluate expressions before encoding. Update the ownership
-  contract and dependency checks accordingly; avoid duplicating expression
-  evaluation semantics in a second implementation.
+  Resolved: the shared writer owns expression application through `ukiel-expr`,
+  including its transitive DataFusion expression dependency. It has no direct
+  DataFusion SQL session, query-server, Kafka, or role-supervisor dependency.
+  Ingest and MV use this same implementation.
 
-- [ ] **R7 [P2]: Specify a fleet-wide replacement handoff (startup selection,
+- [x] **R7 [P2]: Specify a fleet-wide replacement handoff (startup selection,
   Tasks 5–7, and operations docs).** Rejecting duplicate source/target pairs in
   one process does not prevent old and replacement definitions from running in
   different processes. Kafka offset CAS does not determine which SQL version
   wins; MV replacements have distinct pipeline identities and cursors and can
-  both append overlapping work. For the operational v1 rollout, require stopping
-  and draining all old workers before replacements load authoritative offsets
-  or initialize their MV cursors. If rolling overlap is required, design a
-  fenced generation instead. Document the handoff and test the chosen behavior;
-  do not treat a per-process name list as fleet-wide exclusion.
+  both append overlapping work. The
+  [operational handoff](../../notes/2026-10-22-materialized-views.md#changing-or-retiring-a-pipeline)
+  pauses source writers, drains and stops every old worker, registers the new
+  definition at the paused source head, and resumes writers after readiness.
+  A component test verifies this boundary. Per-process selection is not
+  fleet-wide exclusion; overlapping semantic replacements need a future fenced
+  generation.
 
 ## Architecture
 
 A pipeline is an immutable catalog definition:
 
 ```text
-source endpoint -> deterministic DataFusion SELECT -> target endpoint
+source endpoint -> DataFusion SELECT -> identified target publication
 ```
 
 V1 supports:
@@ -126,7 +186,8 @@ V1 supports:
 `ukiel-pipeline` is a pure SQL-over-Arrow crate. Kafka ownership remains in
 `ukiel-ingest`. A new `ukiel-write` crate owns target batch-to-L0 encoding,
 upload intents, upload, and identified ADD commits without depending on Kafka
-or DataFusion. Both `ukiel-ingest` and the new change-feed worker crate
+or a DataFusion SQL session. It uses `ukiel-expr` and its transitive DataFusion
+expression dependency. Both `ukiel-ingest` and the new change-feed worker crate
 `ukiel-mv` consume it. No query/catalog mutation code is hidden inside the pure
 SQL crate, and MV does not inherit Kafka through a convenience dependency.
 
@@ -148,8 +209,9 @@ event-time output are immutable. An operator creates a new pipeline name for a
 semantic change. Bootstrap accepts an existing definition only when every field
 matches; a same-name mismatch is a permanent startup error.
 
-This is load-bearing for deterministic replay and operation identity: a
-`PipelineId` always names one transformation. The catalog may contain multiple
+This keeps operation identity tied to one configured transformation: a
+`PipelineId` always names one definition. Its output may vary across attempts;
+the first committed result wins. The catalog may contain multiple
 immutable definitions for the same source and target so a replacement can be
 created before rollout. Schema/ALTER is outside v1.
 
@@ -235,10 +297,11 @@ the matching stream table is bootstrapped, and adds a unique partial index on
 the ID and retain the topic text only for compatibility and diagnostics. An
 unmapped offset row is never used by a pipeline worker.
 
-### Deterministic event-time bounds use stable Kafka metadata
+### Event-time bounds can use stable Kafka metadata
 
-Deterministic SQL needs a replay-stable clock for event-time bounds. V1 provides
-one explicitly.
+V1 exposes broker append time for pipelines that want event-time bounds relative
+to their input. A pipeline may instead use processing time through `now()`;
+that choice affects its business semantics, not publication deduplication.
 
 Every Kafka source batch exposes a reserved nullable Int64 column:
 
@@ -267,14 +330,37 @@ An optional pipeline `event_time_column` names a target output column used only
 for the existing `ingest_last_flush_event_ts_seconds` freshness metric. This
 keeps freshness observable without making event time a hypertable-core concept.
 
-### SQL must be replay-stable
+### SQL execution uses first-committed-result semantics
 
-Pipeline validation accepts one query with exactly one scan of the declared
-source. DDL, DML, joins, cross joins, extra table scans, and non-immutable
-functions are rejected. Inspect DataFusion function volatility and allow only
-`Immutable`; do not maintain a short denylist that misses a new clock/random
-function. Stable Kafka metadata is how a pipeline expresses time-relative
-policy without `now()`.
+An MV reads one source ADD's parts, executes SQL, writes new files, and publishes
+the result under the identity of that pipeline and source commit. The catalog
+allows only one committed outcome for that identity. A retry or competing
+replica may compute different rows or timestamps; Committed/AlreadyApplied
+selects the durable result without comparing output bytes. `now()` is allowed
+in output, predicates, and expressions using normal DataFusion semantics.
+Defaults and materialized columns may use it too. Do not add clock capture,
+persisted attempt timestamps, or special metadata-column rules for replay.
+
+Pipeline validation still enforces the v1 query scope: one SELECT with exactly
+one scan of the declared source, no DDL/DML, joins, cross joins, or extra scans,
+plus the target type and column contract. Function volatility, unordered
+LIMIT/OFFSET, and order-sensitive operators are not rejected merely because
+different attempts could produce different results. Exact reproducibility of
+an independently rerun query is not a v1 guarantee.
+
+An empty result or allowed skip publishes `CommitOp::Add { parts: vec![] }`
+under the **same canonical identity** as a non-empty result, then advances
+progress. This creates a catalog completion record and no Parquet object. It
+uses the existing commit uniqueness check, not a new outcome table. Otherwise
+an empty attempt could advance the cursor while a late non-empty attempt still
+publishes. Whichever outcome commits first must make every later attempt
+AlreadyApplied. A source ADD with no added parts is completion-only: do not run
+SQL over it; publish an empty identified outcome and advance. REPLACE/DELETE
+remain ignored source events and need no target publication.
+
+This adds a target catalog row for empty/skip outcomes, including completion-only
+events propagated through MV chains. It avoids file writes and special replay
+machinery. Uncommitted losing uploads remain ordinary pending GC orphans.
 
 ### MV progress is one source commit at a time
 
@@ -284,11 +370,13 @@ Each Parquet-source pipeline processes one ordered change event at a time:
   idempotent target ADD, then advance the cursor;
 - `replace` or `delete`: do not run the MV and advance the cursor; those commits
   rewrite/remove rows already represented by earlier ADD intent; and
-- an empty SQL result advances the cursor without a target commit.
+- an empty SQL result or allowed skip publishes an empty identified target ADD
+  before advancing the cursor.
 
 One-commit operations avoid batch-window ambiguity: retries always reconstruct
-the same identity. Aggregates are partial per source commit. Consumers query
-them with a final aggregation; semantic merge-state compaction is future work.
+the same identity, without requiring the same output. Aggregates are partial per
+source commit. Consumers query them with a final aggregation; semantic
+merge-state compaction is future work.
 
 The first worker startup that selects a Parquet-source pipeline initializes its
 `worker_cursors` row atomically at the source's current feed head. Concurrent
@@ -403,11 +491,10 @@ primary, never from a cached local cursor or a lagging read replica:
    or Arrow, cancel/join remaining reads for this attempt and discard partial
    SQL input/output. Re-read the shared cursor and reconcile the exact target
    identity as above. Cursor S >= C proves resolution even when the peer
-   produced no target commit because its result was empty or policy allowed a
-   skip. `Committed` with a cursor below C permits the same monotonic advancement
-   as step 2. If neither proves completion, re-read the cursor once more after
-   an `Absent` lookup, covering an empty/skip outcome that committed between
-   those reads. No object absence or local processing state is completion proof.
+   produced no Parquet files because its result was empty or policy allowed a
+   skip. Those outcomes still have an identified empty target ADD. `Committed`
+   with a cursor below C permits the same monotonic advancement as step 2.
+   No object absence or local processing state is completion proof.
 4. If the source is still required after these fresh checks, retain the typed
    source error. A missing required part is a permanent `SourceInputUnavailable`
    error with source commit, part ID, and path; it must not advance the cursor,
@@ -454,8 +541,9 @@ uploads before noticing peer completion. Record
 `mv_superseded_attempts_total{phase,proof}` with fixed phase values
 `before_read`, `source_read`, `before_publish` and proof values
 `cursor`, `operation`; do not count an inferred operation completion as a real
-`AlreadyApplied` commit response or a configured skip. This contract depends
-on the replay-stability requirements tracked by R3 and does not resolve them.
+`AlreadyApplied` commit response or a configured skip. This contract uses the
+first-committed-outcome rule for both empty and non-empty results; it does not
+depend on reproducible SQL output.
 
 ## Canonical operation identities
 
@@ -483,9 +571,10 @@ OperationIdentity::mv(target_hypertable_id, intent)              // mv/v1
 The target hypertable is the identity scope. Pipeline ID names the immutable
 definition. Kafka ranges or the exact source commit name the consumed log
 prefix. Generated object paths, output bytes, process/attempt IDs, cursor value,
-wall time, and lease state are absent. Bump transformation version only when
-the same immutable definition and source input would legitimately map to
-different logical rows.
+wall time, and lease state are absent. Empty, skipped, and non-empty attempts
+use the same key and fingerprint. Bump transformation version for a deliberate
+change in transformation implementation semantics, never for an attempt's
+clock, random values, or computed output.
 
 ## Global constraints
 
@@ -627,6 +716,10 @@ The catalog needs no new reconciliation API: both identities travel through
 - [ ] Catalog tests: same key+fingerprint is `AlreadyApplied`; forged
   fingerprint is a permanent collision; before/after-COMMIT fault lookup returns
   Absent/Committed for both domains.
+- [ ] Same source identity with different output parts or an empty ADD selects
+  exactly one durable outcome. Exercise empty-first and non-empty-first races;
+  the losing attempt returns AlreadyApplied and cannot add parts or change the
+  winning outcome. No output value enters the identity or fingerprint.
 - [ ] Verify and commit:
 
 ```bash
@@ -636,7 +729,7 @@ cargo clippy -p ukiel-core -p ukiel-catalog --all-targets -- -D warnings
 git commit -m "feat: identify pipeline ingest and mv mutations"
 ```
 
-### Task 3: Pure deterministic SQL-over-batches crate
+### Task 3: Pure SQL-over-batches crate
 
 **Files:**
 
@@ -644,47 +737,55 @@ git commit -m "feat: identify pipeline ingest and mv mutations"
 - Create: `crates/ukiel-pipeline/tests/{validation,execution,boundary}.rs`
 - Modify: root `Cargo.toml`
 
-Interfaces:
+Current foundation interfaces (catalog definition and target-contract
+integration still belongs to this task):
 
 ```rust
-pub struct TargetContract { /* writable fields, required fields, target schema */ }
-pub struct PreparedPipeline { /* validated SQL/logical contract */ }
+pub struct PreparedPipeline { /* SQL, source/output schemas, execution limits */ }
 
 pub async fn prepare_pipeline(
-    pipeline: &Pipeline,
-    source_schema: SchemaRef,
-    target: &TargetContract,
+    source_name: &str,
+    sql: &str,
+    input_schema: SchemaRef,
+    limits: ExecutionLimits,
 ) -> Result<PreparedPipeline, PipelineError>;
 
 pub async fn execute_pipeline(
     prepared: &PreparedPipeline,
-    input: RecordBatch,
+    input: Vec<RecordBatch>,
 ) -> Result<Vec<RecordBatch>, PipelineError>;
 ```
 
-Register only the declared source. Walk the logical expressions and reject any
-function whose volatility is not immutable. Reject joins/cross joins/multiple
-table scans and every DDL/DML/statement class outside one SELECT. Validate the
+Register only the declared source. Allow normal DataFusion functions, including
+`now()` and random values, without a volatility filter. Do not require total
+ordering for LIMIT/OFFSET or aggregates as a publication-correctness condition.
+Reject joins/cross joins/multiple table scans and every DDL/DML/statement class
+outside one SELECT. Validate the
 output against the full writable target contract: required non-default fields,
 packing/sort/partition columns, compatible types, no alias writes, no unknown
 extra fields, and a valid optional event-time column.
 
-Execution uses a fresh single-use DataFusion context per input batch. The input
-schema and prepared schema must match exactly. Empty output retains the planned
-schema. This crate has no catalog, Kafka, object-store, Ukiel worker, or CLI
-dependency.
+Execution uses a fresh single-use DataFusion context per logical source event,
+registering its batch sequence as one input. The input schema and prepared
+schema must match exactly. Empty output retains the planned schema, available
+through `PreparedPipeline::output_schema()`. The initial API enforces explicit
+input/output and operator-memory limits and disables spilling. MV input reading
+must enforce its budget while fetching files, before calling this API. This
+crate has no direct catalog, Kafka, object-store, Ukiel worker, or CLI dependency.
 
 - [ ] Tests: filter/rename/derived partition; aggregation; missing key; wrong
-  type; alias/extra output; immutable function accepted; `now`, random, DDL,
-  DML, join, self-join, and second scan rejected; Kafka metadata predicate is
-  replay-stable.
+  type; alias/extra output; `now()` in projection and predicate and random
+  expressions accepted and executed; LIMIT/OFFSET and order-sensitive SQL not
+  rejected for nondeterminism; DDL, DML, join, self-join, and second scan rejected;
+  Kafka metadata predicates remain available. Do not assert identical output
+  across attempts for nondeterministic SQL.
 - [ ] Boundary test enforces the dependency rule.
 - [ ] Verify and commit:
 
 ```bash
 cargo test -p ukiel-pipeline
 cargo clippy -p ukiel-pipeline --all-targets -- -D warnings
-git commit -m "feat: validate and execute deterministic pipeline sql"
+git commit -m "feat: validate and execute pipeline sql"
 ```
 
 ### Task 4: Shared batch-to-L0 publication path
@@ -695,6 +796,7 @@ git commit -m "feat: validate and execute deterministic pipeline sql"
 - Create: `crates/ukiel-write/tests/{writer,publisher,boundary}.rs`
 - Modify: `crates/ukiel-ingest/src/{writer,flusher,lib,error}.rs`
 - Modify: `crates/ukiel-ingest/tests/consumer_test.rs`
+- Modify: `crates/ukiel-expr/src/lib.rs`
 - Modify: root `Cargo.toml`
 
 Extract target writing without changing existing output. Source JSON decoding
@@ -730,18 +832,29 @@ target sort key, groups by declared partition columns, and uses the shared L0
 writer properties. `publish_add` assigns paths, registers every pending object
 before upload, uploads, then calls `commit_with_offsets` or `commit`. It accepts
 a prebuilt identity so callers prove intent before object work. Empty ingest
-items still allow an offset-only ADD; empty MV output does not call it.
+items publish an offset-only ADD; empty MV results and allowed skips likewise
+call it with no items to commit an identified completion record without uploads.
+
+Support normal DataFusion clock/random expressions in pipeline target defaults
+and materialized columns. Remove the write-time volatility rejection that
+would block them, and ensure execution actually evaluates `now()` rather than
+only accepting its schema. Preserve column-reference and type validation.
 
 Keep ingest metrics at the ingest caller boundary; `ukiel-write` emits
 catalog/object failure metrics with bounded `metric_role` only. The object-store
-wrapper continues to own cache prewarming. `ukiel-write` has no rdkafka,
-DataFusion, query-server, worker-supervisor, or CLI dependency.
+wrapper continues to own cache prewarming. `ukiel-write` uses `ukiel-expr` and
+its transitive DataFusion expression engine, but has no direct DataFusion SQL
+session, rdkafka, query-server, worker-supervisor, or CLI dependency.
 
 - [ ] Characterization tests prove existing ingest Parquet bytes, stats,
   materialized columns, upload-intent ordering, offset CAS, and result are
   unchanged.
 - [ ] Plain ADD test proves pending intents clear on success, survive failed
   commit, and ambiguous errors carry the caller's identity.
+- [ ] Empty identified ADD creates no object/pending upload but does create a
+  reconcilable operation; replay with non-empty items cannot change its outcome.
+  Write-time `now()`/random defaults and materialized expressions execute, and
+  stored values are preserved by subsequent compaction rather than recomputed.
 - [ ] Boundary test proves both ingest and MV can consume `ukiel-write` without
   either depending on the other's source runtime.
 - [ ] Verify and commit:
@@ -844,9 +957,11 @@ shared progress and operation completion before reading exactly `event.added`
 with schema adaptation. Execute SQL, encode target items, recheck progress, and
 call shared `publish_add(Plain)`. Advance the monotonic cursor only after a
 Committed/AlreadyApplied response or authoritative Committed operation lookup.
-An already advanced shared cursor requires no write. For REPLACE/DELETE or
-empty output, advance without target mutation. `stall` preserves cursor; an
-allowed `skip` advances and counts, except for missing required source objects.
+An already advanced shared cursor requires no write. For REPLACE/DELETE,
+advance without target mutation. Empty output and an allowed skip publish an
+empty identified ADD before advancing. An ADD with no source parts bypasses SQL
+and publishes that same completion-only outcome. `stall` preserves the cursor;
+missing required source objects cannot be policy-skipped.
 
 The cursor row created on first selection fences the unresolved pipeline prefix.
 It does not pin objects for a slow replica after a peer resolves that prefix.
@@ -881,12 +996,17 @@ path. No Kafka dependency in `ukiel-mv`.
   read failure, cancels partial work, stays healthy, reloads the durable cursor,
   and does not publish again; the target contains exactly one logical result.
 - [ ] Repeat that race for partial multi-part reads, wrapped Parquet/Arrow
-  NotFound errors, empty SQL output, and a configured skip with no target
-  operation. Separately inject a transient source read error and gate an
-  empty/skip advancement between the first error-time cursor read and an Absent
-  operation lookup to exercise the final cursor recheck. Also pause B after
-  successful reads but before publication and verify the progress recheck
+  NotFound errors, empty SQL output, and a configured skip with no target files
+  but a durable empty target operation. Also pause B after successful reads
+  but before publication and verify the progress recheck
   abandons its work; a later race still converges by identity.
+- [ ] First-committed-result tests: race attempts with different timestamps and
+  different row sets under one identity; verify only the winning result is
+  visible. Race empty/skip and non-empty results in both orders, including a
+  late non-empty publish after the empty outcome's cursor already advanced.
+  Exercise lost acknowledgement for empty completion and non-empty publication.
+  A completion-only ADD received by a downstream MV must not run SQL or create
+  data files, even for SQL such as `SELECT count(*) FROM source`.
 - [ ] Completion-proof tests: target operation committed but cursor unadvanced
   avoids source reads and advances once; genuinely missing required input with
   no proof raises `SourceInputUnavailable` and cannot be policy-skipped;
@@ -1008,8 +1128,9 @@ git commit -m "test: prove pipeline and mv recovery end to end"
 
 Mark v1 implemented; document immutable definitions, explicit startup
 selection and restart-based rollout, acyclic pipeline graphs, stable Kafka
-metadata, future-facing MV creation, partial aggregate semantics, shared-cursor
-active-active correctness/duplicate-work limitation, role recovery, config, and
+metadata, future-facing MV creation, first-committed-result semantics including
+clock expressions and empty completion records, partial aggregate semantics,
+shared-cursor active-active correctness/duplicate-work limitation, role recovery, config, and
 metrics. Remove the old age/future knob documentation only after its replacement
 is live. Keep egress, backfill, pipeline updates, aggregating compaction, and MV
 leases explicit follow-ups.
@@ -1041,7 +1162,8 @@ This plan is complete only when:
 - Kafka progress is edge-scoped and survives an immutable pipeline replacement;
 - ingest and MV workers execute only their explicit startup name lists;
 - Parquet pipeline self-loops and directed cycles are rejected;
-- retries execute deterministic SQL over the same stable source metadata;
+- retries identify the same source work and publish only its first committed
+  outcome; SQL results may differ across attempts, including `now()` values;
 - parts+offsets and MV target ADDs carry canonical operation identities;
 - every upload is intent-covered and every cursor is monotonic/GC-fencing;
 - a slow MV replica survives peer progress and GC by reconciling durable

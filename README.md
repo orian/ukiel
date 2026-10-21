@@ -162,10 +162,22 @@ endpoint: `SELECT table_name FROM information_schema.tables`.
   (metadata-only for dedicated files, rewrite for packed ones). All swaps
   are optimistic REPLACE commits; losers replan from fresh state.
   See `docs/notes/2026-07-06-lsm-hierarchy.md`.
-- `crates/ukiel-expr` — deterministic SQL expression engine for column
-  specs: `default` / `materialized` (computed at write + recomputed on
-  rewrites = organic backfill) / `alias` (computed at query time). See
+- `crates/ukiel-expr` — SQL expression engine for column specs, including
+  `now()` and random values: `default` / `materialized` (computed at write,
+  preserved on rewrites, backfilled when absent from older files) / `alias`
+  (computed at query time). See
   `docs/notes/2026-07-06-materialized-columns.md`.
+- `crates/ukiel-pipeline` — SQL execution over a logical sequence of Arrow
+  batches, with input/output and operator-memory limits. Clock/random expressions
+  are supported; attempts may differ and publication identity selects the first
+  committed result.
+- `crates/ukiel-write` — shared target encoding, upload intents, and identified
+  L0 publication used by ingest and MVs.
+- `crates/ukiel-mv` — Parquet-to-Parquet SQL pipelines over source ADD commits,
+  durable cursors, empty completion records, and reconciliation when a peer
+  finishes an event. The opt-in `mv` daemon role selects immutable pipeline names.
+  Configuration and operating semantics:
+  [materialized views](docs/notes/2026-10-22-materialized-views.md).
 - `crates/ukiel-gc` — object garbage collection: reaps tombstoned parts'
   objects after a grace period (fenced by worker cursors) and sweeps orphaned
   uploads via a write-ahead intent table (`pending_objects`) — no object-store
@@ -175,8 +187,8 @@ endpoint: `SELECT table_name FROM information_schema.tables`.
   (Kafka + Postgres + MinIO); tests are `#[ignore]`d by default. Philosophy
   and scenario catalog: `docs/superpowers/specs/2026-07-05-ukiel-testing-design.md`.
 - `crates/ukield` — the all-in-one server binary: ingest + query + compactor
-  + GC in one process (per-role deployment via `roles = [...]`), idempotent
-  table bootstrap from TOML config, graceful shutdown. Exposes `GET /metrics`
+  + GC and an opt-in MV role (per-role deployment via `roles = [...]`), idempotent
+  table/pipeline bootstrap from TOML config, graceful shutdown. Exposes `GET /metrics`
   (Prometheus) and `GET /readyz` (catalog + object-store reachability) on the
   query listener, plus a standalone `metrics_listen` port for processes
   running without the query role; a periodic collector adds consumer/feed

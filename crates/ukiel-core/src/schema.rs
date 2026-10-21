@@ -42,8 +42,8 @@ pub fn ukiel_type_of(field: &Field) -> String {
 }
 
 /// How a column gets its value. Expressions are DataFusion SQL strings over
-/// this table's stored/default columns; they must be deterministic (enforced
-/// by `ukiel-expr` at compile time).
+/// this table's stored/default columns. Clock and random expressions are allowed;
+/// write-time values are stored and preserved by subsequent rewrites.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnKind {
     /// Plain column: value comes from the insert.
@@ -52,7 +52,7 @@ pub enum ColumnKind {
     /// expression at ingest. Stored.
     Default(String),
     /// Always computed from other columns at write time (insert values are
-    /// ignored) and recomputed on every rewrite. Stored.
+    /// ignored). Rewrites backfill it only when absent from an older file. Stored.
     Materialized(String),
     /// Computed at query time. Never stored.
     Alias(String),

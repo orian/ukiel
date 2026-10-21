@@ -1892,7 +1892,7 @@ async fn the_compaction_identity_is_the_merge_intent_not_the_attempt() {
         merge_identity(&ht, &parts, 1).key(),
         merge_identity(&ht, &parts[..1], 1).key()
     );
-    assert_eq!(COMPACTION_TRANSFORMATION_VERSION, 1);
+    assert_eq!(COMPACTION_TRANSFORMATION_VERSION, 2);
 }
 
 /// The lost-acknowledgement case for compaction: the merge is durable, the

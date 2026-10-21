@@ -2,24 +2,14 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Int64Array, RecordBatch};
+use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::json::ReaderBuilder;
-use parquet::arrow::ArrowWriter;
 use ukiel_core::TableColumns;
 
 use crate::IngestError;
 
-/// One encoded L0 Parquet file, ready for the object store.
-#[derive(Debug)]
-pub struct EncodedPart {
-    pub bytes: Vec<u8>,
-    pub row_count: i64,
-    pub key_min: i64,
-    pub key_max: i64,
-    /// Per-column Int64 min/max for catalog part pruning.
-    pub column_stats: Option<serde_json::Value>,
-}
+pub use ukiel_write::EncodedPart;
 
 /// Decodes `rows` against a plain schema, sorts by `sort_key`, and encodes one
 /// Parquet file. Every row must carry the packing key and ts as JSON integers.
@@ -102,48 +92,12 @@ fn finish_batch(
     sort_key: &[String],
     opts: ukiel_core::WriteOpts,
 ) -> Result<EncodedPart, IngestError> {
-    let key_idx = batch
-        .schema()
-        .index_of(packing_key)
-        .map_err(|_| IngestError::MissingColumn {
-            row: 0,
-            column: packing_key.to_string(),
-        })?;
-    let keys = batch
-        .column(key_idx)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| IngestError::MissingColumn {
-            row: 0,
-            column: packing_key.to_string(),
-        })?;
-    let key_min = arrow::compute::min(keys).ok_or(IngestError::EmptyFlush)?;
-    let key_max = arrow::compute::max(keys).ok_or(IngestError::EmptyFlush)?;
-    // Plan 16: the packing-key bitmap makes part pruning exact for sparse
-    // tenants. Multi-key L0 flushes only — a single-key file is already exact
-    // under range pruning. No row-group spans here: L0 files are small,
-    // short-lived and single-row-group in practice, so spans would buy nothing.
-    let column_stats = ukiel_core::stats::with_key_index(
-        ukiel_core::stats::int64_column_stats(&batch),
-        (key_min != key_max)
-            .then(|| ukiel_core::stats::key_bitmap(&batch, packing_key))
-            .flatten(),
-        None,
-    );
-
-    let props = ukiel_core::writer_props(&batch.schema(), sort_key, &opts);
-    let mut bytes = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), Some(props))?;
-    writer.write(&batch)?;
-    writer.close()?;
-
-    Ok(EncodedPart {
-        bytes,
-        row_count: batch.num_rows() as i64,
-        key_min,
-        key_max,
-        column_stats,
-    })
+    Ok(ukiel_write::encode_batch(
+        batch,
+        packing_key,
+        sort_key,
+        opts,
+    )?)
 }
 
 #[cfg(test)]
@@ -286,6 +240,40 @@ mod tests {
         let doubled: &arrow::array::Float64Array = batch.column(3).as_any().downcast_ref().unwrap();
         assert_eq!(amount.values().as_ref(), &[5.0, 0.0, 0.0]);
         assert_eq!(doubled.values().as_ref(), &[10.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn encode_rows_stores_clock_defaults_and_random_materialized_values() {
+        let cols = ukiel_core::TableColumns::parse(&json!({"fields": [
+            {"name": "tenant_id", "type": "int64"},
+            {"name": "ts", "type": "timestamp_ms"},
+            {"name": "inserted_at", "type": "int64", "default": "CAST(now() AS BIGINT)"},
+            {"name": "draw", "type": "float64", "materialized": "random()"}
+        ]}))
+        .unwrap();
+        let encoded = encode_rows(
+            &cols,
+            "tenant_id",
+            "ts",
+            &sk(),
+            vec![
+                json!({"tenant_id": 2, "ts": 20, "inserted_at": 42, "draw": -1.0}),
+                json!({"tenant_id": 1, "ts": 10}),
+            ],
+        )
+        .unwrap();
+        let batch = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(encoded.bytes))
+            .unwrap()
+            .build()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let times: &Int64Array = batch.column(2).as_any().downcast_ref().unwrap();
+        assert!(times.value(0) > 0);
+        assert_eq!(times.value(1), 42);
+        let draws: &arrow::array::Float64Array = batch.column(3).as_any().downcast_ref().unwrap();
+        assert!(draws.values().iter().all(|x| (0.0..1.0).contains(x)));
     }
 
     #[test]

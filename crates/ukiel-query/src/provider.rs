@@ -461,7 +461,7 @@ impl TableProvider for UkielTableProvider {
                         // field is a schema mismatch, so the target must be the
                         // field's. `compile` casts to it — one narrow output
                         // column, never the scan.
-                        let compiled = ukiel_expr::compile(sql, &scanned_schema, field.data_type())
+                        let compiled = ukiel_expr::compile_for_field(sql, &scanned_schema, field)
                             .map_err(|e| DataFusionError::External(Box::new(e)))?;
                         compiled.into_physical()
                     }

@@ -1,0 +1,18 @@
+[package]
+name = "ukiel-write"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ukiel-core = { workspace = true }
+ukiel-catalog = { workspace = true }
+ukiel-expr = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true }
+object_store = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }

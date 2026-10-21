@@ -7,6 +7,7 @@ edition.workspace = true
 ukiel-core = { workspace = true }
 ukiel-catalog = { workspace = true }
 ukiel-expr = { workspace = true }
+ukiel-write = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true }
 object_store = { workspace = true }

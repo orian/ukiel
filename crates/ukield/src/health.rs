@@ -79,6 +79,7 @@ impl RoleState {
 pub fn role_label(role: Role) -> &'static str {
     match role {
         Role::Ingest => "ingest",
+        Role::Mv => "mv",
         Role::Query => "query",
         Role::Compactor => "compactor",
         Role::Gc => "gc",

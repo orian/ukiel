@@ -21,3 +21,5 @@ id_type!(LogicalTableId);
 id_type!(PartId);
 id_type!(CommitId);
 id_type!(NamespaceId);
+id_type!(PipelineId);
+id_type!(StreamTableId);

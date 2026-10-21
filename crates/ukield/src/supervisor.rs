@@ -84,6 +84,12 @@ impl RoleFailure for ukiel_gc::GcError {
     }
 }
 
+impl RoleFailure for ukiel_mv::MvError {
+    fn catalog_error(&self) -> Option<&CatalogError> {
+        ukiel_mv::MvError::catalog_error(self)
+    }
+}
+
 impl RoleFailure for CatalogError {
     fn catalog_error(&self) -> Option<&CatalogError> {
         Some(self)

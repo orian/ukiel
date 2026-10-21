@@ -8,6 +8,9 @@ members = [
     "crates/ukiel-compactor",
     "crates/ukiel-gc",
     "crates/ukiel-expr",
+    "crates/ukiel-pipeline",
+    "crates/ukiel-write",
+    "crates/ukiel-mv",
     "crates/ukield",
     "crates/ukiel-e2e",
     # Plan 45 (prod-synth). Three single-purpose executables joined only by the
@@ -104,6 +107,9 @@ ukiel-query = { path = "crates/ukiel-query" }
 ukiel-compactor = { path = "crates/ukiel-compactor" }
 ukiel-gc = { path = "crates/ukiel-gc" }
 ukiel-expr = { path = "crates/ukiel-expr" }
+ukiel-pipeline = { path = "crates/ukiel-pipeline" }
+ukiel-write = { path = "crates/ukiel-write" }
+ukiel-mv = { path = "crates/ukiel-mv" }
 ukield = { path = "crates/ukield" }
 prod-synth-contract = { path = "tools/prod-synth-contract" }
 prod-synth-integrity = { path = "tools/prod-synth-integrity" }

@@ -3,6 +3,25 @@ use ukiel_core::{ChangeEvent, CommitId, HypertableId, Part, PartId};
 use crate::parts::{PART_COLUMNS, PartRow};
 use crate::{CatalogError, PostgresCatalog};
 
+/// Caller owns an explicit READ COMMITTED transaction and commits only after
+/// all protected work (such as first cursor registration) is durable.
+pub(crate) async fn feed_head_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    hypertable_id: HypertableId,
+) -> Result<CommitId, CatalogError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(~$1::bigint)")
+        .bind(hypertable_id.0)
+        .execute(&mut **tx)
+        .await?;
+    // A separate statement acquires a fresh snapshot after waiting.
+    let head: Option<i64> =
+        sqlx::query_scalar("SELECT max(id) FROM commits WHERE hypertable_id = $1")
+            .bind(hypertable_id.0)
+            .fetch_one(&mut **tx)
+            .await?;
+    Ok(CommitId(head.unwrap_or(0)))
+}
+
 impl PostgresCatalog {
     /// A complete committed feed prefix (0 when the hypertable has none).
     /// Waits for in-flight catalog writers on this hypertable; other hypertables
@@ -24,17 +43,9 @@ impl PostgresCatalog {
         // NOT maps positive hypertable IDs injectively, without i64 overflow.
         // Use advisory locks rather than the hypertable row: repeated KEY SHARE
         // lockers can starve a queued FOR UPDATE reader under sustained writes.
-        sqlx::query("SELECT pg_advisory_xact_lock(~$1::bigint)")
-            .bind(hypertable_id.0)
-            .execute(&mut *tx)
-            .await?;
-        let head: Option<i64> =
-            sqlx::query_scalar("SELECT max(id) FROM commits WHERE hypertable_id = $1")
-                .bind(hypertable_id.0)
-                .fetch_one(&mut *tx)
-                .await?;
+        let head = feed_head_in_tx(&mut tx, hypertable_id).await?;
         tx.commit().await?;
-        Ok(CommitId(head.unwrap_or(0)))
+        Ok(head)
     }
 
     /// Ordered change feed: commits with id > `after`, oldest first.

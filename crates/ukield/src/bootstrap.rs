@@ -5,7 +5,42 @@ use anyhow::Context;
 use ukiel_catalog::{CatalogError, PostgresCatalog};
 use ukiel_core::{NamespaceId, Placement};
 
-use crate::config::TableConfig;
+use crate::config::{MvPipelineConfig, TableConfig};
+
+/// Bootstrap definitions without acquiring a consumer cursor. Only an
+/// explicitly selected worker registers a GC fence.
+pub async fn apply_pipelines(
+    catalog: &PostgresCatalog,
+    pipelines: &[MvPipelineConfig],
+    limits: ukiel_pipeline::ExecutionLimits,
+) -> anyhow::Result<()> {
+    for pipeline in pipelines {
+        let source = catalog.get_hypertable(&pipeline.source).await?;
+        let target = catalog.get_hypertable(&pipeline.target).await?;
+        ukiel_expr::validate_table_schema(&source.table_schema)?;
+        ukiel_expr::validate_table_schema(&target.table_schema)?;
+        let schema = std::sync::Arc::new(
+            ukiel_core::TableColumns::parse(&source.table_schema)?.query_schema(),
+        );
+        let prepared =
+            ukiel_pipeline::prepare_pipeline(&source.name, &pipeline.sql, schema, limits)
+                .await
+                .with_context(|| format!("preparing pipeline '{}'", pipeline.name))?;
+        ukiel_write::validate_output_schema(prepared.output_schema().as_ref(), &target)?;
+        catalog
+            .ensure_pipeline(&ukiel_core::PipelineDefinition {
+                name: pipeline.name.clone(),
+                source: ukiel_core::Endpoint::Parquet(source.id),
+                target: target.id,
+                sql: pipeline.sql.clone(),
+                delivery: ukiel_core::Delivery::ExactlyOnce,
+                error_policy: pipeline.error_policy,
+                event_time_column: None,
+            })
+            .await?;
+    }
+    Ok(())
+}
 
 pub async fn apply(catalog: &PostgresCatalog, tables: &[TableConfig]) -> anyhow::Result<()> {
     for table in tables {

@@ -11,6 +11,9 @@ ukiel-query = { workspace = true }
 ukiel-compactor = { workspace = true }
 ukiel-gc = { workspace = true }
 ukiel-expr = { workspace = true }
+ukiel-mv = { workspace = true }
+ukiel-pipeline = { workspace = true }
+ukiel-write = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
 axum = { workspace = true }
 tokio = { workspace = true }

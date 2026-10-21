@@ -5,6 +5,7 @@ pub mod ids;
 pub mod keyfilter;
 pub mod operation;
 pub mod part;
+pub mod pipeline;
 pub mod ready;
 pub mod schema;
 pub mod sorting;
@@ -12,12 +13,18 @@ pub mod stats;
 pub mod table;
 
 pub use commit::{ChangeEvent, CommitOp, CommitResult};
-pub use ids::{CommitId, HypertableId, LogicalTableId, NamespaceId, PartId};
+pub use ids::{
+    CommitId, HypertableId, LogicalTableId, NamespaceId, PartId, PipelineId, StreamTableId,
+};
 pub use operation::{
-    CompactionIntent, DeleteKeyIntent, IngestRange, MAX_OPERATION_KEY_LEN, OperationError,
-    OperationIdentity,
+    CompactionIntent, DeleteKeyIntent, IngestRange, MAX_OPERATION_KEY_LEN, MvIntent,
+    OperationError, OperationIdentity,
 };
 pub use part::{ColumnRange, Part, PartMeta};
+pub use pipeline::{
+    Delivery, Endpoint, EndpointKind, ErrorPolicy, Pipeline, PipelineDefinition, StreamTable,
+    StreamTableDefinition,
+};
 pub use ready::{ReadySignal, signal_ready};
 pub use schema::{
     ColumnKind, ColumnSpec, SchemaError, TableColumns, UKIEL_TYPE_META, arrow_schema_from_json,

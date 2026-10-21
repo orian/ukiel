@@ -1,0 +1,13 @@
+[package]
+name = "ukiel-pipeline"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+datafusion = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

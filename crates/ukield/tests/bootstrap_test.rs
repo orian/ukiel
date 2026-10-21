@@ -141,12 +141,51 @@ async fn bootstrap_is_idempotent() {
         name: "boom".to_string(),
         type_name: "float64".to_string(),
         nullable: None,
-        default: Some("random()".to_string()),
+        default: Some("missing_column + 1".to_string()),
         materialized: None,
         alias: None,
     });
     assert!(
         bootstrap::apply(&catalog, &bad.tables).await.is_err(),
-        "volatile default must fail"
+        "invalid column reference must fail"
     );
+}
+
+#[tokio::test]
+async fn pipeline_bootstrap_is_immutable_and_does_not_register_a_consumer() {
+    let (_pg, catalog) = fresh_catalog().await;
+    let source: UkieldConfig = toml::from_str(CONFIG).unwrap();
+    bootstrap::apply(&catalog, &source.tables).await.unwrap();
+    let mut target = table_config("events_copy", "");
+    target.tables[0].partition_columns.clear();
+    bootstrap::apply(&catalog, &target.tables).await.unwrap();
+    let definition = ukield::config::MvPipelineConfig {
+        name: "copy_v1".into(),
+        source: "events".into(),
+        target: "events_copy".into(),
+        sql: "SELECT * FROM events".into(),
+        error_policy: ukiel_core::ErrorPolicy::Stall,
+    };
+    for _ in 0..2 {
+        bootstrap::apply_pipelines(
+            &catalog,
+            std::slice::from_ref(&definition),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    }
+    let pipeline = catalog.get_pipeline("copy_v1").await.unwrap();
+    assert!(matches!(
+        catalog.read_mv_cursor(pipeline.id).await,
+        Err(ukiel_catalog::CatalogError::Invariant(_))
+    ));
+    let mut changed = definition;
+    changed.sql.push_str(" WHERE tenant_id>0");
+    assert!(
+        bootstrap::apply_pipelines(&catalog, &[changed], Default::default())
+            .await
+            .is_err()
+    );
+    assert_eq!(catalog.list_pipelines().await.unwrap().len(), 1);
 }

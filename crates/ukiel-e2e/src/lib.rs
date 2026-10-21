@@ -68,6 +68,7 @@ impl Stack {
             "postgres://postgres:postgres@127.0.0.1:5432/postgres",
         );
         let s3_endpoint = env_or("UKIEL_E2E_S3", "http://127.0.0.1:19000");
+        let s3_bucket = env_or("UKIEL_E2E_BUCKET", "ukiel");
 
         let catalog = PostgresCatalog::connect(&pg)
             .await
@@ -89,7 +90,7 @@ impl Stack {
                 _ => {
                     let s3 = AmazonS3Builder::new()
                         .with_endpoint(&s3_endpoint)
-                        .with_bucket_name("ukiel")
+                        .with_bucket_name(&s3_bucket)
                         .with_access_key_id("minioadmin")
                         .with_secret_access_key("minioadmin")
                         .with_region("us-east-1")
@@ -97,7 +98,10 @@ impl Stack {
                         .with_virtual_hosted_style_request(false)
                         .build()
                         .expect("build s3 store");
-                    (Arc::new(s3), url::Url::parse("s3://ukiel/").unwrap())
+                    (
+                        Arc::new(s3),
+                        url::Url::parse(&format!("s3://{s3_bucket}/")).unwrap(),
+                    )
                 }
             };
 

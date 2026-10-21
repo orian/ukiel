@@ -74,6 +74,7 @@ impl CatalogError {
             | CatalogError::LeasePartitionMismatch { .. }
             | CatalogError::InvalidLeaseTtl(_)
             | CatalogError::InvalidLockTimeout(_)
+            | CatalogError::InvalidPipeline(_)
             | CatalogError::OperationKeyCollision { .. }
             | CatalogError::OperationHypertableMismatch { .. } => CatalogErrorClass::PermanentInput,
             // The outcome is unknown, and the connection is why: recovery must
@@ -85,6 +86,7 @@ impl CatalogError {
                 CatalogErrorClass::PermanentDatabase
             }
             CatalogError::NotFound(_) => CatalogErrorClass::AbsentResource,
+            CatalogError::Invariant(_) => CatalogErrorClass::PermanentDatabase,
             // A migration that failed because the database was unreachable is a
             // *transport* failure wearing a migration's coat. Calling it
             // permanent is how a writer failover during a rolling deploy kills
@@ -147,6 +149,10 @@ fn class_for_db_error(e: &sqlx::Error) -> CatalogErrorClass {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
+    #[error("invalid pipeline definition: {0}")]
+    InvalidPipeline(String),
+    #[error("catalog invariant violated: {0}")]
+    Invariant(String),
     /// A REPLACE/DELETE lost the optimistic-concurrency race: some input
     /// parts were already tombstoned by another commit. Retry on fresh state.
     #[error("commit conflict: only {live_matched} of {expected} input parts were still live")]

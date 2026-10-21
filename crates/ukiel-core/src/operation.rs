@@ -23,7 +23,7 @@
 
 use serde_json::Value;
 
-use crate::ids::{HypertableId, PartId};
+use crate::ids::{CommitId, HypertableId, PartId, PipelineId};
 use crate::table::Placement;
 
 /// Bound on the stored key. The key carries a digest, not the payload, so it is
@@ -80,6 +80,16 @@ pub struct IngestRange {
     pub last: i64,
 }
 
+/// One MV source event. The result is deliberately absent: non-empty output,
+/// empty output, and a policy skip compete for the same durable operation.
+#[derive(Debug, Clone, Copy)]
+pub struct MvIntent {
+    pub pipeline_id: PipelineId,
+    pub source_hypertable_id: HypertableId,
+    pub source_commit_id: CommitId,
+    pub transformation_version: u32,
+}
+
 /// Everything that makes one compaction merge the transformation it is. Output
 /// `PartMeta` is *not* here: paths, sizes and statistics are properties of the
 /// attempt, and two attempts at the same intent legitimately differ in all three.
@@ -109,6 +119,10 @@ pub struct DeleteKeyIntent<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum OperationError {
+    #[error("operation {field} must be positive, got {value}")]
+    InvalidId { field: &'static str, value: i64 },
+    #[error("an MV source and target must be different hypertables")]
+    MvSelfLoop,
     #[error("operation has no input parts")]
     NoInputParts,
     #[error("duplicate input part {0} in one operation")]
@@ -332,6 +346,35 @@ fn hex(bytes: &[u8; 32]) -> String {
 }
 
 impl OperationIdentity {
+    /// Identifies processing of one source ADD by one immutable pipeline.
+    /// Retrying may compute different rows (including clock/random values),
+    /// but only the first committed outcome is published. Existing ingest v1
+    /// identities and their canonical bytes remain unchanged.
+    pub fn mv(
+        target_hypertable_id: HypertableId,
+        intent: MvIntent,
+    ) -> Result<Self, OperationError> {
+        for (field, value) in [
+            ("target_hypertable_id", target_hypertable_id.0),
+            ("pipeline_id", intent.pipeline_id.0),
+            ("source_hypertable_id", intent.source_hypertable_id.0),
+            ("source_commit_id", intent.source_commit_id.0),
+        ] {
+            if value <= 0 {
+                return Err(OperationError::InvalidId { field, value });
+            }
+        }
+        if target_hypertable_id == intent.source_hypertable_id {
+            return Err(OperationError::MvSelfLoop);
+        }
+        finish(target_hypertable_id, "mv", 1, |c| {
+            c.int(i64::from(intent.transformation_version));
+            c.int(intent.pipeline_id.0);
+            c.int(intent.source_hypertable_id.0);
+            c.int(intent.source_commit_id.0);
+        })
+    }
+
     /// The intent to consume exactly these Kafka offsets into this hypertable.
     ///
     /// Deliberately *not* a function of the rows, the Parquet bytes, or the
@@ -422,6 +465,99 @@ impl OperationIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mv_identity_names_the_source_work_and_versions_its_semantics() {
+        let intent = MvIntent {
+            pipeline_id: PipelineId(7),
+            source_hypertable_id: HypertableId(8),
+            source_commit_id: CommitId(9),
+            transformation_version: 1,
+        };
+        let original = OperationIdentity::mv(HypertableId(10), intent).unwrap();
+        assert!(original.key().starts_with("ukiel/mv/v1/"));
+        assert_eq!(original.domain(), "mv");
+        assert_eq!(
+            original,
+            OperationIdentity::mv(HypertableId(10), intent).unwrap()
+        );
+        for changed in [
+            MvIntent {
+                pipeline_id: PipelineId(11),
+                ..intent
+            },
+            MvIntent {
+                source_hypertable_id: HypertableId(12),
+                ..intent
+            },
+            MvIntent {
+                source_commit_id: CommitId(13),
+                ..intent
+            },
+            MvIntent {
+                transformation_version: 2,
+                ..intent
+            },
+        ] {
+            assert_ne!(
+                original,
+                OperationIdentity::mv(HypertableId(10), changed).unwrap()
+            );
+        }
+        assert_ne!(
+            original,
+            OperationIdentity::mv(HypertableId(11), intent).unwrap()
+        );
+        assert_eq!(
+            original.key(),
+            "ukiel/mv/v1/569cc02d4d6dff9c671b78c57af78db42d144085140e34ae06ce70318e62b96d"
+        );
+    }
+
+    #[test]
+    fn mv_identity_rejects_invalid_source_work() {
+        let valid = MvIntent {
+            pipeline_id: PipelineId(7),
+            source_hypertable_id: HypertableId(8),
+            source_commit_id: CommitId(9),
+            transformation_version: 1,
+        };
+        for invalid in [
+            MvIntent {
+                pipeline_id: PipelineId(0),
+                ..valid
+            },
+            MvIntent {
+                pipeline_id: PipelineId(-1),
+                ..valid
+            },
+            MvIntent {
+                source_hypertable_id: HypertableId(0),
+                ..valid
+            },
+            MvIntent {
+                source_commit_id: CommitId(0),
+                ..valid
+            },
+            MvIntent {
+                source_commit_id: CommitId(-1),
+                ..valid
+            },
+        ] {
+            assert!(matches!(
+                OperationIdentity::mv(HypertableId(10), invalid),
+                Err(OperationError::InvalidId { .. })
+            ));
+        }
+        assert!(matches!(
+            OperationIdentity::mv(HypertableId(0), valid),
+            Err(OperationError::InvalidId { .. })
+        ));
+        assert!(matches!(
+            OperationIdentity::mv(valid.source_hypertable_id, valid),
+            Err(OperationError::MvSelfLoop)
+        ));
+    }
     use serde_json::json;
 
     fn parts(ids: &[i64]) -> Vec<PartId> {

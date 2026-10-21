@@ -30,7 +30,8 @@ use crate::rewrite;
 /// materially different output — a new placement rule, a changed sort or
 /// materialized-column semantic. Not for an ordinary release: a version that
 /// moves on every deploy orphans every in-flight identity.
-pub const COMPACTION_TRANSFORMATION_VERSION: u32 = 1;
+/// Version 2 preserves stored expression values; only missing columns backfill.
+pub const COMPACTION_TRANSFORMATION_VERSION: u32 = 2;
 
 /// The identity of "merge exactly these live parts into one run at
 /// `output_level`". Built before a single Parquet file is opened, and free of

@@ -285,6 +285,68 @@ pub async fn run_with_catalog(
     )
     .await?;
 
+    supervisor::with_catalog_recovery(
+        "bootstrapping pipelines",
+        &catalog,
+        &health,
+        &startup,
+        &policy,
+        &shutdown,
+        || {
+            crate::bootstrap::apply_pipelines(
+                &catalog,
+                &cfg.pipelines,
+                cfg.mv.worker_config().limits,
+            )
+        },
+    )
+    .await?;
+
+    if cfg.roles.contains(&Role::Mv) {
+        let mut mv_cfg = cfg.mv.worker_config();
+        mv_cfg.ready = Some(ready_signal(&health, Role::Mv));
+        // Establish the initial fence before starting this process's ingest or
+        // GC. Rebuilds preserve the registered cursor and reload all authority.
+        supervisor::with_catalog_recovery(
+            "registering materialized views",
+            &catalog,
+            &health,
+            &health.role(Role::Mv),
+            &policy,
+            &shutdown,
+            || async {
+                ukiel_mv::MvFleet::new(catalog.clone(), store.clone(), mv_cfg.clone())
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await?;
+        let (catalog, store, token) = (catalog.clone(), store.clone(), shutdown.clone());
+        let build = move || -> supervisor::RoleRun<'static, ukiel_mv::MvError> {
+            let (catalog, store, config, token) = (
+                catalog.clone(),
+                store.clone(),
+                mv_cfg.clone(),
+                token.clone(),
+            );
+            Box::pin(async move {
+                ukiel_mv::MvFleet::new(catalog, store, config)
+                    .await?
+                    .run(token)
+                    .await
+            })
+        };
+        spawn_supervised(
+            &mut tasks,
+            Role::Mv,
+            build,
+            &catalog_for_roles,
+            &health,
+            &policy,
+            &shutdown,
+        );
+    }
+
     if cfg.roles.contains(&Role::Ingest) {
         let routes: Vec<TableRoute> = cfg
             .tables

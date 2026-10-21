@@ -42,7 +42,7 @@ The same move applies to time: the core is **time-agnostic**. The engine owns *p
 
 Query planning = one indexed catalog query (*live parts where partition ∈ P and packing-key range ∋ k*), never an object-store listing.
 
-Schema is owned by the hypertable row (JSON; see `docs/notes/schema-management.md`). Columns can be plain, `default`, `materialized`, or `alias` expressions (`docs/notes/2026-07-06-materialized-columns.md`) — write-time expressions are recomputed on every rewrite, which doubles as organic backfill after additive schema changes.
+Schema is owned by the hypertable row (JSON; see `docs/notes/schema-management.md`). Columns can be plain, `default`, `materialized`, or `alias` expressions (`docs/notes/2026-07-06-materialized-columns.md`). Write-time expressions support clocks and random values; rewrites preserve stored values and backfill only columns absent from older files.
 
 #### Hypertable vs logical table
 
@@ -163,8 +163,15 @@ capability:
   (issue 0003).
 - Poison-message skipping with advancing offsets (S4); asymmetric
   event-time bounds with the per-table backfill override (issue 0004).
-- `default` / `materialized` columns computed at ingest and recomputed on
-  every rewrite (organic backfill); `alias` columns resolved at query time.
+- `default` / `materialized` columns computed at ingest and preserved on
+  rewrites; missing columns receive organic backfill. `alias` columns resolve
+  at query time. Clock and random expressions are supported.
+- `ukiel-pipeline` provides SQL over a batch sequence with fresh execution
+  contexts and input/output/operator-memory limits. Immutable catalog pipeline
+  definitions and the opt-in `mv` daemon role implement Parquet-to-Parquet SQL
+  with one first-committed outcome per source ADD. See
+  [MV configuration and operations](../../notes/2026-10-22-materialized-views.md).
+  Kafka-to-Parquet SQL routing remains planned; existing ingest uses TableRoute.
 - Ingest backpressure on live-L0 pressure (slowdown / stop / 2× memory
   valve, exactly-once-safe) and the partition-spread backfill warning.
 
@@ -243,7 +250,7 @@ types (row 36, needs a sketch).
 8, then 31 → 22 → 23 → 24; 25/26 gated on design decisions; 36 needs a design
 sketch; 38 blocked upstream — DataFusion 54 is current, audit note
 `docs/notes/2026-07-13-datafusion-upgrade-audit.md`): catalog aggregate
-pushdown (35 — plan written), pipelines & MVs (8 — plan written),
+pushdown (35 — plan written), pipelines & MVs (8 — MV implemented; Kafka SQL pending),
 streaming-merge phase 2 / slice sealing (31), partition coalescing + retention
 (22), feed horizon (23), egress (24), auth (25), horizontal ingest (26).
 

@@ -6,6 +6,11 @@ the only storage engine) or `kafka` (a topic endpoint with a schema). This
 replaces the bespoke `TableRoute` ingest config and generalizes the MV design;
 roadmap plan 8 is authored against this note.
 
+**2026-10-22 implementation:** the Parquet-to-Parquet MV path and opt-in daemon
+role are implemented. See [configuration and operations](2026-10-22-materialized-views.md).
+Kafka SQL routing and egress below remain planned; existing Kafka ingestion
+continues using `TableRoute`.
+
 ## Table engines
 
 - **`engine = parquet`** — a hypertable: owns parts, packing key, sort order,
@@ -49,8 +54,8 @@ ported. That is what keeps the engine core time-agnostic (design doc,
 "Catalog data model"): a migration backfill is just a pipeline with a
 different predicate, not a config exception. The pipeline output must
 contain the target's packing-key and sort columns; validated at pipeline
-creation (SQL compiles against the source schema, deterministic functions
-only — same `ukiel-expr` rules).
+creation. Clock/random and order-sensitive SQL are allowed: first committed
+publication under the source operation's identity wins, including empty output.
 
 ### Division of labor vs materialized columns
 
@@ -59,8 +64,8 @@ Both exist (as in ClickHouse); the rule:
 - **Pipeline SQL** — source-specific parsing, filtering, renaming. Computed
   once at ingest, for that source only. Cannot backfill.
 - **Materialized column** (`docs/notes/2026-07-06-materialized-columns.md`) —
-  row-shaping that must hold for *every* write path and is recomputed on
-  rewrites, i.e. heals old files (organic backfill).
+  row-shaping applied on write and preserved during rewrites. Rewrites backfill
+  only columns absent from an older file; existing values and NULLs remain.
 
 ## Delivery semantics (per-pipeline `delivery` property)
 
@@ -96,16 +101,17 @@ safe (it fences more conservatively, never less).
 - A pipeline SELECT sees **only the current batch**. `GROUP BY` in a
   kafka-sourced pipeline yields partial aggregates per flush. ClickHouse
   answers with AggregatingMergeTree; our equivalent would be an "aggregating"
-  placement mode where the *compactor* re-aggregates on merge — a future
-  feature, not v1. Aggregation MVs use the parquet-sourced variant, which can
-  re-read parts.
+  table merge policy where the *compactor* re-aggregates on merge — a future
+  feature, not v1. Parquet-source MVs produce partial aggregates per ADD commit;
+  queries must aggregate those partials across commits.
 - **No joins in v1** (would embed the query stack in ingest). Later.
 - **Fan-out** (N pipelines per source topic) is supported by the model but is
   not atomic across targets (one commit per target — same as ClickHouse).
   v1: one pipeline per topic→table pair.
 - **Runtime error policy** is explicit per pipeline: `stall` (default —
   retry the flush; exactly-once preserved) or `skip` (advance past the batch,
-  count it). Creation-time validation catches schema/determinism errors.
+  count it). Creation-time validation catches schema and SQL-scope errors.
+  Empty/skip outcomes publish an identified empty ADD before cursor advancement.
 
 ## v1 scope (plan 8)
 

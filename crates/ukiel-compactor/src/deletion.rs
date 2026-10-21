@@ -19,7 +19,8 @@ use crate::rewrite;
 /// The version of "what erasing this key means" (plan 43). Inside the operation
 /// fingerprint. Bump it when a change would make the same key over the same
 /// inputs produce materially different remaining data.
-pub const DELETION_TRANSFORMATION_VERSION: u32 = 1;
+/// Version 2 preserves stored expression values during packed-file rewrites.
+pub const DELETION_TRANSFORMATION_VERSION: u32 = 2;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct DeletionStats {
@@ -58,7 +59,6 @@ pub async fn delete_key(
     )?;
 
     let cols = ukiel_core::TableColumns::parse(&hypertable.table_schema)?;
-    let schema = Arc::new(cols.physical_schema());
     let mut stats = DeletionStats::default();
     let mut new_parts: Vec<PartMeta> = Vec::new();
 
@@ -72,8 +72,7 @@ pub async fn delete_key(
 
         // Packed file: rewrite without the key's rows.
         let batch =
-            rewrite::read_parts_to_batch(store, schema.clone(), std::slice::from_ref(part)).await?;
-        let batch = ukiel_expr::apply_defaults_and_materialized(batch, &cols)?;
+            rewrite::read_parts_for_rewrite(store, &cols, std::slice::from_ref(part)).await?;
         let keys = rewrite::int64_column(&batch, &hypertable.packing_key)?;
         let mask = neq(keys, &Int64Array::new_scalar(key))?;
         let kept = filter_record_batch(&batch, &mask)?;

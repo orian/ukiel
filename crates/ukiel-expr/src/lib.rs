@@ -1,4 +1,4 @@
-//! Compile and evaluate deterministic DataFusion SQL expressions for
+//! Compile and evaluate DataFusion SQL expressions for
 //! default/materialized/alias columns.
 
 use std::sync::Arc;
@@ -6,11 +6,12 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, RecordBatch};
 use arrow::compute::is_null;
 use arrow::compute::kernels::zip::zip;
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::common::DFSchema;
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::execution::context::ExecutionProps;
-use datafusion::logical_expr::{Expr, ExprSchemable, Volatility};
+use datafusion::logical_expr::ExprSchemable;
+use datafusion::logical_expr::simplify::SimplifyContext;
+use datafusion::optimizer::simplify_expressions::ExprSimplifier;
 use datafusion::physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion::prelude::SessionContext;
 use ukiel_core::{ColumnKind, TableColumns};
@@ -23,8 +24,6 @@ pub enum ExprError {
     DataFusion(#[from] datafusion::error::DataFusionError),
     #[error(transparent)]
     Arrow(#[from] arrow::error::ArrowError),
-    #[error("expression uses volatile function '{0}' — expressions must be deterministic")]
-    Volatile(String),
 }
 
 #[derive(Debug)]
@@ -55,30 +54,58 @@ pub fn column_refs(sql: &str, schema: &Schema) -> Result<Vec<String>, ExprError>
 }
 
 pub fn compile(sql: &str, schema: &Schema, target: &DataType) -> Result<CompiledExpr, ExprError> {
+    compile_to_storage(sql, schema, target, target)
+}
+
+/// Compile with the field's logical type as well as its physical representation.
+/// timestamp_ms is stored as Int64, but a native SQL timestamp must change to
+/// milliseconds before that integer cast (rather than leaking nanoseconds).
+pub fn compile_for_field(
+    sql: &str,
+    schema: &Schema,
+    target: &Field,
+) -> Result<CompiledExpr, ExprError> {
+    let intermediate = if target
+        .metadata()
+        .get(ukiel_core::UKIEL_TYPE_META)
+        .map(String::as_str)
+        == Some("timestamp_ms")
+    {
+        DataType::Timestamp(TimeUnit::Millisecond, None)
+    } else {
+        target.data_type().clone()
+    };
+    compile_to_storage(sql, schema, &intermediate, target.data_type())
+}
+
+fn compile_to_storage(
+    sql: &str,
+    schema: &Schema,
+    intermediate: &DataType,
+    target: &DataType,
+) -> Result<CompiledExpr, ExprError> {
     let ctx = SessionContext::new();
     let df_schema = DFSchema::try_from(schema.clone())?;
     let logical = ctx.parse_sql_expr(sql, &df_schema)?;
-    reject_volatile(&logical)?;
-    let logical = logical.cast_to(target, &df_schema)?;
-    let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new())?;
+    let logical = logical
+        .cast_to(intermediate, &df_schema)?
+        .cast_to(target, &df_schema)?;
+    // Use DataFusion's normal coercion/simplification path. In particular,
+    // now() must be resolved against an execution start time before physical
+    // evaluation; its UDF deliberately cannot execute unsimplified.
+    let config = Arc::clone(ctx.state().config_options());
+    let mut props = ExecutionProps::new();
+    props.mark_start_execution(Arc::clone(&config));
+    let context = SimplifyContext::builder()
+        .with_schema(Arc::new(df_schema.clone()))
+        .with_config_options(config)
+        .with_query_execution_start_time(props.query_execution_start_time)
+        .build();
+    let simplifier = ExprSimplifier::new(context);
+    let logical = simplifier.coerce(logical, &df_schema)?;
+    let logical = simplifier.simplify(logical)?;
+    let physical = create_physical_expr(&logical, &df_schema, &props)?;
     Ok(CompiledExpr { physical })
-}
-
-fn reject_volatile(expr: &Expr) -> Result<(), ExprError> {
-    let mut volatile: Option<String> = None;
-    expr.apply(|e| {
-        if let Expr::ScalarFunction(f) = e
-            && f.func.signature().volatility == Volatility::Volatile
-        {
-            volatile = Some(f.func.name().to_string());
-            return Ok(TreeNodeRecursion::Stop);
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })?;
-    match volatile {
-        Some(name) => Err(ExprError::Volatile(name)),
-        None => Ok(()),
-    }
 }
 
 pub fn evaluate(expr: &CompiledExpr, batch: &RecordBatch) -> Result<ArrayRef, ExprError> {
@@ -106,7 +133,7 @@ pub fn apply_defaults_and_materialized(
         let idx = schema.index_of(&spec.name)?;
         // Evaluate against the batch with columns filled so far.
         let current = RecordBatch::try_new(schema.clone(), columns.clone())?;
-        let compiled = compile(expr_sql, &schema, &spec.data_type)?;
+        let compiled = compile_for_field(expr_sql, &schema, schema.field(idx))?;
         let computed = evaluate(&compiled, &current)?;
 
         columns[idx] = match &spec.kind {
@@ -126,20 +153,37 @@ pub fn validate_table_schema(v: &serde_json::Value) -> Result<(), ExprError> {
     let cols = TableColumns::parse(v)?;
     let input = cols.input_schema();
     let physical = cols.physical_schema();
+    let query = cols.query_schema();
     for spec in &cols.specs {
         match &spec.kind {
             ColumnKind::Stored => {}
             // Write-time expressions may only reference input columns.
             ColumnKind::Default(e) | ColumnKind::Materialized(e) => {
-                compile(e, &input, &spec.data_type)?;
+                compile_for_field(e, &input, query.field_with_name(&spec.name)?)?;
             }
             // Read-time expressions may reference anything stored.
             ColumnKind::Alias(e) => {
-                compile(e, &physical, &spec.data_type)?;
+                compile_for_field(e, &physical, query.field_with_name(&spec.name)?)?;
             }
         }
     }
     Ok(())
+}
+
+/// Backfill expressions only for columns absent from the original file.
+/// `batch` has already been adapted to the current physical schema; retain the
+/// original `file_schema` so a stored NULL is not confused with a missing column.
+/// Rewrites must preserve stored clock/random values, including stored NULLs.
+pub fn apply_missing_defaults_and_materialized(
+    batch: RecordBatch,
+    cols: &TableColumns,
+    file_schema: &Schema,
+) -> Result<RecordBatch, ExprError> {
+    let mut missing = cols.clone();
+    missing
+        .specs
+        .retain(|spec| file_schema.index_of(&spec.name).is_err());
+    apply_defaults_and_materialized(batch, &missing)
 }
 
 #[cfg(test)]
@@ -237,12 +281,142 @@ mod tests {
     }
 
     #[test]
-    fn rejects_volatile_functions() {
+    fn evaluates_random_and_still_rejects_unknown_columns() {
         let cols = TableColumns::parse(&rich_schema_json()).unwrap();
-        let err = compile("random()", &cols.physical_schema(), &DataType::Float64).unwrap_err();
-        assert!(matches!(err, ExprError::Volatile(_)), "got {err:?}");
+        let expr = compile("random()", &cols.physical_schema(), &DataType::Float64).unwrap();
+        let values = evaluate(&expr, &input_batch(&cols)).unwrap();
+        let values = values.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(values.len(), 2);
+        assert!(values.values().iter().all(|x| (0.0..1.0).contains(x)));
         // Unknown column is also a compile error (from DataFusion).
         assert!(compile("nope + 1", &cols.physical_schema(), &DataType::Float64).is_err());
+    }
+
+    #[test]
+    fn now_executes_with_a_real_execution_time() {
+        use arrow::array::TimestampNanosecondArray;
+        use arrow::datatypes::TimeUnit;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as i64
+        };
+        let cols = TableColumns::parse(&rich_schema_json()).unwrap();
+        let before = nanos();
+        let expr = compile(
+            "now()",
+            &cols.physical_schema(),
+            &DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
+        )
+        .unwrap();
+        let values = evaluate(&expr, &input_batch(&cols)).unwrap();
+        let after = nanos();
+        let values = values
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values.value(0), values.value(1));
+        assert!((before..=after).contains(&values.value(0)));
+    }
+
+    #[test]
+    fn clock_defaults_and_random_materialized_columns_execute_at_write_time() {
+        let cols = TableColumns::parse(&json!({"fields": [
+            {"name": "tenant_id", "type": "int64"},
+            {"name": "inserted_at", "type": "int64", "default": "CAST(now() AS BIGINT)"},
+            {"name": "draw", "type": "float64", "materialized": "random()"}
+        ]}))
+        .unwrap();
+        let input = RecordBatch::try_new(
+            Arc::new(cols.physical_schema()),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![Some(42), None])),
+                Arc::new(Float64Array::from(vec![Some(-1.0), None])),
+            ],
+        )
+        .unwrap();
+        let out = apply_defaults_and_materialized(input, &cols).unwrap();
+        let times = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(times.value(0), 42, "explicit defaults survive insertion");
+        assert!(
+            times.value(1) > 0,
+            "now() evaluated rather than merely validated"
+        );
+        let draws = out
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(draws.values().iter().all(|x| (0.0..1.0).contains(x)));
+    }
+
+    #[test]
+    fn native_clock_default_respects_timestamp_millisecond_storage() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let millis = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64
+        };
+        let cols = TableColumns::parse(&json!({"fields":[
+            {"name":"tenant_id","type":"int64"},
+            {"name":"inserted_at","type":"timestamp_ms","default":"now()"}
+        ]}))
+        .unwrap();
+        let input = RecordBatch::try_new(
+            Arc::new(cols.physical_schema()),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![None::<i64>])),
+            ],
+        )
+        .unwrap();
+        let before = millis();
+        let output = apply_defaults_and_materialized(input, &cols).unwrap();
+        let after = millis();
+        let times = output
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(
+            (before..=after).contains(&times.value(0)),
+            "timestamp_ms must not store epoch nanoseconds"
+        );
+    }
+
+    #[test]
+    fn backfill_preserves_stored_values_and_nulls() {
+        let cols = TableColumns::parse(&json!({"fields": [
+            {"name": "tenant_id", "type": "int64"},
+            {"name": "inserted_at", "type": "int64", "default": "CAST(now() AS BIGINT)"},
+            {"name": "draw", "type": "float64", "materialized": "random()"},
+            {"name": "added_later", "type": "int64", "materialized": "tenant_id + 1"}
+        ]}))
+        .unwrap();
+        let schema = cols.physical_schema();
+        let file_schema = schema.project(&[0, 1, 2]).unwrap();
+        let input = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![Some(42), None])),
+                Arc::new(Float64Array::from(vec![Some(-1.0), None])),
+                Arc::new(Int64Array::from(vec![None::<i64>, None])),
+            ],
+        )
+        .unwrap();
+        let out =
+            apply_missing_defaults_and_materialized(input.clone(), &cols, &file_schema).unwrap();
+        assert_eq!(out.column(1), input.column(1));
+        assert_eq!(out.column(2), input.column(2));
+        assert_eq!(out.column(3).as_ref(), &Int64Array::from(vec![2, 3]));
     }
 
     #[test]
@@ -281,13 +455,11 @@ mod tests {
             {"name": "m", "type": "int64", "materialized": "al + 1"}
         ]});
         assert!(validate_table_schema(&bad).is_err());
-        // Volatile default fails.
-        let bad = json!({"fields": [
+        // Clock/random defaults are ordinary write-time expressions.
+        let clocks = json!({"fields": [
+            {"name": "inserted_at", "type": "int64", "default": "CAST(now() AS BIGINT)"},
             {"name": "a", "type": "float64", "default": "random()"}
         ]});
-        assert!(matches!(
-            validate_table_schema(&bad).unwrap_err(),
-            ExprError::Volatile(_)
-        ));
+        validate_table_schema(&clocks).unwrap();
     }
 }

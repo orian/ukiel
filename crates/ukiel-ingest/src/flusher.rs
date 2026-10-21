@@ -4,15 +4,13 @@
 use std::sync::Arc;
 
 use metrics::{counter, histogram};
-use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::ObjectStore;
 use ukiel_catalog::{OffsetRange, PostgresCatalog};
-use ukiel_core::{
-    CommitOp, CommitResult, Hypertable, HypertableId, IngestRange, OperationIdentity, PartMeta,
-};
+use ukiel_core::{CommitResult, Hypertable, HypertableId, IngestRange, OperationIdentity};
 
 use crate::IngestError;
-use crate::writer::EncodedPart;
+pub use ukiel_write::FlushItem;
+use ukiel_write::{AddCommit, L0Writer};
 
 /// The version of "what these Kafka records mean" (plan 43).
 ///
@@ -27,11 +25,6 @@ use crate::writer::EncodedPart;
 /// changes nothing about the mapping must not change it, or every deploy would
 /// orphan every in-flight identity.
 pub const INGEST_TRANSFORMATION_VERSION: u32 = 1;
-
-pub struct FlushItem {
-    pub partition_values: serde_json::Value,
-    pub part: EncodedPart,
-}
 
 /// The identity of "consume exactly these offsets into this hypertable".
 ///
@@ -116,39 +109,6 @@ impl Flusher {
         // (inverted or overlapping ranges) fail before it costs an upload.
         let identity = ingest_identity(hypertable.id, &offsets)?;
 
-        // Assign every part's path up front and record upload intent BEFORE any
-        // upload, so a crash between upload and commit leaves a discoverable
-        // orphan for GC (never an untracked object).
-        let prepared: Vec<(String, FlushItem)> = items
-            .into_iter()
-            .map(|item| {
-                let path = format!("ht/{}/L0/{}.parquet", hypertable.id, uuid::Uuid::new_v4());
-                (path, item)
-            })
-            .collect();
-        let paths: Vec<String> = prepared.iter().map(|(p, _)| p.clone()).collect();
-        self.catalog
-            .register_pending_objects(hypertable.id, &paths)
-            .await?;
-
-        let mut parts = Vec::with_capacity(prepared.len());
-        for (path, item) in prepared {
-            let size_bytes = item.part.bytes.len() as i64;
-            let column_stats = item.part.column_stats.clone();
-            self.store
-                .put(&Path::from(path.clone()), item.part.bytes.into())
-                .await?;
-            parts.push(PartMeta {
-                path,
-                partition_values: item.partition_values,
-                packing_key_min: item.part.key_min,
-                packing_key_max: item.part.key_max,
-                row_count: item.part.row_count,
-                size_bytes,
-                level: 0,
-                column_stats,
-            });
-        }
         // A transport failure *around* this commit leaves the transaction's
         // outcome unknown: it may have committed and lost the acknowledgement.
         // It is never retried in place — that could double-apply it — and the
@@ -161,12 +121,19 @@ impl Flusher {
         // orphans. What the identity adds is that the outcome is now *knowable*:
         // the error carries it, and the supervisor asks the catalog which of the
         // two it was instead of arranging not to need to know.
-        let result = self
-            .catalog
-            .commit_with_offsets(hypertable.id, CommitOp::Add { parts }, &offsets, &identity)
+        let result = L0Writer::new(self.catalog.clone(), self.store.clone())
+            .publish_add(
+                hypertable,
+                items,
+                AddCommit::Ingest {
+                    offsets: &offsets,
+                    identity: &identity,
+                },
+            )
             .await
+            .map_err(IngestError::from)
             .inspect_err(|e| {
-                if e.is_recoverable_transport() {
+                if matches!(e, IngestError::Catalog(c) if c.is_recoverable_transport()) {
                     metrics::counter!("catalog_ambiguous_mutation_total", "role" => "ingest")
                         .increment(1);
                 }

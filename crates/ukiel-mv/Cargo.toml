@@ -1,0 +1,28 @@
+[package]
+name = "ukiel-mv"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ukiel-core = { workspace = true }
+ukiel-catalog = { workspace = true }
+ukiel-expr = { workspace = true }
+ukiel-pipeline = { workspace = true }
+ukiel-write = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true, features = ["async", "object_store"] }
+object_store = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+metrics = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+ukiel-catalog = { path = "../ukiel-catalog", features = ["fault-injection"] }
+ukiel-gc = { workspace = true }
+testcontainers-modules = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }

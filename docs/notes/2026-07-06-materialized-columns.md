@@ -24,22 +24,26 @@ sees).
 
 Rules:
 
-- **Deterministic expressions only** — `random()`/`now()` are rejected at
-  compile time (`ukiel-expr`). Required because rewrites re-evaluate
-  expressions; volatile ones would make compaction change data.
+- **Clock and random expressions are supported** — `now()`/`random()` use
+  DataFusion's normal expression semantics. Insert-time defaults and materialized
+  values are stored. Compaction and deletion rewrites preserve existing values,
+  including NULLs, and evaluate expressions only for columns absent from the
+  original file. Retry deduplication identifies source work, not output bytes;
+  the first committed outcome wins even when attempts compute different values.
 - Expressions reference only stored/default columns (no chaining on other
   materialized/alias columns). Write-time expressions are validated against
   the input schema; aliases against the physical schema.
-- Materialized columns cannot be sort keys in v1 (ingest sorts before
-  computing them).
+- Materialized columns may be sort keys: ingest computes them before sorting.
 - Validation: call `ukiel_expr::validate_table_schema` before
   `create_hypertable` — the catalog itself does not validate expressions (it
   stays DataFusion-free); bad expressions otherwise fail at first use.
 
 **Organic backfill.** Adding a materialized column later needs no backfill
 job: old files read as NULL for it (schema-adapting reads fill missing
-columns), and every compactor rewrite recomputes write-time columns — so the
-column materializes as compaction naturally touches each file.
+columns), and a compactor rewrite evaluates expressions for those missing
+columns — so the column materializes as compaction naturally touches each file.
+Once present in a file, its stored value is preserved. Changing an expression
+does not recompute a column already stored in old files.
 
 **Divergences from ClickHouse (v1):** materialized and alias columns are
 visible in `SELECT *` (DataFusion has no hidden columns); defaults apply only

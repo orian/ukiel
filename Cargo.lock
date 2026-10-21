@@ -5308,6 +5308,7 @@ dependencies = [
  "ukiel-core",
  "ukiel-gc",
  "ukiel-ingest",
+ "ukiel-mv",
  "ukiel-query",
  "ukield",
  "url",
@@ -5369,7 +5370,44 @@ dependencies = [
  "ukiel-catalog",
  "ukiel-core",
  "ukiel-expr",
+ "ukiel-write",
  "uuid",
+]
+
+[[package]]
+name = "ukiel-mv"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "futures",
+ "metrics",
+ "object_store",
+ "parquet",
+ "serde_json",
+ "testcontainers-modules",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "ukiel-catalog",
+ "ukiel-core",
+ "ukiel-expr",
+ "ukiel-gc",
+ "ukiel-pipeline",
+ "ukiel-write",
+ "uuid",
+]
+
+[[package]]
+name = "ukiel-pipeline"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "datafusion",
+ "futures",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -5461,6 +5499,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ukiel-write"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "bytes",
+ "object_store",
+ "parquet",
+ "serde_json",
+ "thiserror 2.0.18",
+ "ukiel-catalog",
+ "ukiel-core",
+ "ukiel-expr",
+ "uuid",
+]
+
+[[package]]
 name = "ukield"
 version = "0.1.0"
 dependencies = [
@@ -5488,7 +5542,10 @@ dependencies = [
  "ukiel-expr",
  "ukiel-gc",
  "ukiel-ingest",
+ "ukiel-mv",
+ "ukiel-pipeline",
  "ukiel-query",
+ "ukiel-write",
  "url",
  "uuid",
 ]

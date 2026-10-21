@@ -28,3 +28,23 @@ pub enum IngestError {
     #[error("config error: {0}")]
     Config(String),
 }
+
+// Keep catalog errors directly visible to the role supervisor, including the
+// exact identity carried by an ambiguous shared-writer commit.
+impl From<ukiel_write::WriteError> for IngestError {
+    fn from(error: ukiel_write::WriteError) -> Self {
+        use ukiel_write::WriteError;
+        match error {
+            WriteError::Catalog(e) => Self::Catalog(e),
+            WriteError::ObjectStore(e) => Self::ObjectStore(e),
+            WriteError::Schema(e) => Self::Schema(e),
+            WriteError::Arrow(e) => Self::Arrow(e),
+            WriteError::Parquet(e) => Self::Parquet(e),
+            WriteError::Expr(e) => Self::Expr(e),
+            WriteError::SortKey(e) => Self::SortKey(e),
+            WriteError::EmptyBatch => Self::EmptyFlush,
+            WriteError::InvalidTarget(e) => Self::Config(e),
+            WriteError::BudgetExceeded(n) => Self::Config(format!("write input exceeds {n} bytes")),
+        }
+    }
+}

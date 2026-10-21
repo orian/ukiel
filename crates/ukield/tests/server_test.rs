@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use ukield::config::UkieldConfig;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn full_stack_ingest_to_query_over_http() {
+async fn full_stack_ingest_mv_and_query_over_http() {
     let pg = Postgres::default().start().await.expect("postgres");
     let pg_port = pg.get_host_port_ipv4(5432).await.unwrap();
     let kafka = Kafka::default().start().await.expect("kafka");
@@ -21,6 +21,7 @@ async fn full_stack_ingest_to_query_over_http() {
 
     let config_toml = format!(
         r#"
+        roles = ["ingest", "mv", "query", "compactor", "gc"]
         [catalog]
         url = "postgres://postgres:postgres@127.0.0.1:{pg_port}/postgres"
         [object_store]
@@ -33,6 +34,9 @@ async fn full_stack_ingest_to_query_over_http() {
         flush_interval_ms = 500
         max_buffer_rows = 10000
         max_event_age_days = 30000
+        [mv]
+        pipelines = ["event_counts_v1"]
+        poll_interval_ms = 50
 
         [[tables]]
         name = "events"
@@ -51,6 +55,33 @@ async fn full_stack_ingest_to_query_over_http() {
         [[tables.columns]]
         name = "payload"
         type = "utf8"
+
+        [[tables]]
+        name = "event_counts"
+        ts_column = "ts"
+        packing_key = "tenant_id"
+        sort_key = ["tenant_id", "ts"]
+        namespaces = [7]
+        [[tables.columns]]
+        name = "tenant_id"
+        type = "int64"
+        [[tables.columns]]
+        name = "ts"
+        type = "timestamp_ms"
+        [[tables.columns]]
+        name = "n"
+        type = "int64"
+        [[tables.columns]]
+        name = "inserted_at"
+        type = "timestamp_ms"
+        nullable = false
+        default = "now()"
+
+        [[pipelines]]
+        name = "event_counts_v1"
+        source = "events"
+        target = "event_counts"
+        sql = "SELECT tenant_id, MIN(ts) AS ts, COUNT(*) AS n FROM events GROUP BY tenant_id"
         "#
     );
     let cfg: UkieldConfig = toml::from_str(&config_toml).unwrap();
@@ -111,6 +142,25 @@ async fn full_stack_ingest_to_query_over_http() {
     }
     assert_eq!(rows, 5, "all produced rows must become queryable");
 
+    let mut total = 0;
+    for _ in 0..60 {
+        let response=client.post(format!("{base}/api/query"))
+            .json(&json!({"namespace_id":7,"sql":"SELECT SUM(n) AS n,MIN(inserted_at) AS inserted_at FROM event_counts","format":"rows"}))
+            .send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.unwrap();
+        total = body["rows"][0]["n"].as_i64().unwrap_or(0);
+        if total == 5 {
+            assert!(body["rows"][0]["inserted_at"].as_i64().unwrap() > 1_700_000_000_000);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        total, 5,
+        "MV partial counts must cover each source row exactly once"
+    );
+
     // Readiness probe: catalog + object store reachable.
     let ready = client.get(format!("{base}/readyz")).send().await.unwrap();
     assert_eq!(ready.status(), 200);
@@ -127,6 +177,10 @@ async fn full_stack_ingest_to_query_over_http() {
         "catalog_commit_duration_seconds",
         "query_requests_total",
         "ukield_worker_up",
+        "mv_events_committed_total",
+        "mv_attempt_input_bytes",
+        "mv_attempt_output_bytes",
+        "mv_event_duration_seconds_bucket",
     ] {
         assert!(
             body.contains(family),

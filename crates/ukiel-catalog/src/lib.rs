@@ -10,6 +10,7 @@ mod gc;
 mod leases;
 mod offsets;
 mod parts;
+mod pipelines;
 mod tables;
 
 pub use commit::OperationLookup;

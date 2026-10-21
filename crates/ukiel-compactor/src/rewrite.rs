@@ -26,7 +26,7 @@ use futures::Stream;
 /// large enough to amortize decode (K × `MERGE_BATCH_ROWS` rows resident).
 pub const MERGE_BATCH_ROWS: usize = 8 * 1024;
 
-/// One async, schema-adapted, materialized-recomputed batch stream over a part,
+/// One async, schema-adapted, missing-column-backfilled batch stream over a part,
 /// carrying its path for error attribution (the merge guard names the file).
 pub struct PartBatchStream {
     pub path: String,
@@ -36,9 +36,9 @@ pub struct PartBatchStream {
 /// One async batch stream per input part. Range-reads via `ParquetObjectReader`
 /// (O(row-group) memory per stream — the file is never resident), applying the
 /// existing `adapt_to_schema` (additive evolution: old files NULL-fill new
-/// columns) and `apply_defaults_and_materialized` (organic backfill) **per
-/// batch** — both row-wise deterministic, so per-batch ≡ the old post-concat
-/// application. `read_parts_to_batch` is untouched (deletion still uses it).
+/// columns) and write expressions only for columns absent from that file.
+/// Stored values survive rewrites even when their original expression used a
+/// clock or random function.
 pub async fn part_streams(
     store: &Arc<dyn ObjectStore>,
     schema: SchemaRef,
@@ -70,13 +70,35 @@ pub async fn part_streams(
                     path: err_path.clone(),
                     source,
                 })?;
+                let file_schema = batch.schema();
                 let adapted = adapt_to_schema(batch, &schema)?;
-                Ok(ukiel_expr::apply_defaults_and_materialized(adapted, &cols)?)
+                Ok(ukiel_expr::apply_missing_defaults_and_materialized(
+                    adapted,
+                    &cols,
+                    &file_schema,
+                )?)
             })
             .boxed();
         out.push(PartBatchStream { path, stream });
     }
     Ok(out)
+}
+
+/// Read inputs for a rewrite, backfilling per file before concatenation so
+/// stored NULLs and values remain distinguishable from missing columns.
+pub async fn read_parts_for_rewrite(
+    store: &Arc<dyn ObjectStore>,
+    cols: &TableColumns,
+    parts: &[Part],
+) -> Result<RecordBatch, CompactorError> {
+    let schema = Arc::new(cols.physical_schema());
+    let mut batches = Vec::new();
+    for mut input in part_streams(store, schema.clone(), cols, parts).await? {
+        while let Some(batch) = input.stream.next().await {
+            batches.push(batch?);
+        }
+    }
+    Ok(concat_batches(&schema, &batches)?)
 }
 
 /// Downloads every part and concatenates all row batches into one, adapting
@@ -989,7 +1011,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn part_streams_adapt_schema_recompute_and_attribute_errors() {
+    async fn part_streams_adapt_schema_backfill_and_attribute_errors() {
         use futures::StreamExt;
         use ukiel_core::TableColumns;
 
@@ -1058,7 +1080,11 @@ mod tests {
         let bb = streams[1].stream.next().await.unwrap().unwrap();
         let di = bb.schema().index_of("doubled").unwrap();
         let doubled: &Int64Array = bb.column(di).as_any().downcast_ref().unwrap();
-        assert_eq!(doubled.value(0), 10, "materialized recomputed per batch");
+        assert_eq!(
+            doubled.value(0),
+            10,
+            "missing materialized column is backfilled"
+        );
 
         // A corrupt file fails with the offending path attributed.
         store
@@ -1073,6 +1099,49 @@ mod tests {
         match part_streams(&store, target, &cols, &[bad]).await {
             Err(CompactorError::PartRead { path, .. }) => assert_eq!(path, "bad.parquet"),
             other => panic!("expected PartRead(bad.parquet), got {:?}", other.err()),
+        }
+    }
+
+    #[tokio::test]
+    async fn rewrites_preserve_clock_random_values_and_nulls_in_existing_columns() {
+        let cols = TableColumns::parse(&json!({"fields": [
+            {"name": "tenant_id", "type": "int64"},
+            {"name": "ts", "type": "timestamp_ms"},
+            {"name": "inserted_at", "type": "int64", "default": "CAST(now() AS BIGINT)"},
+            {"name": "draw", "type": "float64", "materialized": "random()"},
+            {"name": "added_later", "type": "int64", "materialized": "tenant_id + 1"}
+        ]}))
+        .unwrap();
+        let target = Arc::new(cols.physical_schema());
+        let original_schema = target.project(&[0, 1, 2, 3]).unwrap();
+        let encoded = rows_to_parquet(
+            &original_schema,
+            "tenant_id",
+            "ts",
+            &["tenant_id".into(), "ts".into()],
+            vec![
+                json!({"tenant_id": 1, "ts": 10, "inserted_at": 42, "draw": -1.0}),
+                json!({"tenant_id": 2, "ts": 20, "inserted_at": null, "draw": null}),
+            ],
+        )
+        .unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        store
+            .put(&Path::from("stored.parquet"), encoded.bytes.clone().into())
+            .await
+            .unwrap();
+        let parts = [part("stored.parquet", &encoded)];
+        let original = read_parts_to_batch(&store, Arc::new(original_schema), &parts)
+            .await
+            .unwrap();
+        let mut streams = part_streams(&store, target, &cols, &parts).await.unwrap();
+        let streamed = streams[0].stream.next().await.unwrap().unwrap();
+        // Deletion's read path must preserve values just like streaming compaction.
+        let gathered = read_parts_for_rewrite(&store, &cols, &parts).await.unwrap();
+        for output in [&streamed, &gathered] {
+            assert_eq!(output.column(2), original.column(2));
+            assert_eq!(output.column(3), original.column(3));
+            assert_eq!(output.column(4).as_ref(), &Int64Array::from(vec![2, 3]));
         }
     }
 

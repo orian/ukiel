@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct UkieldConfig {
-    /// Which workers this process runs. Default: all.
+    /// Which workers this process runs. MV is explicitly opt-in.
     #[serde(default = "default_roles")]
     pub roles: Vec<Role>,
     pub catalog: CatalogConfig,
@@ -17,6 +17,8 @@ pub struct UkieldConfig {
     pub query: QueryConfig,
     #[serde(default)]
     pub ingest: IngestSection,
+    #[serde(default)]
+    pub mv: MvSection,
     #[serde(default)]
     pub compactor: CompactorSection,
     #[serde(default)]
@@ -31,12 +33,16 @@ pub struct UkieldConfig {
     /// Tables bootstrapped idempotently at startup.
     #[serde(default)]
     pub tables: Vec<TableConfig>,
+    /// Immutable Parquet-source pipeline definitions to bootstrap.
+    #[serde(default)]
+    pub pipelines: Vec<MvPipelineConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Ingest,
+    Mv,
     Query,
     Compactor,
     Gc,
@@ -190,6 +196,20 @@ impl Default for QueryConfig {
 /// runs both roles (a split deployment can't see both sides — the invariant
 /// note stays in the config comment).
 pub fn validate(cfg: &UkieldConfig) -> anyhow::Result<()> {
+    if cfg.roles.contains(&Role::Mv) && cfg.mv.pipelines.is_empty() {
+        anyhow::bail!("mv.pipelines must be non-empty when the mv role is enabled");
+    }
+    if cfg.mv.poll_interval_ms == 0
+        || [
+            cfg.mv.input_bytes,
+            cfg.mv.output_bytes,
+            cfg.mv.output_rows,
+            cfg.mv.operator_memory_bytes,
+        ]
+        .contains(&0)
+    {
+        anyhow::bail!("MV polling interval and execution limits must be positive");
+    }
     if cfg.roles.contains(&Role::Query)
         && cfg.roles.contains(&Role::Gc)
         && cfg.query.statement_timeout_secs as f64 >= cfg.gc.tombstone_grace_secs
@@ -314,6 +334,57 @@ impl Default for IngestSection {
             max_event_future_secs: 3600,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct MvSection {
+    pub pipelines: Vec<String>,
+    pub poll_interval_ms: u64,
+    pub input_bytes: usize,
+    pub output_bytes: usize,
+    pub output_rows: usize,
+    pub operator_memory_bytes: usize,
+}
+
+impl Default for MvSection {
+    fn default() -> Self {
+        let limits = ukiel_pipeline::ExecutionLimits::default();
+        Self {
+            pipelines: vec![],
+            poll_interval_ms: 1_000,
+            input_bytes: limits.input_bytes,
+            output_bytes: limits.output_bytes,
+            output_rows: limits.output_rows,
+            operator_memory_bytes: limits.operator_memory_bytes,
+        }
+    }
+}
+
+impl MvSection {
+    pub fn worker_config(&self) -> ukiel_mv::MvConfig {
+        ukiel_mv::MvConfig {
+            pipelines: self.pipelines.clone(),
+            poll_interval_ms: self.poll_interval_ms,
+            limits: ukiel_pipeline::ExecutionLimits {
+                input_bytes: self.input_bytes,
+                output_bytes: self.output_bytes,
+                output_rows: self.output_rows,
+                operator_memory_bytes: self.operator_memory_bytes,
+            },
+            ready: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct MvPipelineConfig {
+    pub name: String,
+    pub source: String,
+    pub target: String,
+    pub sql: String,
+    #[serde(default)]
+    pub error_policy: ukiel_core::ErrorPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -602,6 +673,24 @@ mod tests {
         let cfg: UkieldConfig = toml::from_str(EXAMPLE).unwrap();
         assert_eq!(cfg.query.statement_timeout_secs, 300);
         validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn mv_requires_explicit_selection_and_positive_budgets() {
+        let mut cfg: UkieldConfig = toml::from_str(EXAMPLE).unwrap();
+        cfg.roles.push(Role::Mv);
+        assert!(
+            validate(&cfg)
+                .unwrap_err()
+                .to_string()
+                .contains("mv.pipelines")
+        );
+        cfg.mv.pipelines.push("counts_v1".into());
+        validate(&cfg).unwrap();
+        let limits = cfg.mv.worker_config().limits;
+        assert_eq!(limits.input_bytes, 64 * 1024 * 1024);
+        cfg.mv.output_bytes = 0;
+        assert!(validate(&cfg).is_err());
     }
 
     #[test]
