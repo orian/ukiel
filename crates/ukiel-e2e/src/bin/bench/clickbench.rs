@@ -3,9 +3,8 @@
 //! so every query gets a `ukiel / raw-DataFusion` ratio.
 //!
 //! That ratio is the deliverable: raw DataFusion is the ceiling (same engine,
-//! same version — upstream's own harness pins DataFusion 54, which is ukiel's
-//! pin — with zero catalog, provider, or cache), so the gap is the measured cost
-//! of ukiel's stack. Both runners execute the *same* adapted SQL from
+//! same workspace version, with zero catalog, provider, or cache), so the gap is
+//! the measured cost of ukiel's stack. Both runners execute the *same* adapted SQL from
 //! `bench/queries/clickbench/queries.sql`; every deviation from upstream is a
 //! diff against the pristine file next to it, logged in ADAPTATIONS.md.
 //!
@@ -32,8 +31,8 @@ fn queries() -> anyhow::Result<Vec<suite::Query>> {
 }
 
 /// Plan 37, H5: the same-binary lever for DataFusion's **sort-pushdown**
-/// machinery (epic apache/datafusion#23036, phases 1–3 all live in our DF 54
-/// pin; `enable_sort_pushdown` defaults to true).
+/// machinery (epic apache/datafusion#23036, phases 1–3 were already present in
+/// the original DF 54 baseline; `enable_sort_pushdown` defaults to true).
 ///
 /// Why this exists as a knob rather than a rebuild: the provider's declared
 /// ordering feeds `eq_properties()` → `FileScanConfig::try_pushdown_sort` →

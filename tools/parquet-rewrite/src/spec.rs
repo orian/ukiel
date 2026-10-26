@@ -1,4 +1,4 @@
-//! The variant spec: a versioned TOML declaration of the pinned Parquet 58.3 controls the
+//! The variant spec: a versioned TOML declaration of the pinned Parquet controls the
 //! matrix varies. Property *resolution* lives in the shared `parquet-lab-write-core`; this
 //! file is just the TOML shape and its up-front validation.
 //!

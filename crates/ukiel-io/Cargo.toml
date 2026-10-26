@@ -1,0 +1,14 @@
+[package]
+name = "ukiel-io"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+futures = { workspace = true }
+object_store = { workspace = true }
+parquet = { workspace = true, features = ["async"] }
+
+[dev-dependencies]
+arrow = { workspace = true }
+tokio = { workspace = true }

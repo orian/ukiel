@@ -1,7 +1,7 @@
 //! `parquet-lab-write-core` — the pure Arrow-to-Parquet write and property-resolution
 //! core shared by `parquet-rewrite` and `parquet-write-bench`.
 //!
-//! It resolves a writer configuration into concrete Parquet 58.3 properties, applies a
+//! It resolves a writer configuration into concrete Parquet properties, applies a
 //! lossless physical-type projection, writes logical batches to a caller-supplied sink
 //! while folding the logical fingerprint, and reads back what the writer actually did.
 //! It owns no CLI paths, no timing, no reports, and no experiment selection — a rewrite

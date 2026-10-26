@@ -520,9 +520,12 @@ fn median(v: &[f64]) -> f64 {
 fn tool_versions() -> ToolVersions {
     ToolVersions {
         git_sha: std::env::var("UKIEL_GIT_SHA").unwrap_or_else(|_| "unknown".to_string()),
-        arrow: "58.3".to_string(),
-        parquet: "58.3".to_string(),
-        datafusion: "54".to_string(),
+        arrow: arrow::ARROW_VERSION.to_string(),
+        parquet: parquet::file::properties::DEFAULT_CREATED_BY
+            .strip_prefix("parquet-rs version ")
+            .unwrap_or("unknown")
+            .to_string(),
+        datafusion: datafusion::DATAFUSION_VERSION.to_string(),
     }
 }
 

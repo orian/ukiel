@@ -15,7 +15,7 @@ use crate::{ContractError, FileDigest, Fingerprint, check_relative_path, check_v
 pub const VARIANT_MANIFEST_VERSION: &str = "ukiel-parquet-variant/v1";
 
 /// Writer properties applied globally to a variant. Every field is a pinned
-/// Parquet 58.3 control the matrix actually varies; an unsupported combination is a
+/// Parquet control the matrix actually varies; an unsupported combination is a
 /// validation error before any output is written, never an approximation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriterProperties {

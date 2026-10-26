@@ -1,7 +1,7 @@
 //! Writer-property resolution and the pure Arrow-to-Parquet write.
 //!
 //! This is the single place that turns a resolved writer configuration into concrete
-//! Parquet 58.3 `WriterProperties`, applies the lossless projection, writes logical
+//! Parquet `WriterProperties`, applies the lossless projection, writes logical
 //! batches to a supplied sink while folding the logical fingerprint, and reads back
 //! what the writer actually did from the output footer. It is shared by
 //! `parquet-rewrite` (which publishes verified artifacts) and `parquet-write-bench`
@@ -91,7 +91,7 @@ impl WriterConfig {
                     .set_column_bloom_filter_enabled(path.clone(), true)
                     .set_column_bloom_filter_fpp(path.clone(), fpp);
                 if let Some(ndv) = c.bloom_ndv {
-                    b = b.set_column_bloom_filter_ndv(path.clone(), ndv);
+                    b = b.set_column_bloom_filter_max_ndv(path.clone(), ndv);
                 }
             }
         }

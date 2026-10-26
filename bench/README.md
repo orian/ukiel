@@ -44,12 +44,38 @@ next to it so the adaptation set is a reviewable `diff`, not a claim.
 - This README is the single source of truth for the runbook and the recorded
   results. Design rationale and provenance: `docs/notes/2026-07-08-macro-perf.md`.
 
+## Dependency refresh (2026-10-26)
+
+The fixed-file comparison of the original dependency set (DataFusion 54) with
+the refreshed set (DataFusion **55.2.0**, Arrow/Parquet **59.3.2**) is complete:
+
+| Workload | Before | After | Change |
+|---|---:|---:|---:|
+| Ukiel ClickBench, 100M rows / 43 queries | 29.551 s | 27.790 s | −6.0% |
+| Bare DataFusion, same files / 43 queries | 30.651 s | 27.576 s | −10.0% |
+| JSONBench, 1M rows / 5 promoted-column queries | 73.15 ms | 71.28 ms | roughly flat |
+| Bluesky write workload, 1M events | 8.881 s | 9.138 s | roughly flat |
+
+Read totals sum per-query hot medians pooled across repeated runs. The write
+total is median process wall time, including setup and post-write queries.
+Tenant scenarios are broadly flat (median new/old ratio 0.976). All queries
+executed, result row counts match across versions, all four write runs stored
+exactly 1M events without invariant violations, and the MV MinIO e2e test passes.
+
+The first Ukiel baseline showed substantial drift; an extra paired run confirms
+the smaller read improvement above. One repeatable regression remains: q25's
+filtered TopK query rises from 79.64 to 94.91 ms (+19.2%). Full protocol,
+per-run timing spread, diagnostic plans, dependency changes, and artifact paths
+are in [the upgrade note](../docs/notes/2026-10-26-datafusion-55-upgrade.md).
+These measurements use an uncompacted L1 fixture; earlier results below retain
+their original geometry and versions.
+
 ---
 
 ## 1. Prerequisites
 
 - Docker (for the compose stack: Kafka + Postgres + MinIO).
-- Rust toolchain ≥ 1.96.
+- Rust toolchain ≥ 1.96; this dependency refresh was tested with 1.98.1.
 - Free disk:
   - **hits**: ~15 GB download + ~15 GB rewritten into MinIO ⇒ **~50 GB**.
   - **Bluesky 100M**: 12.5 GB gz download; Kafka holds ~45 GB uncompressed
@@ -426,9 +452,9 @@ The 43 official queries from `bench/queries/clickbench/queries.sql`:
 - **`run`** — through ukiel's full read stack (catalog planning, part pruning,
   provider, footer cache) via the operator session.
 - **`raw`** — the *same SQL over the same parquet* on **bare DataFusion**, no
-  ukiel at all. Upstream's own harness pins DataFusion 54, which is ukiel's pin,
-  so this is both a reference ceiling and a sanity check against ClickBench's
-  published DataFusion numbers.
+  ukiel at all. It uses the workspace's DataFusion version, so the reference
+  and Ukiel compare the same engine release. Record that version when comparing
+  against ClickBench's published DataFusion numbers.
 
 Methodology is ClickBench's own: per query, **1 cold run** (fresh session, fresh
 metadata cache) then `--iters` **hot runs** (default 3); the headline is the hot

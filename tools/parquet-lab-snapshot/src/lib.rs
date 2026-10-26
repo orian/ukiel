@@ -38,9 +38,14 @@ use prod_synth_integrity::RowMultiset;
 pub fn tool_versions() -> ToolVersions {
     ToolVersions {
         git_sha: std::env::var("UKIEL_GIT_SHA").unwrap_or_else(|_| "unknown".to_string()),
-        arrow: "58.3".to_string(),
-        parquet: "58.3".to_string(),
-        datafusion: "54".to_string(),
+        arrow: arrow::ARROW_VERSION.to_string(),
+        parquet: parquet::file::properties::DEFAULT_CREATED_BY
+            .strip_prefix("parquet-rs version ")
+            .unwrap_or("unknown")
+            .to_string(),
+        // Matches the exact workspace pin; this adapter reaches DataFusion
+        // through ukield rather than adding a direct query-engine dependency.
+        datafusion: "55.2.0".to_string(),
     }
 }
 

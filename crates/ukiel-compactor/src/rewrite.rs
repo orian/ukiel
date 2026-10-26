@@ -10,14 +10,16 @@ use arrow::datatypes::SchemaRef;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
+use object_store::buffered::BufWriter;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
-use parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObjectWriter};
+use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
+use parquet::arrow::async_writer::AsyncArrowWriter;
 use ukiel_core::stats::{Int64StatsAccumulator, KeyBitmapAccumulator};
 use ukiel_core::{Part, Placement, TableColumns, WriteOpts};
+use ukiel_io::ParquetObjectReader;
 
 use crate::CompactorError;
 use futures::Stream;
@@ -305,7 +307,7 @@ pub struct ChunkOutput {
 
 /// One open output file being streamed to the object store.
 struct OpenFile {
-    writer: AsyncArrowWriter<ParquetObjectWriter>,
+    writer: AsyncArrowWriter<BufWriter>,
     path: String,
     key_min: i64,
     key_max: i64,
@@ -433,7 +435,7 @@ impl StreamingChunkWriter {
         let path = (self.next_path)();
         (self.on_open)(path.clone()).await?;
         let props = ukiel_core::writer_props(&self.schema, &self.sort_key, &self.opts);
-        let obj = ParquetObjectWriter::new(self.store.clone(), Path::from(path.clone()));
+        let obj = BufWriter::new(self.store.clone(), Path::from(path.clone()));
         let writer = AsyncArrowWriter::try_new(obj, self.schema.clone(), Some(props))?;
         Ok(OpenFile {
             writer,

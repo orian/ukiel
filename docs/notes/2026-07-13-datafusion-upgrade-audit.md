@@ -1,5 +1,9 @@
 # DataFusion upgrade audit (roadmap row 38) — nothing to upgrade to yet
 
+**Historical audit.** The trigger fired after this note was written. The
+2026-10-26 [DataFusion 55.2.0 upgrade](2026-10-26-datafusion-55-upgrade.md) records
+the current dependency set, compatibility work, validation, and benchmark runs.
+
 Audited 2026-07-13, for row 38 ("needs a release audit first"). **Finding: the
 audit closes with no plan.** `datafusion 54.0.0` — ukiel's pin — is the newest
 version on crates.io (published 2026-06-08; prior: 53.1.0 on 2026-04-16). A

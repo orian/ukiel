@@ -79,6 +79,13 @@ scenarios (namespace-scoped, through the HTTP endpoint — the product's real qu
 shape), and the **official upstream suites** (ClickBench's 43 queries, JSONBench's
 5), vendored with a per-query adaptation log.
 
+**Dependency refresh (2026-10-26):** DataFusion **55.2.0**, Arrow/Parquet **59.3.2**.
+On fixed 100M-row files, aggregate hot-query latency falls **6% through Ukiel**
+and **10% on bare DataFusion**; tenant, JSON, and bounded write workloads are
+broadly flat. One TopK query regresses by about 15 ms. The
+[upgrade report](docs/notes/2026-10-26-datafusion-55-upgrade.md) records the
+tests, timing spread, regression, and reproducible evidence.
+
 **Official headline (2026-07-13):** on ClickBench at 100M rows, over identical
 local files, ukiel's full stack — catalog planning, provider, tenant-isolation
 machinery, caches — runs the 41 stack-comparable queries at **0.99× bare
@@ -137,6 +144,8 @@ application/vnd.apache.arrow.stream`) for a lossless Arrow IPC stream — see
 endpoint: `SELECT table_name FROM information_schema.tables`.
 
 - `crates/ukiel-core` — shared types (ids, parts, commit ops).
+- `crates/ukiel-io` — shared Parquet range/suffix reads for MV and rewrite
+  workers, preserving typed object-store errors for recovery.
 - `crates/ukiel-catalog` — Postgres-backed catalog: transactional part commits
   (ADD / REPLACE / DELETE with optimistic concurrency), packing-key-pruned
   part listing, ordered change feed. The catalog is tenancy-agnostic:

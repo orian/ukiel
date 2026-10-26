@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 ukiel-core = { workspace = true }
+ukiel-io = { workspace = true }
 ukiel-catalog = { workspace = true }
 ukiel-expr = { workspace = true }
 ukiel-pipeline = { workspace = true }

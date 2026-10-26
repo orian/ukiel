@@ -10,6 +10,7 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::common::DFSchema;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::ExprSchemable;
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::simplify::SimplifyContext;
 use datafusion::optimizer::simplify_expressions::ExprSimplifier;
 use datafusion::physical_expr::{PhysicalExpr, create_physical_expr};
@@ -104,7 +105,12 @@ fn compile_to_storage(
     let simplifier = ExprSimplifier::new(context);
     let logical = simplifier.coerce(logical, &df_schema)?;
     let logical = simplifier.simplify(logical)?;
-    let physical = create_physical_expr(&logical, &df_schema, &props)?;
+    let physical = create_physical_expr(
+        &logical,
+        &df_schema,
+        &props,
+        &PhysicalPlanningContext::default(),
+    )?;
     Ok(CompiledExpr { physical })
 }
 

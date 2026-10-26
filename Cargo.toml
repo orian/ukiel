@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/ukiel-core",
+    "crates/ukiel-io",
     "crates/ukiel-catalog",
     "crates/ukiel-ingest",
     "crates/ukiel-query",
@@ -54,33 +55,33 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
-tokio = { version = "1.52", features = ["full"] }
+tokio = { version = "1.54", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "json", "migrate", "macros", "uuid"] }
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
-arrow = "58.3"
+arrow = "59.3.2"
 # Base features only. `async` + `object_store` drag in tokio, object_store and
 # reqwest, and `ukiel-core` needs none of them — it only touches the Parquet
 # writer properties and footer statistics. Leaving them on here put a whole
 # service client stack in the offline `prod-synth` generator's dependency graph
-# (caught by tools/prod-synth/tests/boundary.rs). The two crates that really do
-# read asynchronously from an object store turn them on themselves.
-parquet = { version = "58.3" }
+# (caught by tools/prod-synth/tests/boundary.rs). Crates that read asynchronously
+# from an object store enable the needed features locally.
+parquet = { version = "59.3.2" }
 object_store = "0.13"
 rdkafka = { version = "0.39", features = ["cmake-build", "tokio"] }
 uuid = { version = "1", features = ["v4"] }
 bytes = "1"
 futures = "0.3"
 tokio-util = "0.7"
-datafusion = "54"
+datafusion = "=55.2.0"
 # Plan 16: `ParquetAccessPlan` (the external-index mechanism) is NOT re-exported
-# by the datafusion facade in 54.0.0 — it lives here. Same version, so cargo
+# by the datafusion facade — it lives here. Same version, so cargo
 # unifies it with the copy datafusion already pulls in; a drifting pin would
 # produce two distinct types and a baffling error.
-datafusion-datasource-parquet = "54"
+datafusion-datasource-parquet = "=55.2.0"
 axum = "0.8"
 async-trait = "0.1"
 url = "2"
@@ -92,15 +93,16 @@ metrics = "0.24"
 # Plan 43: operation fingerprints. A hash, never a hashing implementation of
 # our own — the digest is a durable catalog value.
 blake3 = "1"
-metrics-util = "0.19"
-metrics-exporter-prometheus = "0.16"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-lru = "0.18"
+metrics-util = "0.20"
+metrics-exporter-prometheus = "0.18"
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
+lru = "0.19"
 # Plan 16 key index: roaring treemap of distinct packing keys (u64 domain — i64
 # tenant ids do not fit a u32 Bitmap), base64 for the JSONB-safe encoding.
 roaring = "0.11"
-base64 = "0.22"
+base64 = "0.23"
 ukiel-core = { path = "crates/ukiel-core" }
+ukiel-io = { path = "crates/ukiel-io" }
 ukiel-catalog = { path = "crates/ukiel-catalog" }
 ukiel-ingest = { path = "crates/ukiel-ingest" }
 ukiel-query = { path = "crates/ukiel-query" }

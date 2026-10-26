@@ -6,7 +6,7 @@ use arrow::{
 };
 use futures::StreamExt;
 use object_store::{ObjectStore, path::Path};
-use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use std::{collections::HashSet, error::Error, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use ukiel_catalog::{CatalogError, OperationLookup, PostgresCatalog};
@@ -14,6 +14,7 @@ use ukiel_core::{
     ChangeEvent, ColumnKind, CommitId, CommitResult, Endpoint, ErrorPolicy, Hypertable, MvIntent,
     OperationIdentity, Part, PartId, Pipeline, ReadySignal, TableColumns,
 };
+use ukiel_io::ParquetObjectReader;
 use ukiel_pipeline::{
     ExecutionLimits, PipelineError, PreparedPipeline, execute_pipeline, prepare_pipeline,
 };

@@ -36,6 +36,19 @@ fn dependencies(package: &str) -> HashSet<String> {
 fn source_runtime_boundaries_hold_transitively() {
     for (package, forbidden) in [
         (
+            "ukiel-io",
+            vec![
+                "datafusion",
+                "ukiel-core",
+                "ukiel-catalog",
+                "ukiel-query",
+                "ukiel-ingest",
+                "ukield",
+                "rdkafka",
+                "sqlx",
+            ],
+        ),
+        (
             "ukiel-mv",
             vec!["ukiel-ingest", "ukiel-query", "ukield", "rdkafka"],
         ),
