@@ -53,6 +53,11 @@ cache_dir = "" # non-empty = local disk cache (read-through + write-through prew
 # cache_write_through = true              # prewarm the cache with every written object
 # cache_large_object_threshold = 67108864 # objects over 64 MiB cache as aligned chunks
 # cache_chunk_size = 8388608              # 8 MiB chunk files for large objects
+# cache_max_bytes = 17179869184          # 16 GiB, completed files + temporary fills
+# cache_max_entries = 100000             # completed files + active fills
+# cache_size_entries = 10000             # bounded object-size LRU
+# cache_dir must be dedicated to this process; cache files are disposable.
+# Full/unavailable cache: bypass to object storage; active readers stay pinned.
 statement_timeout_secs = 300 # must be < gc.tombstone_grace_secs (issue 0002)
 
 [ingest]

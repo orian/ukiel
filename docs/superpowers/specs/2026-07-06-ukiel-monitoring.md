@@ -66,6 +66,10 @@ alert traces back to an invariant or an SLO.
 | `query_objectstore_requests_total{op}` | counter | the cost metric (same counting wrapper the perf spec defines) |
 | `cache_hits_total` / `cache_misses_total{tier}` | counter | NVMe file cache and Parquet metadata cache (plan 13's counters) — hit-ratio drop predicts latency regression and disk pressure. Tiers now include `chunk` (plan 15's per-chunk accounting on the large-object path; `file` unchanged) |
 | `cache_prewarms_total{kind}` | counter | write-through prewarms (`put` and `multipart`, plan 15) — a prewarm rate far below the commit rate means writers are bypassing the cache tier |
+| `cache_enabled`, `cache_capacity_bytes`, `cache_capacity_entries`, `cache_size_capacity_entries` | gauge | Data-cache ownership and configured capacity (issue 0016) |
+| `cache_resident_bytes`, `cache_reserved_bytes`, `cache_entries`, `cache_inflight_entries`, `cache_size_entries` | gauge | Completed data, temporary reservations and bounded metadata cardinality |
+| `cache_evictions_total`, `cache_size_evictions_total` | counter | Data and size-LRU reclamation |
+| `cache_admission_failures_total{reason}`, `cache_errors_total{operation}` | counter | Cache bypass and filesystem failures |
 | `query_sessions_built_total` | counter | per-request session cost visibility |
 
 ### Compactor
@@ -90,7 +94,7 @@ alert traces back to an invariant or an SLO.
 
 ### Process (`ukield`)
 
-`ukield_worker_up{role}` gauge (set 1 on spawn, 0 on exit), `ukield_worker_restarts_total{role}`, standard process metrics (RSS, FDs, tokio task counts if cheap). Cache directory disk usage gauge — we have already lived one disk-full incident; the cache dir currently has **no eviction** (plan 15 notes it), so this gauge is the guardrail.
+`ukield_worker_up{role}` gauge (set 1 on spawn, 0 on exit), `ukield_worker_restarts_total{role}`, standard process metrics (RSS, FDs, tokio task counts if cheap). Cache directory disk usage and free-space gauges complement issue 0016's byte/entry limits, LRU eviction and admission-failure counters; filesystem overhead and other applications' disk usage still need monitoring.
 
 ## Alerts (invariant-derived)
 

@@ -21,6 +21,8 @@ futures = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
+blake3 = { workspace = true }
+tracing = { workspace = true }
 chrono = { workspace = true }
 metrics = { workspace = true }
 

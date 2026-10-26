@@ -171,6 +171,10 @@ pub struct QueryConfig {
     pub cache_large_object_threshold: u64,
     /// Chunk size in bytes for large-object caching.
     pub cache_chunk_size: u64,
+    /// Completed cache files plus temporary fills; pinned reads cannot be evicted.
+    pub cache_max_bytes: u64,
+    pub cache_max_entries: usize,
+    pub cache_size_entries: usize,
     /// Statement timeout in seconds (issue 0002: must stay below
     /// gc.tombstone_grace_secs — validated at startup by `validate`).
     pub statement_timeout_secs: u64,
@@ -186,6 +190,9 @@ impl Default for QueryConfig {
             cache_write_through: cache.write_through,
             cache_large_object_threshold: cache.large_object_threshold,
             cache_chunk_size: cache.chunk_size,
+            cache_max_bytes: cache.max_bytes,
+            cache_max_entries: cache.max_entries,
+            cache_size_entries: cache.size_entries,
             statement_timeout_secs: 300,
         }
     }
@@ -196,6 +203,16 @@ impl Default for QueryConfig {
 /// runs both roles (a split deployment can't see both sides — the invariant
 /// note stays in the config comment).
 pub fn validate(cfg: &UkieldConfig) -> anyhow::Result<()> {
+    if !cfg.query.cache_dir.is_empty()
+        && (cfg.query.cache_max_bytes == 0
+            || cfg.query.cache_max_entries == 0
+            || cfg.query.cache_size_entries == 0
+            || cfg.query.cache_chunk_size == 0)
+    {
+        anyhow::bail!(
+            "query cache capacities and chunk size must be positive when cache_dir is set"
+        );
+    }
     if cfg.roles.contains(&Role::Mv) && cfg.mv.pipelines.is_empty() {
         anyhow::bail!("mv.pipelines must be non-empty when the mv role is enabled");
     }
@@ -643,6 +660,9 @@ mod tests {
         assert!(cfg.query.cache_write_through);
         assert_eq!(cfg.query.cache_large_object_threshold, 64 * 1024 * 1024);
         assert_eq!(cfg.query.cache_chunk_size, 8 * 1024 * 1024);
+        assert_eq!(cfg.query.cache_max_bytes, 16 * 1024 * 1024 * 1024);
+        assert_eq!(cfg.query.cache_max_entries, 100_000);
+        assert_eq!(cfg.query.cache_size_entries, 10_000);
         assert_eq!(cfg.ingest.flush_interval_ms, 10_000);
         assert_eq!(cfg.gc.tombstone_grace_secs, 900.0);
         assert_eq!(cfg.object_store.kind, "s3");
@@ -673,6 +693,27 @@ mod tests {
         let cfg: UkieldConfig = toml::from_str(EXAMPLE).unwrap();
         assert_eq!(cfg.query.statement_timeout_secs, 300);
         validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn enabled_cache_requires_positive_capacities() {
+        for setting in [
+            "cache_max_bytes = 0",
+            "cache_max_entries = 0",
+            "cache_size_entries = 0",
+            "cache_chunk_size = 0",
+        ] {
+            let raw =
+                format!("{EXAMPLE}\n[query]\ncache_dir = '/tmp/ukiel-config-test'\n{setting}\n");
+            let cfg: UkieldConfig = toml::from_str(&raw).unwrap();
+            assert!(
+                validate(&cfg)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("cache capacities"),
+                "{setting}"
+            );
+        }
     }
 
     #[test]

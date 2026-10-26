@@ -170,6 +170,9 @@ pub async fn run_with_catalog(
                 large_object_threshold: cfg.query.cache_large_object_threshold,
                 chunk_size: cfg.query.cache_chunk_size,
                 write_through: cfg.query.cache_write_through,
+                max_bytes: cfg.query.cache_max_bytes,
+                max_entries: cfg.query.cache_max_entries,
+                size_entries: cfg.query.cache_size_entries,
             },
         ))
     };

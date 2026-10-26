@@ -1,5 +1,10 @@
 # Ukiel Plan 15: Cache Tiering (Tier-4 write-through prewarm + range-granular chunks) Implementation Plan
 
+**Capacity follow-up (2026-10-26):** issue 0016 adds shared byte/entry budgets,
+bounded size metadata, pinned-reader LRU eviction and restart accounting. See
+[the current cache-capacity note](../../notes/2026-10-26-cache-capacity.md);
+the original executed plan below records the pre-limit implementation.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 > Re-authored 2026-07-12 against the post-29 tree. The original (2026-07-06) predated plans 13/14/20/27/29; its premise "nothing in ukiel writes multipart today" was retired by plan 29's streaming merge — compactor output now streams through `ParquetObjectWriter`/`BufWriter`, which is exactly `put_multipart_opts` for files over 10 MiB. This version adds the multipart prewarm tee, fixes the HEAD-downloads-the-object hazard that plan 29 made hot, and preserves the plan-20 cache counters.

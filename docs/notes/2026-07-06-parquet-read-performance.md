@@ -135,13 +135,13 @@ layout (a follow-up data-collection run; row 16 revalidates the population).
     keep the whole-file path; prewarmed files of any size serve whole. One
     memoized HEAD per object discovers the size.
 
-Cache growth after plan 15: the cache dir grows with every write (prewarm)
-and every large-object read (chunks); eviction remains future work —
-`ukield_cache_dir_free_ratio`/`_bytes` (plan 21) are the guardrail, and the
-collector's byte walk counts chunk files since it walks the dir. GC-deleted
-objects leave stale cache files — harmless (part paths are UUID-fresh, the
-catalog never reuses them) but they count toward disk usage; a `cache-gc`
-sweep is the natural follow-up.
+Cache capacity (issue 0016, 2026-10-26): completed files, active readers and
+temporary fills share byte/entry budgets, with LRU reclamation and best-effort
+bypass when full. The size map is independently bounded. GC-deleted copies
+remain eligible for ordinary eviction. The collector's free-space/directory
+gauges remain operational signals; they complement the cache's occupancy and
+admission metrics. Configuration, restart ownership and measurements are in
+[the cache-capacity note](2026-10-26-cache-capacity.md).
 
 ## Sequencing
 

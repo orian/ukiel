@@ -160,8 +160,8 @@ endpoint: `SELECT table_name FROM information_schema.tables`.
   row-group key spans prune before any I/O), namespace isolation injected
   into the physical plan, `Utf8View` string scans (engine-default parity),
   HTTP SQL endpoint (`POST /api/query`), process-wide Parquet footer cache,
-  and a local-disk cache tier with write-through prewarm and chunked
-  large-object caching in front of the object store.
+  and a bounded local-disk LRU cache with write-through prewarm, chunked
+  large-object reads and cache-full bypass. [Cache limits and measurements](docs/notes/2026-10-26-cache-capacity.md).
 - `crates/ukiel-compactor` — background rewrite workers on the change feed:
   fanout-driven level-ladder compaction (a run = one commit's key-disjoint
   output; runs merge a level up at a two-tier trigger — eager `l0_fanout`

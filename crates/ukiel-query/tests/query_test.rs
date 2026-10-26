@@ -301,7 +301,7 @@ use ukiel_query::cache::CachingObjectStore;
 async fn cache_serves_reads_after_inner_store_loses_the_object() {
     let h = setup().await;
     let cache_dir = tempfile::tempdir().unwrap();
-    let cached: Arc<dyn ObjectStore> = Arc::new(CachingObjectStore::new(
+    let cached = Arc::new(CachingObjectStore::new(
         h.store.clone(),
         cache_dir.path().to_path_buf(),
     ));
@@ -326,7 +326,7 @@ async fn cache_serves_reads_after_inner_store_loses_the_object() {
     assert_eq!(all_strings(&batches, "payload"), vec!["a1", "a2"]);
 
     // Files were cached locally.
-    let cached_files = std::fs::read_dir(cache_dir.path()).unwrap().count();
+    let cached_files = cached.stats().entries;
     assert!(cached_files >= 1, "expected at least one cached file");
 
     // Delete everything from the inner store; reads must now come from cache.

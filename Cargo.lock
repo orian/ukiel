@@ -5738,6 +5738,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "blake3",
  "bytes",
  "chrono",
  "datafusion",
@@ -5755,6 +5756,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tracing",
  "ukiel-catalog",
  "ukiel-compactor",
  "ukiel-core",

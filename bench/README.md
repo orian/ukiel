@@ -72,6 +72,17 @@ their original geometry and versions.
 
 ---
 
+## Cache capacity measurement (2026-10-26, issue 0016)
+
+A four-worker, 40,000-path upload/read/delete churn test, including a cache-owner
+restart, stays within a **64 KiB / eight-entry** data budget and a **four-entry**
+size LRU. Epoch-end allocated data is **40–48 KiB**, temporary reservations drain
+to zero, and the standalone debug test process peaks at **7,412 KiB RSS**.
+The cache-enabled MinIO MV/compaction test passes separately. This measures
+resource bounds on an in-memory backing store; it is not a throughput baseline.
+The [capacity note](../docs/notes/2026-10-26-cache-capacity.md) records the command,
+limits, filesystem accounting and raw evidence.
+
 ## 1. Prerequisites
 
 - Docker (for the compose stack: Kafka + Postgres + MinIO).
