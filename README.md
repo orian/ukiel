@@ -111,22 +111,23 @@ I develop on Apple M3 36GB ram and AMD Ryzen AI 9 HX 370, 96GB ram.
 ### Quickstart
 
 ```sh
-make play           # compose stack (Kafka/Postgres/MinIO) + the ukield server
+make demo           # isolated Kafka/Postgres/MinIO + ukield + sample orders + sales MV
 ```
 
-Then, in another terminal, produce an event and query it back:
+Then, in another terminal, query the sales rollup:
 
 ```sh
-echo '{"tenant_id": 1, "ts": 1751800000000, "payload": "hello"}' | \
-  docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
-    --bootstrap-server localhost:9092 --topic events
-
-curl -s -X POST http://127.0.0.1:8080/api/query \
-  -H 'content-type: application/json' \
-  -d '{"namespace_id": 1, "sql": "SELECT payload FROM events"}'
+python3 examples/mv-demo/demo.py query \
+  "SELECT product, SUM(orders) AS orders, SUM(revenue_cents) AS revenue_cents FROM sales GROUP BY product ORDER BY product"
 ```
 
-Tables, namespaces, and server roles are declared in `ukield.example.toml`.
+The [runnable MV demo](examples/mv-demo/README.md) includes sample data for two
+tenants, more SQL examples, additional-data loading, MinIO inspection, and reset
+instructions. It requires Docker Compose, the Rust build dependencies, and
+Python 3.11+. Ctrl-C stops it; restarting retains its data and MV progress.
+
+The basic unseeded setup is also available through `make play`, configured by
+`ukield.example.toml`.
 
 Results come back **columnar JSON by default** (`{"schema": [...], "columns":
 {col: [...]}, "row_count": N}` — cheaper and chart/dataframe-ready); add

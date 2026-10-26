@@ -1,6 +1,6 @@
 # Ukiel developer targets.
 
-.PHONY: test e2e e2e-ha e2e-up e2e-down play bench-fetch-hits bench-fetch-bluesky bench-report
+.PHONY: test e2e e2e-ha e2e-up e2e-down play demo bench-fetch-hits bench-fetch-bluesky bench-report
 
 # Unit + component tests (Docker required for testcontainers).
 # --test-threads=2: each component test starts its own containers; unbounded
@@ -61,3 +61,7 @@ bench-report:
 play:
 	docker compose up -d --wait
 	cargo run -p ukield -- --config ukield.example.toml
+
+# Seeded orders + sales MV, with its own stack. Ctrl-C stops it and retains data.
+demo:
+	python3 examples/mv-demo/demo.py start

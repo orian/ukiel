@@ -1,0 +1,126 @@
+roles = ["ingest", "mv", "query", "compactor", "gc"]
+
+[catalog]
+url = "postgres://ukiel_demo:ukiel_demo@127.0.0.1:25432/ukiel_demo"
+
+[object_store]
+kind = "s3"
+endpoint = "http://127.0.0.1:29000"
+bucket = "ukiel-demo"
+access_key_id = "minioadmin"
+secret_access_key = "minioadmin"
+allow_http = true
+
+[query]
+listen = "127.0.0.1:18880"
+statement_timeout_secs = 30
+
+[ingest]
+brokers = "127.0.0.1:19092"
+group_id = "ukiel-mv-demo"
+flush_interval_ms = 500
+max_buffer_rows = 1000
+
+[mv]
+pipelines = ["sales_v1"]
+poll_interval_ms = 100
+
+[compactor]
+poll_interval_ms = 1000
+l0_fanout = 2
+fanout = 2
+finalize_after_secs = 10
+finalize_poll_interval_ms = 1000
+
+[gc]
+poll_interval_ms = 10000
+tombstone_grace_secs = 60
+orphan_grace_secs = 60
+
+[collector]
+interval_ms = 1000
+
+[[tables]]
+name = "orders"
+topic = "ukiel-demo-orders"
+ts_column = "ts"
+packing_key = "tenant_id"
+sort_key = ["tenant_id", "ts"]
+partition_columns = ["day"]
+namespaces = [1, 2]
+
+[[tables.columns]]
+name = "tenant_id"
+type = "int64"
+
+[[tables.columns]]
+name = "ts"
+type = "timestamp_ms"
+
+[[tables.columns]]
+name = "order_id"
+type = "utf8"
+
+[[tables.columns]]
+name = "product"
+type = "utf8"
+
+[[tables.columns]]
+name = "quantity"
+type = "int64"
+
+[[tables.columns]]
+name = "amount_cents"
+type = "int64"
+
+[[tables]]
+name = "sales"
+ts_column = "ts"
+packing_key = "tenant_id"
+sort_key = ["tenant_id", "product", "ts"]
+partition_columns = []
+namespaces = [1, 2]
+
+[[tables.columns]]
+name = "tenant_id"
+type = "int64"
+
+[[tables.columns]]
+name = "product"
+type = "utf8"
+
+[[tables.columns]]
+name = "ts"
+type = "timestamp_ms"
+
+[[tables.columns]]
+name = "orders"
+type = "int64"
+
+[[tables.columns]]
+name = "units"
+type = "int64"
+
+[[tables.columns]]
+name = "revenue_cents"
+type = "int64"
+
+[[tables.columns]]
+name = "inserted_at"
+type = "timestamp_ms"
+nullable = false
+default = "now()"
+
+[[pipelines]]
+name = "sales_v1"
+source = "orders"
+target = "sales"
+sql = """
+SELECT tenant_id, product, MIN(ts) AS ts,
+       COUNT(*) AS orders,
+       SUM(quantity) AS units,
+       SUM(amount_cents) AS revenue_cents
+FROM orders
+GROUP BY tenant_id, product
+"""
+error_policy = "stall"

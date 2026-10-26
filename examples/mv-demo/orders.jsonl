@@ -1,0 +1,12 @@
+{"tenant_id":1,"product":"coffee","quantity":2,"amount_cents":700}
+{"tenant_id":1,"product":"tea","quantity":1,"amount_cents":250}
+{"tenant_id":1,"product":"cake","quantity":1,"amount_cents":500}
+{"tenant_id":1,"product":"coffee","quantity":1,"amount_cents":350}
+{"tenant_id":1,"product":"tea","quantity":2,"amount_cents":500}
+{"tenant_id":1,"product":"cake","quantity":2,"amount_cents":1000}
+{"tenant_id":2,"product":"coffee","quantity":1,"amount_cents":350}
+{"tenant_id":2,"product":"coffee","quantity":2,"amount_cents":700}
+{"tenant_id":2,"product":"tea","quantity":3,"amount_cents":750}
+{"tenant_id":2,"product":"cake","quantity":1,"amount_cents":500}
+{"tenant_id":2,"product":"tea","quantity":1,"amount_cents":250}
+{"tenant_id":2,"product":"cake","quantity":1,"amount_cents":500}
